@@ -1,0 +1,36 @@
+# PEP 517 build configuration for the go_transposition C extension.
+#
+# This file lives inside goboard_transposition/ and is entirely independent
+# from the parent KataProxy project's build. The resulting wheel distributes
+# a single Python-importable module: `go_transposition`.
+
+[build-system]
+requires = ["meson-python>=0.15.0", "pybind11>=2.11"]
+build-backend = "mesonpy"
+
+[project]
+name = "go_transposition"
+version = "0.1.0"
+description = "Transposition-aware PV partitioning for KataGo analysis output."
+readme = "COMPILATION.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "KodBena" },
+]
+dependencies = []
+keywords = ["katago", "go", "baduk", "transposition", "pv"]
+classifiers = [
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Games/Entertainment :: Board Games",
+]
+
+[project.urls]
+Repository = "https://github.com/KodBena/KataProxy"

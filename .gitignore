@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.venv/
+venv/
+env/
+.env
+build/
+builddir/
+dist/
+wheelhouse/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store

@@ -1,0 +1,69 @@
+KataProxy
+=========
+
+This repository contains code released under two distinct licenses.
+The boundary is by directory and is documented below.
+
+------------------------------------------------------------------------
+Project root and all subdirectories EXCEPT `goboard_transposition/`
+------------------------------------------------------------------------
+
+Released into the public domain under the Unlicense.
+See the file `UNLICENSE` at the project root for the full text.
+
+This includes (non-exhaustive):
+  - proxy_server.py, router.py, pubsub_hub.py
+  - session_middleware.py, sproxy_config.py, logging_config.py
+  - The AbstractProxy/ subpackage
+  - The rxp/ subpackage
+  - flt.py, transposition_enricher.py
+  - All shell scripts, configuration examples, and documentation
+
+------------------------------------------------------------------------
+The `goboard_transposition/` subdirectory
+------------------------------------------------------------------------
+
+Derived from KataGo, which is distributed under the MIT License.
+See the file `goboard_transposition/LICENSE` for the full text and
+copyright attribution from the upstream KataGo project.
+
+The MIT License requires that this attribution and the license text
+itself be preserved in any redistribution of the derivative work.
+Downstream packagers and redistributors must include
+`goboard_transposition/LICENSE` alongside any binary or source form
+of the `goboard_transposition` module.
+
+KataGo project: https://github.com/lightvector/KataGo
+
+Derivation provenance
+~~~~~~~~~~~~~~~~~~~~~
+
+This module was derived from the KataGo cpp/search/analysisdata.h
+and /cpp/search/searchresults.cpp source at upstream commit:
+
+    4f78e16742c25ff7c78156a1aef9f1d00df6d5b0
+    ("Fix clear_cache crash on analysis engine", 2026-01-06)
+
+Local modifications added transposition tracking to the analysis
+engine output. The MIT license terms apply to both the original
+upstream code and the local modifications within this subdirectory.
+
+To inspect the upstream code at the fork point:
+    git -C <katago-checkout> show 4f78e16742c25ff7c78156a1aef9f1d00df6d5b0
+
+------------------------------------------------------------------------
+Practical implications for downstream users
+------------------------------------------------------------------------
+
+If you redistribute KataProxy in source form: include both LICENSE
+files (`UNLICENSE` and `goboard_transposition/LICENSE`) and this
+NOTICE file. No further obligations.
+
+If you redistribute compiled artifacts that include
+`goboard_transposition`: include `goboard_transposition/LICENSE`
+alongside the binary. The MIT attribution requirement applies to
+that module specifically.
+
+If you redistribute compiled artifacts WITHOUT `goboard_transposition`
+(the module is optional at runtime): no licensing obligations apply.
+The remainder of the project is in the public domain.

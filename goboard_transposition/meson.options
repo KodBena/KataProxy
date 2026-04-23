@@ -1,0 +1,6 @@
+option(
+  'module_name',
+  type: 'string',
+  value: 'go_transposition',
+  description: 'Python importable name of the pybind11 extension (controls both filename and PyInit_ symbol)',
+)

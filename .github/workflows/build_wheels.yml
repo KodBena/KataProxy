@@ -1,0 +1,136 @@
+name: Build go_transposition wheels
+
+# Triggers:
+#   - Every push / PR: build all wheels to verify the build stays green.
+#   - Version tag (v*.*.*): additionally upload wheels to a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }} · ${{ matrix.arch }} · ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Fully expanded matrix: every (os, arch, python) combination is
+        # spelled out explicitly. 3 platforms × 4 Python versions = 12 jobs.
+        #
+        # Platforms supported for v1.0:
+        #   ubuntu-latest  → manylinux x86_64
+        #   windows-latest → win_amd64 (with delvewheel DLL bundling)
+        #   macos-latest   → macOS Apple Silicon (arm64)
+        #
+        # macOS Intel (x86_64) is intentionally NOT built. Apple stopped
+        # selling Intel Macs in 2022, and GitHub Actions' Intel macOS
+        # runners have limited capacity that causes queue starvation.
+        # Users on Intel Macs can build from source with:
+        #     pip install git+https://github.com/KodBena/KataProxy.git#subdirectory=goboard_transposition
+        include:
+          # --- Linux x86_64 ---
+          - { os: ubuntu-latest,  arch: x86_64, python: cp310 }
+          - { os: ubuntu-latest,  arch: x86_64, python: cp311 }
+          - { os: ubuntu-latest,  arch: x86_64, python: cp312 }
+          - { os: ubuntu-latest,  arch: x86_64, python: cp313 }
+          # --- Windows AMD64 ---
+          - { os: windows-latest, arch: AMD64,  python: cp310 }
+          - { os: windows-latest, arch: AMD64,  python: cp311 }
+          - { os: windows-latest, arch: AMD64,  python: cp312 }
+          - { os: windows-latest, arch: AMD64,  python: cp313 }
+          # --- macOS Apple Silicon (arm64) ---
+          - { os: macos-latest,   arch: arm64,  python: cp310 }
+          - { os: macos-latest,   arch: arm64,  python: cp311 }
+          - { os: macos-latest,   arch: arm64,  python: cp312 }
+          - { os: macos-latest,   arch: arm64,  python: cp313 }
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python (host, for cibuildwheel itself)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cibuildwheel
+        run: python -m pip install --upgrade pip cibuildwheel==2.21.3
+
+      - name: Build wheel
+        run: python -m cibuildwheel --output-dir wheelhouse goboard_transposition
+        env:
+          # Build only the current matrix Python for this job.
+          # Pattern: {pythontag}-{platformtag}, e.g. cp312-manylinux_x86_64
+          CIBW_BUILD: "${{ matrix.python }}-*"
+
+          # Skip uncommon/unreliable targets:
+          #   *musllinux* — alpine; add later if users ask
+          #   *-win32     — 32-bit Windows; effectively dead
+          #   *_i686      — 32-bit Linux; effectively dead
+          CIBW_SKIP: "*musllinux* *-win32 *_i686"
+
+          # NOTE: nlohmann/json is vendored directly as a single-header file
+          # at goboard_transposition/third_party/nlohmann/json.hpp.
+          # No network access, no package managers, no wrap files needed.
+
+          # --- Architecture selection (one arch per job) ---
+          CIBW_ARCHS: ${{ matrix.arch }}
+
+          # --- Windows: bundle runtime DLLs into the wheel ---
+          # Without delvewheel, the .pyd links against VCRUNTIME140.dll etc.
+          # which may not be on the DLL search path at import time, causing
+          # "DLL load failed while importing" errors on user machines.
+          # delvewheel is the Windows equivalent of auditwheel/delocate —
+          # it copies required DLLs into the wheel so it is self-contained.
+          CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
+
+          # --- Smoke-test each built wheel ---
+          # cibuildwheel installs the wheel into a fresh venv, then runs this.
+          CIBW_TEST_REQUIRES: pytest
+          CIBW_TEST_COMMAND: pytest {project}/goboard_transposition/test_partition_pv.py -v
+
+          # Manylinux baseline: modern baseline (~RHEL 8 / Ubuntu 20.04+).
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+
+      - name: Upload wheels as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.python }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Release job: runs only on version tags. Gathers all per-matrix wheel
+  # artifacts and attaches them to a GitHub Release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish wheels to GitHub Release
+    needs: build_wheels
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to create/modify releases
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List wheels to be published
+        run: ls -lh dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
