@@ -51,18 +51,59 @@ upstream code and the local modifications within this subdirectory.
 To inspect the upstream code at the fork point:
     git -C <katago-checkout> show 4f78e16742c25ff7c78156a1aef9f1d00df6d5b0
 
+Vendored third-party dependency: nlohmann/json
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+`goboard_transposition/third_party/nlohmann/json.hpp` is the
+single-header amalgamation of the nlohmann/json C++ library
+(version 3.11.3), distributed under the MIT License.
+
+  Copyright (c) 2013-2026 Niels Lohmann
+  Upstream: https://github.com/nlohmann/json
+
+The copyright statement above matches the canonical form in the
+sibling `LICENSE.MIT` (synced byte-for-byte from upstream's
+`develop` branch). The SPDX identifier in the vendored `json.hpp`
+header still says `2013-2023` because the .hpp is unmodified at
+the v3.11.3 release point; the LICENSE.MIT tracks the current
+upstream copyright statement, so the year ranges differ
+intentionally.
+
+The full MIT license text for nlohmann/json is at
+`goboard_transposition/third_party/nlohmann/LICENSE.MIT`. This is
+distinct from `goboard_transposition/LICENSE` (which carries the
+MIT terms for the KataGo derivation). Both license files must be
+preserved in any redistribution that includes the corresponding
+code; the two MIT grants are independent legal instruments even
+though the license texts are substantively identical.
+
+The SPDX identifier in `json.hpp`'s file header
+(`SPDX-License-Identifier: MIT`,
+`SPDX-FileCopyrightText: 2013-2023 Niels Lohmann`) is for tooling
+and does not, on its own, satisfy the MIT requirement to preserve
+the full license text. The sibling `LICENSE.MIT` file is the
+preserved text.
+
+Vendoring rationale (cross-platform reproducibility, avoidance of
+distro package manager dependencies) and the SHA-256 integrity
+hash for the unmodified upstream amalgamation are documented in
+`goboard_transposition/third_party/README.md`.
+
 ------------------------------------------------------------------------
 Practical implications for downstream users
 ------------------------------------------------------------------------
 
-If you redistribute KataProxy in source form: include both LICENSE
-files (`UNLICENSE` and `goboard_transposition/LICENSE`) and this
+If you redistribute KataProxy in source form: include `UNLICENSE`,
+`goboard_transposition/LICENSE`,
+`goboard_transposition/third_party/nlohmann/LICENSE.MIT`, and this
 NOTICE file. No further obligations.
 
 If you redistribute compiled artifacts that include
-`goboard_transposition`: include `goboard_transposition/LICENSE`
-alongside the binary. The MIT attribution requirement applies to
-that module specifically.
+`goboard_transposition`: include both
+`goboard_transposition/LICENSE` (KataGo MIT) and
+`goboard_transposition/third_party/nlohmann/LICENSE.MIT`
+(nlohmann/json MIT) alongside the binary. The MIT attribution
+requirement applies to each upstream independently.
 
 If you redistribute compiled artifacts WITHOUT `goboard_transposition`
 (the module is optional at runtime): no licensing obligations apply.
