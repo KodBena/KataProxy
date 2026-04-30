@@ -40,13 +40,23 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
     request_cache: Dict[str, BadukAnalysisState] = {}
 
     def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
-        # Guard: only cache for analysis
-        if q.action == KataGoAction.ANALYZE and q.opaque and len(q.opaque['moves']) > 1:
-            config = q.opaque.get('analysis_config')
-            logger.debug(f"analysis_config = {config}")
-            if not config:
-                return q
+        # `analysis_config` is consumed by this transformer and must NEVER
+        # reach KataGo's stdin — KataGo's analysis-engine protocol does
+        # not define this field, and forwarding it produces malformed
+        # responses on short / empty queries (no moveInfos / rootInfo on
+        # returned packets, observed as a frontend crash on empty-board
+        # ponder). The strip is unconditional; analyser setup is gated
+        # below because BadukAnalysisState requires ≥2 moves to compute
+        # meaningful deltas, but that gate must NOT also gate the strip.
+        config = q.opaque.pop('analysis_config', None)
 
+        if (
+            q.action == KataGoAction.ANALYZE
+            and config
+            and q.opaque.get('moves')
+            and len(q.opaque['moves']) > 1
+        ):
+            logger.debug(f"analysis_config = {config}")
             env = RegistryInterpreter(config)
             delta_fn = env.get_delta_fn()
             summary_fn = env.get_summary_fn()
@@ -60,7 +70,6 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
                 triangular=True,
             )
             request_cache[eid] = analyzer
-            del q.opaque['analysis_config']
         return q
 
     def on_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
