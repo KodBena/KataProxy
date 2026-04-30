@@ -58,8 +58,16 @@ Vendored third-party dependency: nlohmann/json
 single-header amalgamation of the nlohmann/json C++ library
 (version 3.11.3), distributed under the MIT License.
 
-  Copyright (c) 2013-2023 Niels Lohmann <https://nlohmann.me>
+  Copyright (c) 2013-2026 Niels Lohmann
   Upstream: https://github.com/nlohmann/json
+
+The copyright statement above matches the canonical form in the
+sibling `LICENSE.MIT` (synced byte-for-byte from upstream's
+`develop` branch). The SPDX identifier in the vendored `json.hpp`
+header still says `2013-2023` because the .hpp is unmodified at
+the v3.11.3 release point; the LICENSE.MIT tracks the current
+upstream copyright statement, so the year ranges differ
+intentionally.
 
 The full MIT license text for nlohmann/json is at
 `goboard_transposition/third_party/nlohmann/LICENSE.MIT`. This is
