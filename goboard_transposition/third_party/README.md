@@ -10,10 +10,19 @@ Vendored here rather than fetched at build time to guarantee cross-platform
 reproducibility and avoid dependence on distro package managers or external
 package registries.
 
-**License**: MIT (see the copyright notice at the top of `json.hpp`).
-The MIT license text is compatible with the KataGo MIT license that covers
-the rest of `goboard_transposition/`; no additional license file is
-required at the parent level.
+**License**: MIT. The full license text and copyright notice are in
+`nlohmann/LICENSE.MIT` alongside `json.hpp`; the SPDX identifier in
+the .hpp header (`SPDX-License-Identifier: MIT`,
+`SPDX-FileCopyrightText: 2013-2023 Niels Lohmann`) is for tooling and
+does not substitute for the full text. The `LICENSE.MIT` file must
+travel with `json.hpp` in any redistribution.
+
+The nlohmann MIT license is compatible with the KataGo MIT license
+that covers the rest of `goboard_transposition/`; both can be
+satisfied by including `goboard_transposition/LICENSE` (KataGo) and
+`goboard_transposition/third_party/nlohmann/LICENSE.MIT` (nlohmann)
+in any source or binary distribution. No consolidated license file
+at the `goboard_transposition/` level is required.
 
 **Source URL**:
     https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
