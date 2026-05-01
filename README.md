@@ -23,8 +23,14 @@ without giving each client direct access to the engine.
 ## Requirements
 
 - Python 3.10 or newer
-- A built [KataGo](https://github.com/lightvector/KataGo) binary and a
-  neural network model (only needed for LEAF role)
+- For the LEAF role, three artefacts from upstream KataGo:
+  - a built [KataGo](https://github.com/lightvector/KataGo) **binary**
+  - a neural network **model** (`.bin.gz` or `.txt.gz`)
+  - an analysis-engine **config** (the upstream source ships
+    `cpp/configs/analysis_example.cfg`; copy it to `analysis.cfg` or
+    point `KATAGO_CFG` at it)
+
+  The RELAY, ECHO, and REDIRECT roles do not need any of these.
 
 ---
 
@@ -36,18 +42,24 @@ cd kataproxy
 pip install -e .
 ```
 
-Set the path to your KataGo model and start the server:
+Set the paths to your KataGo model and analysis config, then start the
+server:
 
 ```bash
 export KATAGO_MODEL=/path/to/model.bin.gz
+export KATAGO_CFG=/path/to/analysis.cfg
 ./run_leaf.sh
 ```
 
 The LEAF now listens on `ws://127.0.0.1:41948`. Point any KataGo analysis
 client at that URL.
 
-If `katago` is not on your `$PATH`, also set `KATAGO_PATH` to the absolute
-path of the executable.
+If `katago` is not on your `$PATH`, also set `KATAGO_PATH` to the
+absolute path of the executable. All three — binary, model, and config
+— must be present and acceptable to KataGo; if any is missing or
+rejected, the proxy raises `LeafStartupError` at startup with KataGo's
+own error in the message (see
+[LEAF startup behaviour](#leaf-startup-behaviour)).
 
 ---
 
