@@ -77,6 +77,7 @@ for the full reference, with defaults and inline explanations.
 For most operators the relevant variables are:
 
 - `KATAGO_PATH`, `KATAGO_CFG`, `KATAGO_MODEL` — LEAF only
+- `KATAGO_STARTUP_TIMEOUT_S` — LEAF startup-gate timeout (default 60s)
 - `PROXY_HOST`, `PROXY_PORT` — network binding
 - `PROXY_ROLE` — `LEAF` (default), `RELAY`, `ECHO`, or `REDIRECT`
 - `UPSTREAM_URLS` — comma-separated list, required for RELAY and REDIRECT
@@ -84,6 +85,21 @@ For most operators the relevant variables are:
 Copy `.env.example` to `.env` and edit it; the file is loaded automatically
 on startup. Variables already set in the shell take precedence over the
 file.
+
+### LEAF startup behaviour
+
+When the LEAF role starts, it spawns KataGo, sends a tiny probe query,
+and waits for the engine to respond. If KataGo exits before responding —
+the typical cause is a missing `analysis.cfg`, a missing model file, or
+a GPU that won't initialise — the proxy raises a `LeafStartupError`
+that includes KataGo's own stderr output, and refuses to begin
+serving. KataGo's stderr is also forwarded continuously to the proxy's
+log under `kataproxy.router` while the engine is running.
+
+If KataGo crashes after a successful start, the LEAF respawns it up to
+3 times (each retry logged at WARNING) before giving up. After the
+budget is exhausted the router enters an unhealthy state: subsequent
+queries return an immediate error response rather than hanging.
 
 ---
 
