@@ -108,6 +108,15 @@ KATAGO_CMD: List[str] = [
     "-quit-without-waiting",
 ]
 
+# Seconds to wait for KataGo to acknowledge the LEAF startup probe
+# before raising LeafStartupError. Cold model loads on slow disks /
+# CPUs / GPUs can legitimately take a while; the default is generous.
+# A startup that exceeds this is far more likely to be a config or
+# hardware problem than a slow but-eventually-successful boot.
+KATAGO_STARTUP_TIMEOUT_S: float = float(
+    os.environ.get("KATAGO_STARTUP_TIMEOUT_S", "60")
+)
+
 # ---------------------------------------------------------------------------
 # Relay tuning
 # ---------------------------------------------------------------------------
