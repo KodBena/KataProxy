@@ -48,6 +48,7 @@ from AbstractProxy.katago_proxy import (
     KataGoQuery,
     parse_response_from_wire,
 )
+from proxy_json import loads_bounded, JsonDepthExceededError
 import sproxy_config as cfg
 
 from flt import filter_dict
@@ -615,7 +616,10 @@ class LeafRouter(BackendRouter):
             line = raw.decode().strip()
 
             try:
-                wire: WireDict = json.loads(line)
+                wire: WireDict = loads_bounded(line, max_depth=cfg.JSON_MAX_DEPTH)
+            except JsonDepthExceededError as e:
+                logger.error(f"refused depth-bombed line from KataGo: {e}")
+                continue
             except json.JSONDecodeError as e:
                 logger.error(f"JSON error: {e}  raw={line}")
                 continue
@@ -939,7 +943,10 @@ class RelayRouter(BackendRouter):
                     f"{json.dumps(filter_dict(json.loads(str(raw_msg))))}"
                 )
                 try:
-                    wire: WireDict = json.loads(raw_msg)
+                    wire: WireDict = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
+                except JsonDepthExceededError as e:
+                    logger.error(f"refused depth-bombed message from {url}: {e}")
+                    continue
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON error from {url}: {e}")
                     continue

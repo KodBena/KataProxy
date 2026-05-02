@@ -139,3 +139,18 @@ HASH_RING_REPLICAS: int = int(os.environ.get("HASH_RING_REPLICAS", "150"))
 # (audit H-2).
 
 HUB_CACHE_MAX: int = int(os.environ.get("PROXY_HUB_CACHE_MAX", "1024"))
+
+
+# ---------------------------------------------------------------------------
+# JSON structural depth bound (v1.0.4)
+# ---------------------------------------------------------------------------
+#
+# Maximum nesting depth accepted on inbound JSON (client wire, KataGo
+# stdout, RELAY upstream). Payloads exceeding this depth are refused
+# before json.loads runs, so a depth-bombed message can't trip Python's
+# interpreter recursion limit and tear down the receive loop (audit M-3).
+#
+# Default 64; legitimate KataGo JSON is depth ≤ 5 in practice. Set to 0
+# (or any non-positive integer) to disable the check.
+
+JSON_MAX_DEPTH: int = int(os.environ.get("PROXY_JSON_MAX_DEPTH", "64"))

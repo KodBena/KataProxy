@@ -70,6 +70,7 @@ from AbstractProxy.katago_proxy import (
 from AbstractProxy.proxy_core import CompletionTracker, Envelope, TranslationError, Dispatcher, ProxyLink
 from AbstractProxy.protocol_transformer import TransformedChain, Transformer
 from pubsub_hub import PubSubHub, LRUCacheStore
+from proxy_json import loads_bounded, JsonDepthExceededError
 from router import BackendRouter, InFlightQueryLoad, make_router
 from session_middleware import SessionMiddleware, IdentityMiddleware
 
@@ -216,7 +217,13 @@ class ClientSession:
 
     async def _handle_incoming(self, raw_msg: str) -> None:
         try:
-            outer = json.loads(raw_msg)
+            outer = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
+        except JsonDepthExceededError as e:
+            logger.error(
+                f"peer={self._peer} refused depth-bombed payload: {e} "
+                f"raw={raw_msg[:100]!r}"
+            )
+            return
         except json.JSONDecodeError:
             return
 
