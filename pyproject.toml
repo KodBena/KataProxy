@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kataproxy"
-version = "1.0.3"
+version = "1.0.4"
 description = "A modular, composable protocol proxy and analysis middleware for KataGo."
 readme = "README.md"
 license = { text = "Unlicense" }
