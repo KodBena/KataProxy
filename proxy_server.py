@@ -46,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import traceback
 from typing import Callable, Dict, List, Optional
 
 import websockets
@@ -192,9 +191,8 @@ class ClientSession:
                     await task
                 except asyncio.CancelledError:
                     pass
-        except Exception as e:
-            logger.error(f"peer={self._peer} unexpected: {e}")
-            traceback.print_exc()
+        except Exception:
+            logger.exception(f"peer={self._peer} unexpected error in run loop")
         finally:
             await self._cleanup()
 
@@ -213,9 +211,8 @@ class ClientSession:
                 await self._handle_incoming(raw_msg)
         except ConnectionClosed as e:
             logger.info(f"peer={self._peer} closed: {e}")
-        except Exception as e:
-            logger.error(f"peer={self._peer} error: {e}")
-            traceback.print_exc()
+        except Exception:
+            logger.exception(f"peer={self._peer} error in receive loop")
 
     async def _handle_incoming(self, raw_msg: str) -> None:
         try:
@@ -392,9 +389,8 @@ class ClientSession:
             raise
         except ConnectionClosed as e:
             logger.info(f"peer={self._peer} ws closed: {e}")
-        except Exception as e:
-            logger.error(f"peer={self._peer} error: {e}")
-            traceback.print_exc()
+        except Exception:
+            logger.exception(f"peer={self._peer} error in send loop")
 
     async def _deliver_upstream(self, wire: dict) -> None:
         """Translate one relabelled response to client namespace and send.
@@ -451,9 +447,8 @@ class ClientSession:
                     f"out={json.dumps(filter_dict(out_wire))}"
                 )
                 await self._ws.send(out_json)
-        except Exception as e:
-            logger.error(f"middleware error: {e}")
-            traceback.print_exc()
+        except Exception:
+            logger.exception(f"peer={self._peer} middleware error in deliver_upstream")
 
     # -----------------------------------------------------------------------
     # Cleanup
