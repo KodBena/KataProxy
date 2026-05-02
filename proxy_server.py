@@ -225,7 +225,25 @@ class ClientSession:
 
         result = self._dispatcher.match(outer)
         if not result:
-            logger.error(f"Unknown protocol branch: {raw_msg[:100]}")
+            # Differentiate "looks like a near-valid query but malformed"
+            # from "fully alien JSON" so a buggy-client signal isn't lost
+            # in the bot-noise floor. Both surfaces are ERROR per
+            # ADR-0002's loudness hierarchy; the message specificity is
+            # what changes.
+            if isinstance(outer, dict) and ("action" in outer or "id" in outer):
+                logger.error(
+                    f"peer={self._peer} malformed protocol message "
+                    f"(looks like a query but no prism matched): "
+                    f"keys={sorted(outer.keys())} "
+                    f"action={outer.get('action')!r} "
+                    f"id_present={'id' in outer} "
+                    f"raw={raw_msg[:100]!r}"
+                )
+            else:
+                logger.error(
+                    f"peer={self._peer} unknown protocol branch: "
+                    f"raw={raw_msg[:100]!r}"
+                )
             return
 
         prism, orig_id, query = result
