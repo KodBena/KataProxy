@@ -385,11 +385,54 @@ def nonzero(x):
 
 
 # ===========================================================================
+# Bit-equivalence contract — load-bearing for cross-team migrations
+# ===========================================================================
+# For inputs that pass _to_array's gate (no object/complex dtype, within the
+# element-count cap), most wrappers below return values bit-identical to
+# their numpy / scipy.stats originals when called with the wrapper's exact
+# signature. This is the property the umbrella's frontend migrations.ts
+# (step 11 → 12) relies on when it mechanically rewrites `np.<fn>(...)` →
+# `<fn>(...)` in symbol bodies. See the dispatch chain at
+# <umbrella>/docs/dispatch/{proxy,frontend}-to-{frontend,proxy}-analysis-
+# config-curation*.md for the coordination record.
+#
+# Strictly bit-equivalent (subject to dtype/size gating):
+#   reductions     mean median std var sum prod min max
+#                  percentile quantile argmin argmax argsort
+#   elementwise    log exp sqrt abs sign isnan isfinite
+#   convolution    convolve correlate (mode kwarg only)
+#   stats          entropy (positional p, q only — no axis/base/nan_policy)
+#   construction   zeros ones full arange linspace
+#   indexing       take nonzero
+#
+# Not strictly bit-equivalent — the wrapper narrows the domain:
+#   clip(x, lo, hi)    refuses array-shaped lo/hi (np.clip accepts); scalar
+#                      bounds are bit-equivalent.
+#   where(cond, a, b)  ternary form only; np.where(cond) returns indices and
+#                      is not exposed.
+#   array(x)           returns .copy() unconditionally; np.array uses
+#                      copy=True by default with some path-dependent sharing
+#                      — semantically identical for read-only use.
+#
+# Not numpy-derived (no equivalence claim — these are new wrappers):
+#   normalized_entropy, sliding_window, sliding_mean, sliding_median,
+#   sliding_std, sliding_percentile, apply_window
+#
+# A wrapper that no longer satisfies bit-equivalence must be moved to the
+# "narrowed domain" list here so downstream rewriters can refuse to migrate
+# call-sites that would diverge.
+
+
+# ===========================================================================
 # Symtable — the complete set of names exposed to user code
 # ===========================================================================
-# Anything not in this dict is unbound at compile time, producing an asteval
-# error that bubbles up through _exec → RuntimeError → analysis_enricher's
-# warning. There is no other path to numpy or scipy from a user expression.
+# Anything not in this dict is unbound. asteval defers name resolution inside
+# def-bodies to call time, so a user symbol referencing e.g. `np` compiles
+# cleanly but raises NameError on first invocation; that exception propagates
+# through the BSA pipeline to baduk.analysis_enricher's on_response
+# except-Exception clause, where it surfaces as
+# `Enrichment failed: name '<X>' is not defined`. No other path to numpy or
+# scipy exists from a user expression.
 
 _CURATED_SYMTABLE = {
     # reductions
