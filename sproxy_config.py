@@ -187,3 +187,23 @@ MAX_SESSIONS: int = int(os.environ.get("PROXY_MAX_SESSIONS", "256"))
 # proxy IP for every user. Operators with direct internet exposure may
 # want to set this to e.g. 600 (10 q/sec sustained).
 RATELIMIT_PER_IP: int = int(os.environ.get("PROXY_RATELIMIT_PER_IP", "0"))
+
+
+# ---------------------------------------------------------------------------
+# Adaptive middleware (v1.0.5)
+# ---------------------------------------------------------------------------
+#
+# Per-session bound on the number of in-flight queries
+# AdaptiveReevaluateMiddleware will track. On overflow, the oldest in-flight
+# entry is dropped (its buffered final responses are lost; subsequent
+# responses for that orig_id flow through unchanged). This replaces the
+# pre-v1.0.5 panic-flush at 5000 entries that wiped every in-flight entry
+# for the session at once (audit H-2).
+#
+# 128 is generous — a typical session has well under 10 in-flight queries
+# at any moment. Operators with very long-lived sessions or unusual
+# workloads can raise it; a non-positive value disables the bound entirely.
+
+ADAPTIVE_MAX_INFLIGHT: int = int(
+    os.environ.get("PROXY_ADAPTIVE_MAX_INFLIGHT", "128")
+)

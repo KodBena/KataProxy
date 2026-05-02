@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+import sproxy_config as cfg
 from AbstractProxy.katago_proxy import KataGoAction, KataGoQuery, KataGoResponse
 from session_middleware import SessionMiddleware, SubmitQuery, ResponseStream
 
@@ -93,13 +94,22 @@ class AdaptiveReevaluateMiddleware(SessionMiddleware):
         worst_quantile: float = 1.0,
         extra_visits: int = 800,
         window_size: int = 3,
+        max_inflight: Optional[int] = None,
     ) -> None:
         self._worst_quantile = worst_quantile
         self._extra_visits = extra_visits
         self._window_size = window_size
+        # Per-session in-flight cap. None or non-positive → unbounded
+        # (pre-v1.0.5 semantics, except without the panic-flush behaviour).
+        self._max_inflight = (
+            max_inflight if max_inflight is not None else cfg.ADAPTIVE_MAX_INFLIGHT
+        )
 
-        # orig_id → number of final responses still expected
-        self._expected: Dict[str, int] = {}
+        # orig_id → number of final responses still expected. OrderedDict
+        # so insertion order is the canonical eviction order on overflow;
+        # _buffered and _orig_queries are kept consistent at every
+        # mutation site.
+        self._expected: "OrderedDict[str, int]" = OrderedDict()
         # orig_id → buffered (turn_number, response) pairs
         self._buffered: Dict[str, List[Tuple[int, KataGoResponse]]] = {}
         # orig_id → original KataGoQuery (needed to build the deeper query)
@@ -120,12 +130,22 @@ class AdaptiveReevaluateMiddleware(SessionMiddleware):
         self._expected[orig_id] = len(turns) if turns else 1
         self._orig_queries[orig_id] = deepcopy(query)
 
-        # Safety flush so we don't accumulate unboundedly for long-lived sessions.
-        if len(self._expected) > 5000:
-            logger.warning("adaptive: safety flush triggered (> 5000 in-flight queries)")
-            self._expected.clear()
-            self._buffered.clear()
-            self._orig_queries.clear()
+        # Bounded LRU eviction. The pre-v1.0.5 implementation tripped a
+        # panic-flush at 5000 entries that wiped every in-flight query's
+        # state — a single bad client could lose every other concurrent
+        # query's adaptation context. The ordered eviction here keeps the
+        # newest queries' state intact and only loses the oldest, which is
+        # the right trade-off when the client is genuinely producing more
+        # in-flight queries than the cap allows.
+        while (self._max_inflight > 0
+               and len(self._expected) > self._max_inflight):
+            evicted, _ = self._expected.popitem(last=False)
+            self._buffered.pop(evicted, None)
+            self._orig_queries.pop(evicted, None)
+            logger.warning(
+                f"adaptive: per-session in-flight cap {self._max_inflight} "
+                f"reached; evicted oldest orig_id={evicted!r}"
+            )
 
     # ------------------------------------------------------------------
     # handle_response — core interception logic
