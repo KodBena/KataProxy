@@ -157,9 +157,15 @@ load balancing) works identically with or without it.
 
 ## Logs
 
-KataProxy uses the standard `logging` module. The default level is `DEBUG`,
-which is verbose; for production set `PYTHONLOGLEVEL=INFO` or configure a
-logging file at the application level.
+KataProxy uses the standard `logging` module. The default level is `INFO`;
+set `PYTHONLOGLEVEL=DEBUG` for verbose per-message logging when
+debugging, or `PYTHONLOGLEVEL=WARNING` to see only anomalies.
+
+Untrusted strings (peer-controlled wire content, KataGo stdout, RELAY
+upstream messages) are passed through `log_safe()` before being formatted
+into log records: control characters (newlines, tabs, etc.) are escaped
+and the text is truncated to `PROXY_LOG_TRUNCATE` characters (default
+256). This blocks log-injection attempts and bounds per-record size.
 
 Log records are namespaced under `kataproxy.*` (e.g. `kataproxy.router`,
 `kataproxy.pubsub_hub`) so individual subsystems can be filtered

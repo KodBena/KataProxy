@@ -52,7 +52,7 @@ from typing import Callable, Dict, List, Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from logging_config import get_logger
+from logging_config import get_logger, log_safe
 logger = get_logger("kataproxy")
 
 
@@ -275,9 +275,13 @@ class ClientSession:
         logger.info(f"peer={self._peer} started")
         try:
             async for raw_msg in self._ws:
+                # log_safe defends against (a) log injection — a peer
+                # cannot insert newlines that forge log lines from inside
+                # the formatted record — and (b) unbounded log-line growth
+                # for multi-megabyte messages. Default truncation is 256
+                # chars, configurable via PROXY_LOG_TRUNCATE.
                 logger.debug(
-                    f"peer={self._peer} "
-                    f"raw={str(raw_msg)}"
+                    f"peer={self._peer} raw={log_safe(raw_msg)}"
                 )
                 await self._handle_incoming(raw_msg)
         except ConnectionClosed as e:
@@ -299,7 +303,7 @@ class ClientSession:
         except JsonDepthExceededError as e:
             logger.error(
                 f"peer={self._peer} refused depth-bombed payload: {e} "
-                f"raw={raw_msg[:100]!r}"
+                f"raw={log_safe(raw_msg)}"
             )
             return
         except json.JSONDecodeError:
@@ -317,14 +321,14 @@ class ClientSession:
                     f"peer={self._peer} malformed protocol message "
                     f"(looks like a query but no prism matched): "
                     f"keys={sorted(outer.keys())} "
-                    f"action={outer.get('action')!r} "
+                    f"action={log_safe(outer.get('action'))} "
                     f"id_present={'id' in outer} "
-                    f"raw={raw_msg[:100]!r}"
+                    f"raw={log_safe(raw_msg)}"
                 )
             else:
                 logger.error(
                     f"peer={self._peer} unknown protocol branch: "
-                    f"raw={raw_msg[:100]!r}"
+                    f"raw={log_safe(raw_msg)}"
                 )
             return
 

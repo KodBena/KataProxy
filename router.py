@@ -52,6 +52,7 @@ from proxy_json import loads_bounded, JsonDepthExceededError
 import sproxy_config as cfg
 
 from flt import filter_dict
+from logging_config import log_safe
 
 logger = logging.getLogger("kataproxy.router")
 
@@ -621,7 +622,7 @@ class LeafRouter(BackendRouter):
                 logger.error(f"refused depth-bombed line from KataGo: {e}")
                 continue
             except json.JSONDecodeError as e:
-                logger.error(f"JSON error: {e}  raw={line}")
+                logger.error(f"JSON error: {e}  raw={log_safe(line)}")
                 continue
 
             logger.debug(f"stdout: {json.dumps(filter_dict(wire))}")
@@ -944,10 +945,12 @@ class RelayRouter(BackendRouter):
         """Read responses from one upstream; dispatch callbacks by canonical_id."""
         try:
             async for raw_msg in ws:
-                logger.debug(
-                    f"url={url} raw="
-                    f"{json.dumps(filter_dict(json.loads(str(raw_msg))))}"
-                )
+                # Log the raw message via log_safe rather than re-parsing —
+                # sidesteps both the cost of a second json.loads on every
+                # message AND the (theoretical) RecursionError that would
+                # have fired here for a depth-bombed payload before the
+                # depth-bound check below could refuse it.
+                logger.debug(f"url={url} raw={log_safe(raw_msg)}")
                 try:
                     wire: WireDict = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
                 except JsonDepthExceededError as e:
