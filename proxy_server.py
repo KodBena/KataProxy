@@ -516,6 +516,19 @@ class ClientSession:
             logger.debug(f"transformer suppressed response")
             return
 
+        # Drop the per-session _active_queries entry as soon as the
+        # underlying ProxyLink considers the query done. The link's
+        # response policy purges the mapping on the QUERY_COMPLETE final,
+        # so `forward(orig_id) is None` is the canonical signal that no
+        # further translate_upstream calls for this orig_id will happen.
+        # Without this cleanup the entry leaked for the session's lifetime
+        # — most acutely on the lookup_cache=true replay path, where the
+        # orphaned entry was the only consequence of a successful cached
+        # delivery (audit M-4).
+        completed_orig_id = translated_env.id
+        if self._link.mapping.forward(completed_orig_id) is None:
+            self._active_queries.pop(completed_orig_id, None)
+
         # Pass through the middleware.  It yields zero or more (orig_id, response)
         # pairs; each becomes one WebSocket frame.
         try:

@@ -897,6 +897,12 @@ class RelayRouter(BackendRouter):
         # async iteration) is enforced behaviourally.
         self._connections: dict[str, Any] = {}            # url → websocket
         self._reader_tasks: dict[str, asyncio.Task[None]] = {}  # url → task
+        # Reconnect tasks scheduled by _read_loop's finally block. Tracked
+        # so stop() can cancel them; without tracking, a flapping upstream
+        # accumulates one orphan task per disconnect cycle indefinitely
+        # (audit H-2). The set is self-pruning via the done-callback in
+        # _schedule_reconnect.
+        self._reconnect_tasks: set[asyncio.Task[None]] = set()
         self._tracker: CompletionTracker[str, int] = CompletionTracker()
         # canonical_id → (on_response, on_complete, url)
         self._callbacks: dict[str, tuple[OnResponse, OnComplete, str]] = {}
@@ -995,8 +1001,19 @@ class RelayRouter(BackendRouter):
         finally:
             self._connections.pop(url, None)
             self._reader_tasks.pop(url, None)
-            logger.info(f"scheduling reconnect for {url}")
-            asyncio.create_task(self._reconnect_with_backoff(url))
+            self._schedule_reconnect(url)
+
+    def _schedule_reconnect(self, url: str) -> None:
+        """Spawn a reconnect-with-backoff task and track it for cancellation."""
+        logger.info(f"scheduling reconnect for {url}")
+        task = asyncio.create_task(
+            self._reconnect_with_backoff(url),
+            name=f"relay-reconnect:{url}",
+        )
+        self._reconnect_tasks.add(task)
+        # Self-prune on completion so stop()'s set scan stays bounded
+        # under sustained successful reconnects.
+        task.add_done_callback(self._reconnect_tasks.discard)
 
     def _select_upstream(self, canonical_id: str) -> Optional[str]:
         """Walk the ring in preference order; return first under max_load."""
@@ -1088,6 +1105,11 @@ class RelayRouter(BackendRouter):
 
     async def stop(self) -> None:
         for task in list(self._reader_tasks.values()):
+            task.cancel()
+        # Cancel any in-flight reconnect-with-backoff tasks so stop() truly
+        # stops; otherwise they would continue retrying indefinitely after
+        # the router was meant to shut down.
+        for task in list(self._reconnect_tasks):
             task.cancel()
         for ws in list(self._connections.values()):
             try:
