@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from typing import Callable, Dict, List, Optional
 
 import websockets
@@ -108,6 +109,65 @@ Must produce a new instance per call; middleware is stateful per session."""
 
 
 # ---------------------------------------------------------------------------
+# _PerIpRateLimit — token bucket keyed by peer IP
+# ---------------------------------------------------------------------------
+
+class _PerIpRateLimit:
+    """Per-IP token-bucket rate limiter for inbound messages.
+
+    Constructed with a queries-per-minute budget; each :meth:`allow`
+    call consumes one token if available and refills at
+    ``rate_per_minute / 60`` tokens per second up to a ceiling equal to
+    ``rate_per_minute``. A budget of 0 (or any non-positive integer)
+    disables the limiter entirely; :meth:`allow` always returns True.
+
+    State is bounded: at most ``max_ips`` peer-IP entries are tracked,
+    with LRU eviction when the cap is exceeded. Eviction is a known
+    correctness weakness (an evicted IP gets a fresh full bucket on its
+    next message) but it bounds memory under sustained scanning. The
+    cap is not intended to be hit in normal operation; an operator
+    seeing it hit should investigate the traffic shape.
+    """
+
+    def __init__(self, rate_per_minute: int, *, max_ips: int = 10000) -> None:
+        self._rate_per_sec = rate_per_minute / 60.0  # tokens per second
+        self._capacity = max(1, rate_per_minute)
+        self._max_ips = max_ips
+        # OrderedDict keyed by IP; value is (tokens, last_seen_monotonic).
+        self._buckets: "OrderedDict[str, tuple[float, float]]" = OrderedDict()
+
+    @property
+    def enabled(self) -> bool:
+        return self._rate_per_sec > 0
+
+    def allow(self, ip: str) -> bool:
+        if not self.enabled:
+            return True
+        import time as _time
+        now = _time.monotonic()
+        entry = self._buckets.get(ip)
+        if entry is None:
+            tokens = float(self._capacity)
+        else:
+            tokens, last = entry
+            elapsed = now - last
+            tokens = min(float(self._capacity),
+                         tokens + elapsed * self._rate_per_sec)
+
+        if tokens < 1.0:
+            self._buckets[ip] = (tokens, now)
+            self._buckets.move_to_end(ip)
+            return False
+
+        self._buckets[ip] = (tokens - 1.0, now)
+        self._buckets.move_to_end(ip)
+        # LRU-evict the oldest entry if state has grown past the cap.
+        while len(self._buckets) > self._max_ips:
+            self._buckets.popitem(last=False)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # ClientSession
 # ---------------------------------------------------------------------------
 
@@ -126,11 +186,21 @@ class ClientSession:
         router: BackendRouter,
         transformer_factory: Optional[TransformerFactory] = None,
         middleware: Optional[SessionMiddleware] = None,
+        rate_limit: Optional[_PerIpRateLimit] = None,
     ):
         self._ws = ws
         self._peer = peer
+        # Extract IP for the per-IP rate limiter. ws.remote_address is a
+        # (host, port) tuple from the websockets library; falls back to the
+        # full peer string if the tuple shape isn't available.
+        self._peer_ip = (
+            ws.remote_address[0]
+            if isinstance(getattr(ws, "remote_address", None), tuple)
+            else peer
+        )
         self._hub = hub
         self._router = router
+        self._rate_limit = rate_limit
         self._dispatcher = Dispatcher(KATAGO_QUERY_PRISMS)
 
         # One tracker per client, shared with the ProxyLink so that
@@ -216,6 +286,14 @@ class ClientSession:
             logger.exception(f"peer={self._peer} error in receive loop")
 
     async def _handle_incoming(self, raw_msg: str) -> None:
+        # Per-IP rate limit. Off when the limiter is disabled (the default),
+        # so this is a single attribute read on the hot path otherwise.
+        if self._rate_limit is not None and not self._rate_limit.allow(self._peer_ip):
+            logger.warning(
+                f"peer={self._peer_ip} rate limit exceeded; dropping message"
+            )
+            return
+
         try:
             outer = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
         except JsonDepthExceededError as e:
@@ -540,6 +618,13 @@ class ProxyServer:
         self._hub = PubSubHub(cache_store=self._hub_cache)
         self._router: Optional[BackendRouter] = None
         self._rr_state: dict = {"counter": 0}
+        # Concurrent-session bookkeeping (audit M-1). Capped via
+        # PROXY_MAX_SESSIONS; a non-positive value disables the cap.
+        self._active_sessions: int = 0
+        # Per-IP rate limiter (audit M-1). Disabled when
+        # PROXY_RATELIMIT_PER_IP <= 0; that is the default so deployments
+        # behind a reverse proxy do not throttle every user as one IP.
+        self._rate_limit = _PerIpRateLimit(cfg.RATELIMIT_PER_IP)
 
     async def start(self) -> None:
 
@@ -553,43 +638,64 @@ class ProxyServer:
             await self._router.start()
             logger.info(f"router started for role={role}")
 
-        logger.info(f"listening on ws://{cfg.HOST}:{cfg.PORT} role={role}")
+        logger.info(
+            f"listening on ws://{cfg.HOST}:{cfg.PORT} role={role} "
+            f"max_size={cfg.MAX_MESSAGE_SIZE} max_sessions={cfg.MAX_SESSIONS} "
+            f"ratelimit_per_ip={cfg.RATELIMIT_PER_IP}"
+        )
         async with websockets.serve(
             self._handle_connection,
             cfg.HOST,
             cfg.PORT,
-            max_size=64 * 1024 * 1024,
+            max_size=cfg.MAX_MESSAGE_SIZE,
         ):
             await asyncio.Future()  # run forever
 
     async def _handle_connection(self, ws) -> None:
         peer = str(ws.remote_address)
+
+        # Concurrent-session cap (audit M-1). Refused connections close with
+        # WebSocket code 1013 ("try again later"), which the websockets
+        # library translates appropriately for the client.
+        if cfg.MAX_SESSIONS > 0 and self._active_sessions >= cfg.MAX_SESSIONS:
+            logger.warning(
+                f"refusing {peer}: session cap reached "
+                f"({self._active_sessions} >= {cfg.MAX_SESSIONS})"
+            )
+            await ws.close(code=1013, reason="server too busy")
+            return
+
         logger.info(f"accepted {peer}")
+        self._active_sessions += 1
+        try:
+            role = cfg.ROLE.upper()
+            if role in ("REDIRECT", "DELEGATE"):
+                session = RedirectSession(
+                    ws=ws,
+                    peer=peer,
+                    upstream_urls=cfg.UPSTREAM_URLS,
+                    rr_state=self._rr_state,
+                )
+            else:
+                # Each session gets its own middleware instance (middleware
+                # is stateful).
+                middleware = (
+                    self._middleware_factory() if self._middleware_factory else None
+                )
+                session = ClientSession(
+                    ws=ws,
+                    peer=peer,
+                    hub=self._hub,
+                    router=self._router,
+                    transformer_factory=self._transformer_factory,
+                    middleware=middleware,
+                    rate_limit=self._rate_limit,
+                )
 
-        role = cfg.ROLE.upper()
-        if role in ("REDIRECT", "DELEGATE"):
-            session = RedirectSession(
-                ws=ws,
-                peer=peer,
-                upstream_urls=cfg.UPSTREAM_URLS,
-                rr_state=self._rr_state,
-            )
-        else:
-            # Each session gets its own middleware instance (middleware is stateful).
-            middleware = (
-                self._middleware_factory() if self._middleware_factory else None
-            )
-            session = ClientSession(
-                ws=ws,
-                peer=peer,
-                hub=self._hub,
-                router=self._router,
-                transformer_factory=self._transformer_factory,
-                middleware=middleware,
-            )
-
-        await session.run()
-        logger.info(f"{peer} disconnected")
+            await session.run()
+            logger.info(f"{peer} disconnected")
+        finally:
+            self._active_sessions -= 1
 
     async def stop(self) -> None:
         if self._router is not None:
