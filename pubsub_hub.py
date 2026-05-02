@@ -186,24 +186,30 @@ class CoalescingPolicy:
         before the hub applies the action-query exemption so the caller can
         still see the content hash for logging.  The hub itself appends the
         random suffix unconditionally for action queries.
+
+        The hash is built from a JSON-serialised structured form (a dict
+        with action / analyzeTurns / capturing fields), not from
+        ``|``-joined ``repr``-quoted strings — the structured form is
+        stable across Python releases (json.dumps semantics are specified;
+        repr() escaping rules are not). The digest is 128 bits, well
+        beyond practical birthday collision in the in-flight pool. See
+        audit M-2 for the rationale.
         """
-        parts: list[Any] = [query.action.name]
-
-        turns = sorted(query.analyze_turns) if query.analyze_turns else []
-        parts.append(json.dumps(turns, sort_keys=True))
-
+        fields: dict[str, Any] = {
+            "action": query.action.name,
+            "analyzeTurns": (
+                sorted(query.analyze_turns) if query.analyze_turns else []
+            ),
+        }
         for field_name in self.capturing_fields:
-            value = query.opaque.get(field_name)
-            # Normalise moves list so order is preserved but type is stable.
-            if field_name == "moves" and isinstance(value, list):
-                value = json.dumps(value)
-            elif value is None:
-                value = "__absent__"
-            parts.append(f"{field_name}={value!r}")
+            # `default=str` lets us include any non-JSON-native value the
+            # opaque might carry without raising; the resulting string form
+            # is still deterministic for any given input.
+            fields[field_name] = query.opaque.get(field_name, None)
 
-        raw = "|".join(str(p) for p in parts)
-        digest = hashlib.sha256(raw.encode()).hexdigest()[:24]
-        logger.debug(f"raw={raw} digest={digest}")
+        payload = json.dumps(fields, sort_keys=True, default=str)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+        logger.debug(f"payload={payload} digest={digest}")
         return digest
 
 

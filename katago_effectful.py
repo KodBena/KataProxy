@@ -63,9 +63,16 @@ def _is_synthetic(orig_id: str) -> bool:
 
 
 def _real_id_of(synthetic_id: str) -> str:
-    """Extract the real orig_id from a synthetic one."""
-    # Format: __adap__<8hex>__<real_id>  (real_id may itself contain __)
-    return synthetic_id.split("__", 2)[1]
+    """Extract the real orig_id from a synthetic one.
+
+    Format: ``Q:<8hex>__<real_id>`` where real_id may itself contain ``__``.
+    The maxsplit=1 (rather than 2) is the load-bearing detail: the
+    pre-v1.0.6 maxsplit=2 took the middle of a 3-part split and silently
+    truncated real_orig_ids that contained the ``__`` separator (audit L-4).
+    With maxsplit=1, [1] is everything after the first separator —
+    including any subsequent ``__``s in the real_id.
+    """
+    return synthetic_id.split("__", 1)[1]
 
 
 # ---------------------------------------------------------------------------
