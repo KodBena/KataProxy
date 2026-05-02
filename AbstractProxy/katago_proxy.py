@@ -307,25 +307,57 @@ def translate_response_to_wire(
 # ---------------------------------------------------------------------------
 # Prism definitions for the Dispatcher
 # ---------------------------------------------------------------------------
+#
+# Each preview returns None — the Prism contract's "doesn't match this
+# shape" signal — for any payload that is not a dict-with-id. The
+# alternative (raise on missing structural fields) was the pre-v1.0.4
+# behaviour and let a single malformed wire message tear down the receive
+# loop with a stack trace; the per-connection-DoS surface noted in audit
+# H-3. The Dispatcher's no-match path remains the loud surface (an
+# operator-visible ERROR log in proxy_server's _handle_incoming), so
+# returning None here doesn't sacrifice ADR-0002 visibility.
+
+
+def _terminate_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
+    if not isinstance(d, dict) or "id" not in d:
+        return None
+    if d.get("action") != "terminate":
+        return None
+    return (d["id"], parse_query_from_wire(d)[1])
+
+
+def _action_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
+    if not isinstance(d, dict) or "id" not in d:
+        return None
+    action = d.get("action")
+    if action is None or action == "terminate":
+        return None
+    return (d["id"], parse_query_from_wire(d)[1])
+
+
+def _analyze_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
+    if not isinstance(d, dict) or "id" not in d:
+        return None
+    if "action" in d:
+        return None
+    return (d["id"], parse_query_from_wire(d)[1])
+
 
 TERMINATE_PRISM: Prism[dict[str, Any], KataGoQuery] = Prism(
     name="terminate",
-    preview=lambda d: (d["id"], parse_query_from_wire(d)[1])
-            if d.get("action") == "terminate" else None,
+    preview=_terminate_preview,
     review=translate_query_to_wire,
 )
 
 ACTION_PRISM: Prism[dict[str, Any], KataGoQuery] = Prism(
     name="action",
-    preview=lambda d: (d["id"], parse_query_from_wire(d)[1])
-            if "action" in d and d["action"] != "terminate" else None,
+    preview=_action_preview,
     review=translate_query_to_wire,
 )
 
 ANALYZE_PRISM: Prism[dict[str, Any], KataGoQuery] = Prism(
     name="analyze",
-    preview=lambda d: (d["id"], parse_query_from_wire(d)[1])
-            if "id" in d and "action" not in d else None,
+    preview=_analyze_preview,
     review=translate_query_to_wire,
 )
 

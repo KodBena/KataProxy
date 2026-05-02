@@ -123,3 +123,67 @@ KATAGO_STARTUP_TIMEOUT_S: float = float(
 
 RELAY_MAX_LOAD: int = int(os.environ.get("RELAY_MAX_LOAD", "10"))
 HASH_RING_REPLICAS: int = int(os.environ.get("HASH_RING_REPLICAS", "150"))
+
+# ---------------------------------------------------------------------------
+# Hub replay-cache bound (v1.0.4)
+# ---------------------------------------------------------------------------
+#
+# Maximum number of analysis-level replay-cache entries the hub keeps. When
+# the cache is full, the least-recently-used entry is evicted.
+#
+# Set to 0 (or any non-positive integer) to disable the bound entirely — the
+# cache then behaves as a plain dict and grows without limit. Operators with
+# very large active query corpora may want this; the default is conservative
+# because any client can populate the cache via {"cache": true} queries and
+# unbounded growth is then a one-connection memory-amplification surface
+# (audit H-2).
+
+HUB_CACHE_MAX: int = int(os.environ.get("PROXY_HUB_CACHE_MAX", "1024"))
+
+
+# ---------------------------------------------------------------------------
+# JSON structural depth bound (v1.0.4)
+# ---------------------------------------------------------------------------
+#
+# Maximum nesting depth accepted on inbound JSON (client wire, KataGo
+# stdout, RELAY upstream). Payloads exceeding this depth are refused
+# before json.loads runs, so a depth-bombed message can't trip Python's
+# interpreter recursion limit and tear down the receive loop (audit M-3).
+#
+# Default 64; legitimate KataGo JSON is depth ≤ 5 in practice. Set to 0
+# (or any non-positive integer) to disable the check.
+
+JSON_MAX_DEPTH: int = int(os.environ.get("PROXY_JSON_MAX_DEPTH", "64"))
+
+
+# ---------------------------------------------------------------------------
+# Connection-level resource caps (v1.0.4)
+# ---------------------------------------------------------------------------
+#
+# WebSocket-level bounds that apply per connection or across the whole
+# listening server. All three close audit M-1 / per-connection-DoS surfaces
+# that were unbounded pre-v1.0.4.
+
+# Maximum WebSocket message size accepted from a client. This applies to
+# inbound client queries only; KataGo response sizes (which run ~48 KB per
+# turn with the policy head and ownership map enabled) flow outbound and
+# are unaffected by this cap. Realistic inbound queries — even with rich
+# analysis_config payloads — are well under 100 KB. The pre-v1.0.4 default
+# of 64 MB was the most exploitable single value in the codebase; 4 MB
+# gives wide headroom for any realistic inbound shape.
+MAX_MESSAGE_SIZE: int = int(os.environ.get("PROXY_MAX_MESSAGE_SIZE",
+                                            str(4 * 1024 * 1024)))
+
+# Maximum number of concurrent client WebSocket sessions. New connections
+# above the cap are closed with WS code 1013 ("try again later"). Set to
+# 0 (or any non-positive integer) to disable the cap entirely. 256 covers
+# small-to-medium go-school deployments at 1–3 connections per active user.
+MAX_SESSIONS: int = int(os.environ.get("PROXY_MAX_SESSIONS", "256"))
+
+# Per-IP query rate limit, in queries per minute. When set, exceeding the
+# rate causes the offending message to be dropped (with a WARNING log);
+# the connection itself stays open. Default 0 (off) — appropriate for
+# deployments behind a reverse proxy where the proxy sees the reverse-
+# proxy IP for every user. Operators with direct internet exposure may
+# want to set this to e.g. 600 (10 q/sec sustained).
+RATELIMIT_PER_IP: int = int(os.environ.get("PROXY_RATELIMIT_PER_IP", "0"))

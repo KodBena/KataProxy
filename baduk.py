@@ -1,4 +1,3 @@
-import traceback
 from scipy.stats import entropy
 
 # ===========================================================================
@@ -101,13 +100,12 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
             try:
                 analysis = req_analyzer.push_packet(r.turn_number, (r.turn_number, r.opaque))
                 r.opaque['extra'] = deepcopy(analysis)
-            except Exception as e:
+            except Exception:
                 # asteval defers name resolution inside def-bodies to call
                 # time, so a body that referenced a no-longer-exposed name
                 # (e.g. legacy `np.median(x)`) may compile cleanly in
                 # on_query and only fail here on the first real packet.
-                print(traceback.format_exc())
-                logger.error(f"Enrichment failed: {e}")
+                logger.exception("Enrichment failed")
 
         if link.mapping.forward(eid) is None:
             request_cache.pop(eid, None)
