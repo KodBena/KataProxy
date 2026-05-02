@@ -34,7 +34,16 @@ public:
 
     std::pair<int, int> parseCoords(const std::string& s) const {
         if (s == "pass" || s == "PASS" || s == ".." || s == "tt") return {-1, -1};
-        char colChar = std::toupper(s[0]);
+        if (s.empty()) return {-1, -1};   // s[0] read below would be UB on empty
+        // Cast to unsigned char before std::toupper: passing a negative `char`
+        // (a high-bit byte under the default signed-char ABI on x86_64 Linux)
+        // is UB per the C standard. Refusing non-ASCII-letter first chars
+        // here also blocks crafted bytes from reaching the column arithmetic.
+        unsigned char ch0 = static_cast<unsigned char>(s[0]);
+        if (!((ch0 >= 'A' && ch0 <= 'Z') || (ch0 >= 'a' && ch0 <= 'z'))) {
+            return {-1, -1};
+        }
+        char colChar = static_cast<char>(std::toupper(ch0));
         int col = colChar - 'A';
         if (colChar > 'I') col--;
         try {
@@ -103,8 +112,20 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
 #endif
     std::vector<int> parent(k);
     std::iota(parent.begin(), parent.end(), 0);
-    auto find = [&](auto self, int i) -> int {
-        return (parent[i] == i) ? i : (parent[i] = self(self, parent[i]));
+    // Iterative two-walk path compression. The previous recursive lambda
+    // could stack-overflow on long parent chains assembled across many
+    // moveInfos with overlapping transpositions; the iterative form bounds
+    // stack use to O(1) regardless of chain length.
+    auto find = [&](int i) -> int {
+        int root = i;
+        while (parent[root] != root) root = parent[root];
+        int cur = i;
+        while (parent[cur] != root) {
+            int next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        return root;
     };
 
     std::unordered_map<uint64_t, int> seenHashes;
@@ -125,8 +146,8 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
 
             uint64_t h = testBoard.getSitHash(pla);
             if (seenHashes.count(h)) {
-                int rootA = find(find, i);
-                int rootB = find(find, seenHashes[h]);
+                int rootA = find(i);
+                int rootB = find(seenHashes[h]);
                 if (rootA != rootB) {
 #ifdef DEBUG
                     fprintf(stderr, "[partition_pv] merge: moveInfo[%d] -> moveInfo[%d] via hash 0x%016llx at move \"%s\"\n",
@@ -148,7 +169,7 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
     // 5. Compute total visits per cluster (after union-find is complete)
     std::unordered_map<int, long long> clusterVisits;
     for (int i = 0; i < k; ++i) {
-        int root = find(find, i);
+        int root = find(i);
         long long visits = moveInfos[i].value("visits", 0LL);
         clusterVisits[root] += visits;
     }
@@ -179,7 +200,7 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
 
     // 8. Write the new clusterId into every moveInfo
     for (int i = 0; i < k; ++i) {
-        int root = find(find, i);
+        int root = find(i);
         moveInfos[i]["clusterId"] = canonToId[root];
     }
 

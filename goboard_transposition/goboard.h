@@ -7,6 +7,7 @@
 #include <optional>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,15 +26,25 @@ constexpr Stone opponent(Stone s) noexcept {
 // ======================================================================
 class GoBoard {
 public:
+    // Bound on accepted board sizes. Standard play is 19; non-standard
+    // variants reach 25. Inputs above this cap are rejected at construction:
+    // the wire isn't trusted and crafted sizes (e.g. boardXSize=50000) hit
+    // an integer-overflow path on size_*size_ in the historical version,
+    // and boardXSize=0 hit an assert that aborted the process.
+    static constexpr int kMaxBoardSize = 25;
+
     // ---- Construction ----------------------------------------------------
 
     /// Create an empty size×size board.  `zobristSeed` seeds the random
     /// table used for incremental Zobrist hashing.
+    /// Throws std::invalid_argument if size is outside [1, kMaxBoardSize].
     explicit GoBoard(int size = 19,
                      std::uint64_t zobristSeed = 0xDEAD'BEEF'CAFE'1234ULL)
-        : size_{size}, board_(size * size, Stone::Empty)
+        : size_{validate_size_(size)},
+          board_(static_cast<std::size_t>(size_)
+                 * static_cast<std::size_t>(size_),
+                 Stone::Empty)
     {
-        assert(size >= 1);
         initZobrist(zobristSeed);
     }
 
@@ -96,6 +107,20 @@ protected:
     std::vector<std::array<std::uint64_t, 2>> ztab_;
 
     // ---- Helpers ---------------------------------------------------------
+
+    /// Validate a constructor-supplied board size; return it if accepted,
+    /// throw std::invalid_argument otherwise. Used as the size_ initializer
+    /// so an out-of-range size never reaches the board_ allocation.
+    static int validate_size_(int s) {
+        if (s < 1 || s > kMaxBoardSize) {
+            throw std::invalid_argument(
+                "GoBoard: size must be in [1, "
+                + std::to_string(kMaxBoardSize)
+                + "], got " + std::to_string(s));
+        }
+        return s;
+    }
+
     int  pos(int r, int c) const noexcept { return r * size_ + c; }
     bool onBoard(int r, int c) const noexcept {
         return static_cast<unsigned>(r) < static_cast<unsigned>(size_)
@@ -168,7 +193,8 @@ protected:
     }
 
     void initZobrist(std::uint64_t seed) {
-        ztab_.resize(size_ * size_);
+        ztab_.resize(static_cast<std::size_t>(size_)
+                     * static_cast<std::size_t>(size_));
         std::mt19937_64 rng(seed);
         for (auto& entry : ztab_) { entry[0] = rng(); entry[1] = rng(); }
     }
