@@ -1,9 +1,20 @@
+import ast
 import json
+import math
 from typing import Any,Callable,Dict,List,Optional,Tuple
+
+import numpy as np
 from rxp import CompiledPipeline,Pipeline
 from sgfmill.common import format_vertex,move_from_vertex
-import ast
 from sortedcontainers.sortedlist import SortedList
+
+# Process-wide JSONEncoder.default extension. Pre-v1.0.6 the np and math
+# references in the body had no corresponding import; the monkeypatched
+# default would NameError on any numpy scalar or NaN reaching json.dumps
+# (audit L-2). Fixed by the imports above. This patch is duplicated by
+# proxy_server.py with the same body; whichever loads last wins. The
+# duplication is itself a future-cleanup smell.
+
 original_default = json.JSONEncoder.default
 
 def global_extended_encoder(self, obj):

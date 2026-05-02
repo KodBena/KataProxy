@@ -46,10 +46,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from collections import OrderedDict
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import websockets
+from sortedcontainers import SortedList
 from websockets.exceptions import ConnectionClosed
 
 from logging_config import get_logger, log_safe
@@ -78,7 +81,14 @@ from session_middleware import SessionMiddleware, IdentityMiddleware
 from flt import filter_dict
 
 
-# Store the original method
+# Process-wide JSONEncoder.default extension. The body references SortedList
+# (from BSA's enrichment output), numpy scalars (also BSA), and Python NaN
+# (from edge-case KataGo responses); pre-v1.0.6 the imports were missing and
+# the monkeypatched default would NameError on any of those types reaching
+# json.dumps. Fixed by adding the imports above (audit L-2). This patch is
+# duplicated by bsa.py for the same reasons and survives whichever module
+# loads last; consolidating into one place is a future cleanup.
+
 original_default = json.JSONEncoder.default
 
 def global_extended_encoder(self, obj):
