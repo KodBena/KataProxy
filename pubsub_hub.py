@@ -63,6 +63,7 @@ import hashlib
 import json
 import logging
 import secrets
+from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
@@ -78,6 +79,7 @@ __all__ = [
     "InFlightEntry",
     "PubSubHub",
     "CacheStore",
+    "LRUCacheStore",
     "WireDict",
 ]
 
@@ -105,6 +107,45 @@ class CacheStore(Protocol):
     def __contains__(self, key: str) -> bool: ...
     def __getitem__(self, key: str) -> list[WireDict]: ...
     def __setitem__(self, key: str, value: list[WireDict]) -> None: ...
+
+
+class LRUCacheStore:
+    """A bounded LRU cache implementing the CacheStore Protocol.
+
+    Eviction order is "least recently set or read" — both ``__setitem__``
+    and ``__getitem__`` move the affected key to the most-recent position.
+    On overflow the least-recently-used entry is evicted (popitem(last=False)).
+
+    A maxsize of 0 or negative is interpreted as "unbounded": the LRU
+    machinery is bypassed entirely and the wrapped store behaves as a plain
+    dict. Operators who explicitly want unbounded growth set
+    ``PROXY_HUB_CACHE_MAX=0`` (or any non-positive value); the conservative
+    default is the finite maxsize wired by ``ProxyServer``.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self._store: "OrderedDict[str, list[WireDict]]" = OrderedDict()
+        self._maxsize = maxsize  # ≤ 0 means unbounded
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._store
+
+    def __getitem__(self, key: str) -> list[WireDict]:
+        value = self._store[key]
+        if self._maxsize > 0:
+            self._store.move_to_end(key)
+        return value
+
+    def __setitem__(self, key: str, value: list[WireDict]) -> None:
+        if self._maxsize > 0 and key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = value
+        if self._maxsize > 0 and len(self._store) > self._maxsize:
+            evicted_key, _ = self._store.popitem(last=False)
+            logger.debug(f"LRU evicted cache_key={evicted_key[:24]}…")
+
+    def __len__(self) -> int:
+        return len(self._store)
 
 
 # ---------------------------------------------------------------------------

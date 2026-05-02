@@ -70,7 +70,7 @@ from AbstractProxy.katago_proxy import (
 )
 from AbstractProxy.proxy_core import CompletionTracker, Envelope, TranslationError, Dispatcher, ProxyLink
 from AbstractProxy.protocol_transformer import TransformedChain, Transformer
-from pubsub_hub import PubSubHub
+from pubsub_hub import PubSubHub, LRUCacheStore
 from router import BackendRouter, InFlightQueryLoad, make_router
 from session_middleware import SessionMiddleware, IdentityMiddleware
 
@@ -511,7 +511,12 @@ class ProxyServer:
     ):
         self._transformer_factory = transformer_factory
         self._middleware_factory = middleware_factory
-        self._hub_cache = dict()
+        # Hub replay-cache: bounded LRU by default (audit H-2). The
+        # LRUCacheStore implementation degrades to a plain dict when its
+        # maxsize is non-positive, so PROXY_HUB_CACHE_MAX=0 restores
+        # pre-v1.0.4 unbounded semantics for operators who explicitly want
+        # them.
+        self._hub_cache = LRUCacheStore(maxsize=cfg.HUB_CACHE_MAX)
         self._hub = PubSubHub(cache_store=self._hub_cache)
         self._router: Optional[BackendRouter] = None
         self._rr_state: dict = {"counter": 0}

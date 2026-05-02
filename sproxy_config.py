@@ -123,3 +123,19 @@ KATAGO_STARTUP_TIMEOUT_S: float = float(
 
 RELAY_MAX_LOAD: int = int(os.environ.get("RELAY_MAX_LOAD", "10"))
 HASH_RING_REPLICAS: int = int(os.environ.get("HASH_RING_REPLICAS", "150"))
+
+# ---------------------------------------------------------------------------
+# Hub replay-cache bound (v1.0.4)
+# ---------------------------------------------------------------------------
+#
+# Maximum number of analysis-level replay-cache entries the hub keeps. When
+# the cache is full, the least-recently-used entry is evicted.
+#
+# Set to 0 (or any non-positive integer) to disable the bound entirely — the
+# cache then behaves as a plain dict and grows without limit. Operators with
+# very large active query corpora may want this; the default is conservative
+# because any client can populate the cache via {"cache": true} queries and
+# unbounded growth is then a one-connection memory-amplification surface
+# (audit H-2).
+
+HUB_CACHE_MAX: int = int(os.environ.get("PROXY_HUB_CACHE_MAX", "1024"))
