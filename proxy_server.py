@@ -424,7 +424,7 @@ class ClientSession:
             )
             return
 
-        self._hub.unsubscribe(target_internal_id, canonical_id)
+        was_last = self._hub.unsubscribe(target_internal_id, canonical_id)
         self._active_queries = {
             oid: pair
             for oid, pair in self._active_queries.items()
@@ -435,32 +435,58 @@ class ClientSession:
 
         send_queue = self._send_queue
 
-        async def on_terminate_response(wire_id: str, wire: dict) -> None:
-            relabelled = dict(wire)
-            relabelled["id"] = terminate_internal_id
-            if relabelled.get("terminateId") == canonical_id:
-                relabelled["terminateId"] = target_internal_id
-            logger.debug(
-                f"on_terminate_response "
-                f"wire_id={wire_id!r} → terminate_internal={terminate_internal_id!r}"
-            )
-            await send_queue.put(relabelled)
+        if was_last:
+            # Sole subscriber on this canonical: terminate at the LEAF and
+            # forward the real KataGo ack via relabelling. Existing flow.
 
-        async def on_terminate_complete(wire_id: str) -> None:
-            logger.debug(
-                f"on_terminate_complete "
-                f"wire_id={wire_id!r}"
-            )
+            async def on_terminate_response(wire_id: str, wire: dict) -> None:
+                relabelled = dict(wire)
+                relabelled["id"] = terminate_internal_id
+                if relabelled.get("terminateId") == canonical_id:
+                    relabelled["terminateId"] = target_internal_id
+                logger.debug(
+                    f"on_terminate_response "
+                    f"wire_id={wire_id!r} → terminate_internal={terminate_internal_id!r}"
+                )
+                await send_queue.put(relabelled)
 
-        await self._router.terminate(
-            canonical_id,
-            on_response=on_terminate_response,
-            on_complete=on_terminate_complete,
-        )
-        logger.debug(
-            f"canonical={canonical_id!r} "
-            f"dispatched for peer={self._peer}"
-        )
+            async def on_terminate_complete(wire_id: str) -> None:
+                logger.debug(
+                    f"on_terminate_complete "
+                    f"wire_id={wire_id!r}"
+                )
+
+            await self._router.terminate(
+                canonical_id,
+                on_response=on_terminate_response,
+                on_complete=on_terminate_complete,
+            )
+            logger.debug(
+                f"canonical={canonical_id!r} "
+                f"dispatched for peer={self._peer}"
+            )
+        else:
+            # Other subscribers remain on this canonical. Terminating the
+            # LEAF would silently end their analysis (the canonical's
+            # response stream would just stop). Synthesize the ack the
+            # originating client would have received as a sole subscriber:
+            # the KataGo protocol guarantees the ack is a verbatim echo of
+            # the terminate query's fields, so the synthesis is
+            # deterministic. Both id-fields here are in the internal
+            # namespace; _deliver_upstream's translate_upstream pass
+            # rewrites them to the client's namespace via the response
+            # policy's referential fields (RESPONSE_TERMINATE_ID_FIELD).
+            synthesized_ack: dict = {
+                "id": terminate_internal_id,
+                "action": "terminate",
+                "terminateId": target_internal_id,
+            }
+            logger.debug(
+                f"coalescing-transparent terminate: canonical={canonical_id!r} "
+                f"retained other subscriber(s); synthesizing ack for "
+                f"orig={orig_id!r}"
+            )
+            await send_queue.put(synthesized_ack)
 
     def _internal_to_canonical(self, subscriber_internal_id: str) -> Optional[str]:
         """Reverse lookup: subscriber_internal_id → canonical_id."""

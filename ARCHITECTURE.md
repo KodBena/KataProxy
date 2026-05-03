@@ -131,10 +131,12 @@ The contract that closes this gap sits at the layer boundary:
   other subscribers remain on the canonical, *or* the entry was already
   gone (an `on_complete` racing the unsubscribe).
 - The Hub stays free of router dependencies. The signal is a return
-  value, not a callback or a hub-side effect. Layer 1's `_cleanup`
-  consumes it and dispatches `router.terminate` on orphaned canonicals;
-  the WebSocket is already closed at that point, so the terminate-ack
-  is acknowledged into no-op callbacks.
+  value, not a callback or a hub-side effect. Layer 1 consumes it at
+  two call sites: `_cleanup` (the disconnect path; dispatches
+  `router.terminate` on orphaned canonicals into no-op callbacks
+  because the WebSocket is already closed) and `_handle_terminate`
+  (the explicit-terminate path; see "Coalescing-transparent explicit
+  terminate" below).
 
 Race semantics are deliberately on the safe side. If `on_complete` fires
 first and pops the entry, `unsubscribe` finds no entry and returns
@@ -149,6 +151,44 @@ effect — bypassing Layer 2 with Layer 2's blessing. The alternative
 shape (a hub-side router callback) would have leaked router knowledge
 into the coalescing layer, which is exactly what the return-value
 contract is designed to prevent.
+
+---
+
+## Coalescing-transparent explicit terminate
+
+`_handle_terminate` is the second consumer of the `was_last` contract
+above. When a client explicitly terminates a query, the action's
+correct effect at the LEAF depends on whether the originating client
+was the only subscriber on the canonical:
+
+- **Sole subscriber (`was_last == True`)** — the canonical can safely
+  end. The LEAF is terminated and the real KataGo ack is relabelled
+  and forwarded to the originating client.
+- **Other subscribers remain (`was_last == False`)** — terminating the
+  LEAF would silently end the search for every other subscriber on the
+  canonical, contradicting the central guarantee that makes coalescing
+  worthwhile (participants are isolated from each other's lifecycle).
+  The LEAF is left alone and a synthesized terminate-ack is delivered
+  to the originating client. From their perspective the protocol
+  behaviour is identical to the sole-subscriber case; the other
+  subscribers see no disruption.
+
+The KataGo analysis protocol guarantees the terminate ack is a verbatim
+echo of the query's fields (`id`, `action`, `terminateId`), which makes
+the synthesis deterministic. The synthesized ack carries the
+internal-namespace ids and is placed on `_send_queue`; the standard
+`_deliver_upstream` pipeline translates both `id` and `terminateId` to
+the client's namespace via the response policy's referential fields
+(see `AbstractProxy/katago_proxy.py:RESPONSE_TERMINATE_ID_FIELD`)
+before the WS write. The synthesized path is observationally
+indistinguishable from the LEAF-echo path; the only difference is that
+no terminate ever reaches the engine, which is precisely the property
+the multi-subscriber path needs to preserve.
+
+If KataGo's ack format ever extends — adding fields the synthesis does
+not mirror — the divergence will surface as a client-side parse anomaly.
+That is the correct loudness per ADR-0002: a stale-shape synthesis is
+a protocol-fidelity bug worth seeing, not silently tolerating.
 
 ---
 
