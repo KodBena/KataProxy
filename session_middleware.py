@@ -43,6 +43,7 @@ output is fed into the outer one. This mirrors the Transformer.then() convention
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import AsyncGenerator, Awaitable, Callable
 from typing import AsyncIterator, Awaitable, Callable
 
@@ -52,16 +53,24 @@ __all__ = [
     "SessionMiddleware",
     "IdentityMiddleware",
     "MiddlewareChain",
+    "SessionCapabilities",
     "SubmitQuery",
+    "TerminateQuery",
     "ResponseStream",
 ]
 
 # ---------------------------------------------------------------------------
 # Public type aliases
 #
-# SubmitQuery: the callback signature injected queries must use. Callers pass
-#   a synthetic orig_id and a KataGoQuery; the session routes it through the
-#   full transformer + hub/router pipeline independently.
+# SubmitQuery: the callback signature for injecting analyze queries. Callers
+#   pass a synthetic orig_id and a KataGoQuery; the session routes it through
+#   the full transformer + hub/router pipeline independently.
+#
+# TerminateQuery: the callback for terminating an in-flight query by orig_id.
+#   Wraps _handle_terminate internally; failure modes (already-completed
+#   query, untranslatable orig_id) are logged and return cleanly. Routes
+#   through the now-coalescing-aware terminate path, so middleware-initiated
+#   terminations respect coalescing transparency without extra work.
 #
 # ResponseStream: what every handle_response implementation must return. Using
 #   AsyncGenerator (rather than AsyncIterator) aligns the alias with what
@@ -71,7 +80,25 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 SubmitQuery = Callable[[str, KataGoQuery], Awaitable[None]]
+TerminateQuery = Callable[[str], Awaitable[None]]
 ResponseStream = AsyncIterator[tuple[str, KataGoResponse]]
+
+
+# ---------------------------------------------------------------------------
+# SessionCapabilities — the lifetime-of-the-session callback bundle
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SessionCapabilities:
+    """Callbacks the session exposes to middleware for the session's lifetime.
+
+    Constructed once per session; passed to `SessionMiddleware.on_session_start`
+    so middleware can stash references for use from session-scoped tasks.
+    Frozen to make the contract clear: middleware cannot mutate or extend
+    the capability surface.
+    """
+    submit_query: SubmitQuery
+    terminate_query: TerminateQuery
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +116,25 @@ class SessionMiddleware(ABC):
     Thread-safety: ClientSession is single-threaded (asyncio event loop), so
     implementations need not be thread-safe.
     """
+
+    def on_session_start(self, caps: SessionCapabilities) -> None:
+        """Called once after instantiation, before any on_query/handle_response.
+
+        Override to stash capabilities for later use (e.g., from a
+        session-scoped asyncio task) or to spawn such a task. The default
+        implementation is a no-op.
+
+        Called from within the session's event loop, so async task creation
+        (`asyncio.create_task`) is safe.
+        """
+
+    def on_session_end(self) -> None:
+        """Called once during session cleanup, after the hub.unsubscribe loop
+        and after any orphan-termination calls.
+
+        Override to cancel session-scoped tasks and release resources. The
+        default implementation is a no-op.
+        """
 
     def on_query(self, orig_id: str, query: KataGoQuery) -> None:
         """Called synchronously when a client query is received, before routing.
@@ -144,6 +190,17 @@ class MiddlewareChain(SessionMiddleware):
     def __init__(self, inner: SessionMiddleware, outer: SessionMiddleware) -> None:
         self._inner = inner
         self._outer = outer
+
+    def on_session_start(self, caps: SessionCapabilities) -> None:
+        # Inner first, outer second — same convention as on_query.
+        self._inner.on_session_start(caps)
+        self._outer.on_session_start(caps)
+
+    def on_session_end(self) -> None:
+        # Outer first, inner second — reverse-of-construction is the safer
+        # teardown convention (outer's tasks may depend on inner's state).
+        self._outer.on_session_end()
+        self._inner.on_session_end()
 
     def on_query(self, orig_id: str, query: KataGoQuery) -> None:
         self._inner.on_query(orig_id, query)

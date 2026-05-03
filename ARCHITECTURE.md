@@ -235,6 +235,37 @@ turns, identifies the worst-performing positions in a window, and submits
 follow-up queries with higher visit counts. This requires history, async
 submission, and control over response timing — all three.
 
+#### Lifecycle hooks and `SessionCapabilities`
+
+Middleware whose work isn't driven by an incoming response — a watchdog
+task, a periodic flush, an external clock — needs two more hooks plus a
+way to act on the session from outside `handle_response`:
+
+- `on_session_start(caps: SessionCapabilities)` runs once after
+  instantiation, before any `on_query` or `handle_response`. Stash the
+  capability bundle and spawn any session-scoped tasks here. The
+  proxy is already inside an asyncio event loop at this point, so
+  `asyncio.create_task` is safe.
+- `on_session_end()` runs once during `_cleanup`, after orphan
+  termination has flushed pending router state. Cancel session-scoped
+  tasks and release resources here.
+- `SessionCapabilities` exposes `submit_query` (existing semantics —
+  inject an analyze query) and `terminate_query(orig_id)` (new —
+  cancel an in-flight query by its client-namespace orig_id, routing
+  through the coalescing-aware `_handle_terminate` so middleware-
+  initiated terminations respect coalescing transparency without
+  extra work).
+
+The `KeepAliveMiddleware` (`keep_alive.py`) is the worked example for
+this triple: it stashes capabilities in `on_session_start`, spawns a
+watchdog task that wakes on a schedule, observes heartbeat queries
+via `on_query` to keep its idle clock fresh, and terminates stranded
+in-flight queries via `caps.terminate_query` when the idle clock
+exceeds the configured timeout. The watchdog handles the case
+`_cleanup` cannot: WebSocket stays open but the client is silent
+(HMR-orphaned singleton, frozen network without TCP RST, frontend
+bug).
+
 ---
 
 ## Recipe: add a query enricher transformer
