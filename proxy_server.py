@@ -47,6 +47,7 @@ import asyncio
 import json
 import logging
 import math
+import uuid
 from collections import OrderedDict
 from typing import Callable, Dict, List, Optional
 
@@ -76,7 +77,12 @@ from AbstractProxy.protocol_transformer import TransformedChain, Transformer
 from pubsub_hub import PubSubHub, LRUCacheStore
 from proxy_json import loads_bounded, JsonDepthExceededError
 from router import BackendRouter, InFlightQueryLoad, make_router
-from session_middleware import SessionMiddleware, IdentityMiddleware
+from session_middleware import (
+    IdentityMiddleware,
+    MiddlewareChain,
+    SessionCapabilities,
+    SessionMiddleware,
+)
 
 from flt import filter_dict
 
@@ -242,6 +248,17 @@ class ClientSession:
             f"transformer={effective_transformer.name!r} "
             f"middleware={type(self._middleware).__name__!r}"
         )
+
+        # Lifecycle hook: middleware sees the capability bundle once,
+        # before any queries arrive. Constructed here so the middleware can
+        # spawn session-scoped tasks (e.g., the keep-alive watchdog) inside
+        # the running event loop. ClientSession is always constructed within
+        # _handle_connection (an async coroutine), so an event loop exists.
+        caps = SessionCapabilities(
+            submit_query=self._handle_query,
+            terminate_query=self._terminate_query,
+        )
+        self._middleware.on_session_start(caps)
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -488,6 +505,28 @@ class ClientSession:
             )
             await send_queue.put(synthesized_ack)
 
+    async def _terminate_query(self, target_orig_id: str) -> None:
+        """Terminate an in-flight ANALYZE query by its client-namespace orig_id.
+
+        Surfaced to middleware via SessionCapabilities.terminate_query so
+        session-scoped tasks (the keep-alive watchdog, etc.) can cancel
+        stranded queries without needing a synthetic terminate query
+        constructed by the client. Wraps _handle_terminate; the synthetic
+        wrapper-id follows the `__keepalive_term_<hex>` convention next
+        to katago_effectful's `_make_synthetic_id` (audit L-4 preserved
+        the `__` separator across both consumers).
+
+        Routes through v1.0.8's coalescing-aware terminate path, so a
+        middleware-initiated termination on a coalesced canonical only
+        stops this session's view; other subscribers continue.
+        """
+        synthetic_id = f"__keepalive_term_{uuid.uuid4().hex[:12]}"
+        term_query = KataGoQuery(
+            action=KataGoAction.TERMINATE,
+            terminate_id=target_orig_id,
+        )
+        await self._handle_terminate(synthetic_id, term_query)
+
     def _internal_to_canonical(self, subscriber_internal_id: str) -> Optional[str]:
         """Reverse lookup: subscriber_internal_id → canonical_id."""
         for _orig, (iid, cid) in self._active_queries.items():
@@ -623,6 +662,12 @@ class ClientSession:
                         f"orphan terminate failed: canonical={cid!r}"
                     )
         self._active_queries.clear()
+
+        # Lifecycle hook: middleware releases session-scoped resources
+        # (cancels watchdog tasks, etc.). Called after orphan-termination
+        # so any middleware that depends on _active_queries observing the
+        # cleanup sees the post-cleanup state.
+        self._middleware.on_session_end()
 
 
 # ---------------------------------------------------------------------------
@@ -786,19 +831,40 @@ from contextual import Contextual
 from transposition_enricher import transposition_enricher
 from baduk import analysis_enricher
 from katago_effectful import adaptive_reevaluate
+from keep_alive import KeepAliveMiddleware
+
+
+def _make_middleware() -> SessionMiddleware:
+    """Per-session middleware factory.
+
+    Composes the adaptive re-evaluation policy (inner) with the keep-alive
+    inactivity watchdog (outer). When KEEP_ALIVE_IDLE_TIMEOUT_SECONDS is
+    set to 0 or negative, the watchdog is omitted and the chain degrades
+    to bare adaptive_reevaluate.
+    """
+    base = adaptive_reevaluate(
+        worst_quantile=0.25,
+        extra_visits=800,
+        window_size=3,
+    )
+    if cfg.KEEP_ALIVE_IDLE_TIMEOUT_SECONDS <= 0:
+        return base
+    return MiddlewareChain(
+        inner=base,
+        outer=KeepAliveMiddleware(
+            idle_timeout_seconds=cfg.KEEP_ALIVE_IDLE_TIMEOUT_SECONDS,
+        ),
+    )
 
 
 async def _main() -> None:
     server = ProxyServer(
         # Pure synchronous content transformations (enrichment, filtering).
         transformer_factory=Contextual(analysis_enricher).then(transposition_enricher),
-        # Stateful async policy: adaptive re-evaluation.
-        # A fresh instance per session because middleware holds per-query state.
-        middleware_factory=lambda: adaptive_reevaluate(
-            worst_quantile=0.25,
-            extra_visits=800,
-            window_size=3,
-        ),
+        # Stateful async policy: adaptive re-evaluation chained with the
+        # keep-alive inactivity watchdog. A fresh instance per session
+        # because middleware holds per-query state.
+        middleware_factory=_make_middleware,
     )
     try:
         await server.start()

@@ -207,3 +207,32 @@ RATELIMIT_PER_IP: int = int(os.environ.get("PROXY_RATELIMIT_PER_IP", "0"))
 ADAPTIVE_MAX_INFLIGHT: int = int(
     os.environ.get("PROXY_ADAPTIVE_MAX_INFLIGHT", "128")
 )
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive middleware (v1.0.10)
+# ---------------------------------------------------------------------------
+#
+# Per-session inactivity watchdog timeout, in seconds. The KeepAliveMiddleware
+# tracks the most recent timestamp at which a configurable "heartbeat" query
+# (default: action == query_version) was observed on the session. If the gap
+# between now and the last heartbeat exceeds this value, every in-flight
+# ANALYZE query on the session is terminated.
+#
+# This catches the WS-stays-open-but-client-silent case that v1.0.7's
+# orphan-cleanup cannot: when the WebSocket never closes (HMR-orphaned
+# singleton on a frontend, network freeze without TCP RST, frontend bug
+# stops sending heartbeats without disconnecting), the proxy never observes
+# a disconnect and `_cleanup` never runs. The watchdog is the safety net.
+#
+# Default 25 seconds: 5x the frontend's existing 5000ms `query_version`
+# watchdog cadence. Generous enough to absorb network jitter and one missed
+# beat without false positives, tight enough to bound cost on a stranded
+# ponder.
+#
+# Set to 0 (or any non-positive value) to disable keep-alive entirely. The
+# middleware factory will then omit KeepAliveMiddleware from the chain.
+
+KEEP_ALIVE_IDLE_TIMEOUT_SECONDS: float = float(
+    os.environ.get("KEEP_ALIVE_IDLE_TIMEOUT_SECONDS", "25.0")
+)
