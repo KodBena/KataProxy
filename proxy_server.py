@@ -571,8 +571,31 @@ class ClientSession:
             f"peer={self._peer} "
             f"unsubscribing {len(self._active_queries)} active query(ies)"
         )
+
+        async def _drop_response(_wid: str, _wire: dict) -> None:
+            pass
+
+        async def _drop_complete(_wid: str) -> None:
+            pass
+
         for _orig_id, (iid, cid) in list(self._active_queries.items()):
-            self._hub.unsubscribe(iid, cid)
+            was_last = self._hub.unsubscribe(iid, cid)
+            if was_last:
+                # Sole subscriber departed. The canonical has no consumer
+                # left and would otherwise run on the LEAF until natural
+                # completion (cheap on bounded analyze, expensive on
+                # ponder). Terminate at the router; the WS is already
+                # closed, so the ack is dropped.
+                try:
+                    await self._router.terminate(
+                        cid,
+                        on_response=_drop_response,
+                        on_complete=_drop_complete,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"orphan terminate failed: canonical={cid!r}"
+                    )
         self._active_queries.clear()
 
 
