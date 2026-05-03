@@ -482,12 +482,20 @@ class PubSubHub:
     # Public: unsubscribe (on client disconnect before query completes)
     # -----------------------------------------------------------------------
 
-    def unsubscribe(self, subscriber_internal_id: str, canonical_id: str) -> None:
-        """Remove a subscriber from an in-flight slot."""
+    def unsubscribe(self, subscriber_internal_id: str, canonical_id: str) -> bool:
+        """Remove a subscriber from an in-flight slot.
+
+        Returns True iff this call left the subscriber list empty — i.e., the
+        canonical is now orphaned and the caller is responsible for terminating
+        it at the router. Returns False otherwise: either other subscribers
+        remain on the canonical, or the entry was already gone (on_complete
+        racing this call). The hub stays free of router dependencies; the
+        orphan-cleanup signal is a return value, not a callback.
+        """
         entry = self._by_canonical.get(canonical_id)
         if entry is None:
             logger.info(f"no entry for canonical={canonical_id!r}")
-            return
+            return False
 
         before = len(entry.subscribers)
         entry.subscribers = [
@@ -509,6 +517,8 @@ class PubSubHub:
             f"{before} → {len(entry.subscribers)} subscriber(s). "
             f"Hash {entry.content_hash[:24]} removed from coalescing pool."
         )
+
+        return len(entry.subscribers) == 0
 
     # -----------------------------------------------------------------------
     # Router callbacks (async, called from the router's read loop)

@@ -113,6 +113,45 @@ The contracts that hold these invariants together live in
 
 ---
 
+## Lifecycle: orphan-canonical cleanup
+
+A canonical query in the Hub may outlive its only subscriber: a session
+disconnects (clean tab close, browser quit, eventual TCP RST) while its
+in-flight canonical is still computing. Without an explicit signal back
+to Layer 3, the canonical would run on the LEAF until natural completion
+— cheap on bounded analyze, expensive on ponder
+(`maxVisits = PONDER_MAX_VISITS`). The cost is real on GPU-accelerated
+deployments.
+
+The contract that closes this gap sits at the layer boundary:
+
+- `PubSubHub.unsubscribe(...)` returns `bool`. `True` means the call
+  emptied the subscriber list — the canonical is now orphaned and the
+  caller is responsible for terminating it at the router. `False` means
+  other subscribers remain on the canonical, *or* the entry was already
+  gone (an `on_complete` racing the unsubscribe).
+- The Hub stays free of router dependencies. The signal is a return
+  value, not a callback or a hub-side effect. Layer 1's `_cleanup`
+  consumes it and dispatches `router.terminate` on orphaned canonicals;
+  the WebSocket is already closed at that point, so the terminate-ack
+  is acknowledged into no-op callbacks.
+
+Race semantics are deliberately on the safe side. If `on_complete` fires
+first and pops the entry, `unsubscribe` finds no entry and returns
+`False`; no spurious terminate. If `unsubscribe` fires first and reports
+`was_last`, the caller's `router.terminate` is benign even when the
+canonical was mid-completion: the LEAF terminate path tolerates a
+canonical it has already retired.
+
+This responsibility is named explicitly because it is the one contract
+where Layer 1 acts on a Layer 2 return value to dispatch a Layer 3
+effect — bypassing Layer 2 with Layer 2's blessing. The alternative
+shape (a hub-side router callback) would have leaked router knowledge
+into the coalescing layer, which is exactly what the return-value
+contract is designed to prevent.
+
+---
+
 ## Extension points
 
 There are two extension surfaces, and the choice between them is
