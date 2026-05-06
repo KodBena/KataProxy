@@ -14,14 +14,21 @@ without sanitisation, opening a log-injection surface (a client could
 forge log lines by including newlines in the message, audit H-4).
 PYTHONLOGLEVEL=DEBUG re-enables verbose logging when needed.
 
-The log_safe() helper produces a quoted, length-bounded, newline-escaped
-representation of an untrusted string suitable for inclusion in a log
-record. Use it for any value that originated from the wire.
+Two log-rendering helpers live here:
+
+  - ``log_safe(s)`` — quoted, length-bounded, newline-escaped repr of an
+    untrusted string (defends against log injection + unbounded growth).
+    Use for any value that originated from the wire.
+
+  - ``filter_dict(d)`` — strips three high-volume KataGo response keys
+    (``moveInfos``, ``ownership``, ``policy``) so log records remain
+    readable. Use when emitting an entire response dict at DEBUG.
 
 License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
 import logging
 import os
+from typing import Any
 
 
 _DEFAULT_LOG_TRUNCATE = int(os.environ.get("PROXY_LOG_TRUNCATE", "256"))
@@ -71,3 +78,22 @@ def log_safe(s: object, *, max_len: int = _DEFAULT_LOG_TRUNCATE) -> str:
         text = str(s)
         truncated = text[:max_len] + ("..." if len(text) > max_len else "")
     return repr(truncated)
+
+
+# Three KataGo response keys are bulky enough that logging them inline
+# defeats the readability of every other field. moveInfos can be hundreds
+# of move-info dicts; ownership is a board-area-shaped float array; policy
+# is a per-cell distribution. Strip them when the goal is "show the shape
+# of this response in a log record" rather than "preserve every byte."
+_BULKY_KATAGO_RESPONSE_KEYS = frozenset({"moveInfos", "ownership", "policy"})
+
+
+def filter_dict(d: dict[str, Any]) -> dict[str, Any]:
+    """Drop bulky KataGo response keys for log readability.
+
+    The three stripped keys (``moveInfos``, ``ownership``, ``policy``)
+    each carry per-move or per-cell payload that drowns out the rest of
+    the response shape in a log record. Used by the proxy_server and
+    router log paths when emitting whole-response DEBUG records.
+    """
+    return {k: v for k, v in d.items() if k not in _BULKY_KATAGO_RESPONSE_KEYS}

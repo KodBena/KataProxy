@@ -1,11 +1,21 @@
+"""
+analysis_enricher.py — Transformer factory that wires DeltaAnalysisState
+into the proxy's response pipeline.
+
+This is the *proxy-protocol-aware glue* between the wire-level Transformer
+extension surface and the protocol-agnostic analysis substance in
+delta_analysis.py. It reads ``analysis_config`` off each incoming query's
+opaque payload, builds a per-eid DeltaAnalysisState via the
+RegistryInterpreter (registry_interpreter.py compiles the user-supplied
+analysis expressions against a curated stdlib), and on each response
+attaches the analysis result to ``r.opaque['extra']``.
+
+(Renamed in v1.0.14 from baduk.py.)
+"""
+
 from scipy.stats import entropy
 
-# ===========================================================================
-# Baduk (Go) reactive multi-resolution analysis pipeline
-# ===========================================================================
-
-
-from bsa import BadukAnalysisState
+from delta_analysis import DeltaAnalysisState
 
 
 from typing import Optional, Dict
@@ -31,13 +41,14 @@ def sliding_median(arr, window):
 # NOTE: The analysis functions previously defined here as module-level lambdas
 # (visit_entropy, winrate, default_delta_fn, etc.) are now user-configurable
 # via the 'symbols' and 'bindings' sections of the analysis_config passed in
-# each query's opaque payload.  See reginterp.py for the stdlib helpers that
-# are always available (_visit_entropy, _spread, _visit_ratio, _uservisits, …).
+# each query's opaque payload.  See registry_interpreter.py for the stdlib
+# helpers that are always available (_visit_entropy, _spread, _visit_ratio,
+# _uservisits, …).
 
-from reginterp import RegistryInterpreter
+from registry_interpreter import RegistryInterpreter
 
 def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoResponse]:
-    request_cache: Dict[str, BadukAnalysisState] = {}
+    request_cache: Dict[str, DeltaAnalysisState] = {}
 
     def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
         # `analysis_config` is consumed by this transformer and must NEVER
@@ -46,7 +57,7 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
         # responses on short / empty queries (no moveInfos / rootInfo on
         # returned packets, observed as a frontend crash on empty-board
         # ponder). The strip is unconditional; analyser setup is gated
-        # below because BadukAnalysisState requires ≥2 moves to compute
+        # below because DeltaAnalysisState requires ≥2 moves to compute
         # meaningful deltas, but that gate must NOT also gate the strip.
         config = q.opaque.pop('analysis_config', None)
 
@@ -62,7 +73,7 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
                 delta_fn = env.get_delta_fn()
                 summary_fn = env.get_summary_fn()
                 state_fns = env.get_state_fns()
-                analyzer = BadukAnalysisState(
+                analyzer = DeltaAnalysisState(
                     q.opaque['boardXSize'],
                     q.opaque['moves'],
                     delta_fn=delta_fn,
@@ -73,7 +84,7 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
             except (RuntimeError, TypeError, ValueError) as e:
                 # RegistryInterpreter raises RuntimeError on asteval compile
                 # failure (syntax error, parameter/symbol shadow of a curated
-                # name, etc.); BadukAnalysisState can raise ValueError for
+                # name, etc.); DeltaAnalysisState can raise ValueError for
                 # n_moves<2; range/dtype checks in the curated stdlib raise
                 # TypeError or ValueError. None of these justify killing the
                 # WebSocket connection — the right posture per ADR-0002 is to

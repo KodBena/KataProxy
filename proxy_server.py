@@ -56,7 +56,7 @@ import websockets
 from sortedcontainers import SortedList
 from websockets.exceptions import ConnectionClosed
 
-from logging_config import get_logger, log_safe
+from logging_config import filter_dict, get_logger, log_safe
 logger = get_logger("kataproxy")
 
 
@@ -84,16 +84,16 @@ from session_middleware import (
     SessionMiddleware,
 )
 
-from flt import filter_dict
 
 
 # Process-wide JSONEncoder.default extension. The body references SortedList
-# (from BSA's enrichment output), numpy scalars (also BSA), and Python NaN
-# (from edge-case KataGo responses); pre-v1.0.6 the imports were missing and
-# the monkeypatched default would NameError on any of those types reaching
-# json.dumps. Fixed by adding the imports above (audit L-2). This patch is
-# duplicated by bsa.py for the same reasons and survives whichever module
-# loads last; consolidating into one place is a future cleanup.
+# (from delta_analysis enrichment output), numpy scalars (also delta_analysis),
+# and Python NaN (from edge-case KataGo responses); pre-v1.0.6 the imports
+# were missing and the monkeypatched default would NameError on any of those
+# types reaching json.dumps. Fixed by adding the imports above (audit L-2).
+# This patch is duplicated by delta_analysis.py for the same reasons and
+# survives whichever module loads last; consolidating into one place is a
+# future cleanup.
 
 original_default = json.JSONEncoder.default
 
@@ -829,7 +829,7 @@ class ProxyServer:
 # ---------------------------------------------------------------------------
 from contextual import Contextual
 from transposition_enricher import transposition_enricher
-from baduk import analysis_enricher
+from analysis_enricher import analysis_enricher
 from katago_effectful import adaptive_reevaluate
 from keep_alive import KeepAliveMiddleware
 

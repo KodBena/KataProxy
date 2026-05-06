@@ -350,12 +350,15 @@ migration. The remaining leaks listed above (the `str` constraint, the
 integer-turn-number assumption in supposedly generic code) stay open
 items.
 
-### The `rxp` reactive pipeline is experimental
+### The `reactive_pipeline` subpackage is experimental
 
-The `rxp/` subpackage was a reactive-pipeline experiment that is currently
-used only by `bsa.py`. It is not integrated with
-the main message flow. If you find it useful, it is yours; if you do not,
-ignore it — the core proxy does not depend on it.
+The `reactive_pipeline/` subpackage was a reactive-pipeline experiment
+that is currently used only by `delta_analysis.py` (which holds
+`DeltaAnalysisState`, the multi-resolution analysis manager that the
+`analysis_enricher` Transformer factory wires into the response
+pipeline). It is not integrated with the main message flow. If you find
+it useful, it is yours; if you do not, ignore it — the core proxy does
+not depend on it.
 
 ---
 
@@ -367,12 +370,17 @@ For an extender looking for the right file to read:
 |---|---|---|
 | `proxy_server.py` | 1 | `ProxyServer`, `ClientSession`, `RedirectSession`, `_main` |
 | `session_middleware.py` | 1 | `SessionMiddleware` ABC, `MiddlewareChain`, `IdentityMiddleware` |
+| `keep_alive.py` | 1 | `KeepAliveMiddleware` (per-session inactivity watchdog) |
+| `katago_effectful.py` | 1 | `AdaptiveReevaluateMiddleware` |
+| `analysis_enricher.py` | 1 | `analysis_enricher` Transformer factory (proxy-protocol-aware glue for `DeltaAnalysisState`) |
+| `delta_analysis.py` | — | `DeltaAnalysisState` (protocol-agnostic reactive analysis substance; uses `reactive_pipeline`) |
+| `registry_interpreter.py` | — | `RegistryInterpreter` (compiles user-supplied analysis expressions against a curated stdlib) |
+| `reactive_pipeline/` | — | Reactive-pipeline eDSL (`Pipeline`, `CompiledPipeline`, …) — experimental, used only by `delta_analysis.py` |
 | `AbstractProxy/protocol_transformer.py` | 1 | `Transformer`, `TransformedChain` |
 | `AbstractProxy/katago_transformers.py` | 1 | KataGo-specific transformers |
 | `pubsub_hub.py` | 2 | `PubSubHub`, `CoalescingPolicy`, `CacheStore` protocol |
 | `router.py` | 3 | `BackendRouter` ABC, `LeafRouter`, `RelayRouter`, `EchoRouter`, `LoadMetric`, `HashRing` |
 | `AbstractProxy/proxy_core.py` | All | `IdMapping`, `CompletionTracker`, `ProxyLink`, `ProxyChain`, `Prism`, `Dispatcher` |
-| `AbstractProxy/katago_proxy.py` | All | KataGo protocol types, prisms, parsers |
+| `AbstractProxy/katago_proxy.py` | All | KataGo protocol types, prisms, parsers, response-variant union |
 | `sproxy_config.py` | All | Environment-driven configuration |
-| `logging_config.py` | All | Optional `ColoredLogger` shim |
-| `flt.py` | All | Utility: filter-recursive-dict for log readability |
+| `logging_config.py` | All | Logging factory, `log_safe()`, `filter_dict()` for log readability |

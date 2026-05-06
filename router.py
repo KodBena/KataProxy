@@ -52,8 +52,7 @@ from AbstractProxy.katago_proxy import (
 from proxy_json import loads_bounded, JsonDepthExceededError
 import sproxy_config as cfg
 
-from flt import filter_dict
-from logging_config import log_safe
+from logging_config import filter_dict, log_safe
 
 logger = logging.getLogger("kataproxy.router")
 

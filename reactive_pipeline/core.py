@@ -1,11 +1,18 @@
 """
-reactive_pipeline.py — Composable reactive computation graph with arbitrary topologies.
+reactive_pipeline/core.py — Composable reactive computation graph with arbitrary
+topologies.
 
 A Pipeline is an eDSL for declaring how a stream of indexed values should flow through
 a series of topology+algebra pairs.  Each combinator sets a topology (which inputs j
 depends on) and Map/Fold/ZipWith supplies the algebra (how those inputs are combined).
 The compiled result propagates updates incrementally, touching only the outputs that
 actually depend on each changed input.
+
+The package's public surface is re-exported from ``reactive_pipeline/__init__.py``;
+import ``Pipeline``, ``CompiledPipeline``, ``MonitoredNode``, ``MissingData``,
+``CompiledNode`` from ``reactive_pipeline`` directly.
+
+(Renamed in v1.0.14 from ``rxp/rxp.py``.)
 """
 
 from __future__ import annotations
