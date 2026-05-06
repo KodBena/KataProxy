@@ -28,8 +28,8 @@ _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
-from AbstractProxy.katago_proxy import KataGoAction, KataGoQuery  # noqa: E402
-from keep_alive import KeepAliveMiddleware  # noqa: E402
+from katago import KataGoAction, KataGoQuery  # noqa: E402
+from middleware.keep_alive import KeepAliveMiddleware  # noqa: E402
 from proxy_server import ClientSession  # noqa: E402
 from pubsub_hub import PubSubHub  # noqa: E402
 

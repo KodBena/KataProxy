@@ -61,7 +61,7 @@ logger = get_logger("kataproxy")
 
 
 import sproxy_config as cfg
-from AbstractProxy.katago_proxy import (
+from katago import (
     KataGoAction,
     KataGoQuery,
     make_katago_link,
@@ -77,7 +77,7 @@ from AbstractProxy.protocol_transformer import TransformedChain, Transformer
 from pubsub_hub import PubSubHub, LRUCacheStore
 from proxy_json import loads_bounded, JsonDepthExceededError
 from router import BackendRouter, InFlightQueryLoad, make_router
-from session_middleware import (
+from middleware.session_middleware import (
     IdentityMiddleware,
     MiddlewareChain,
     SessionCapabilities,
@@ -828,10 +828,10 @@ class ProxyServer:
 # main
 # ---------------------------------------------------------------------------
 from contextual import Contextual
-from transposition_enricher import transposition_enricher
-from analysis_enricher import analysis_enricher
-from katago_effectful import adaptive_reevaluate
-from keep_alive import KeepAliveMiddleware
+from transformers.transposition_enricher import transposition_enricher
+from transformers.analysis_enricher import analysis_enricher
+from middleware.adaptive_reevaluate import adaptive_reevaluate
+from middleware.keep_alive import KeepAliveMiddleware
 
 
 def _make_middleware() -> SessionMiddleware:

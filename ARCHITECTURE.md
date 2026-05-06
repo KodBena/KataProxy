@@ -50,7 +50,7 @@ flowchart TB
     Relay <--> Upstream
 ```
 
-**Layer 1 — Sessions** (`proxy_server.py`, `session_middleware.py`)
+**Layer 1 — Sessions** (`proxy_server.py`, `middleware/`, `transformers/`)
 One `ClientSession` per connected WebSocket. Owns the per-client transformer
 chain and the per-session middleware. Translates between the client's
 external ID namespace and an internal namespace.
@@ -179,7 +179,7 @@ the synthesis deterministic. The synthesized ack carries the
 internal-namespace ids and is placed on `_send_queue`; the standard
 `_deliver_upstream` pipeline translates both `id` and `terminateId` to
 the client's namespace via the response policy's referential fields
-(see `AbstractProxy/katago_proxy.py:RESPONSE_TERMINATE_ID_FIELD`)
+(see `katago/katago_proxy.py:RESPONSE_TERMINATE_ID_FIELD`)
 before the WS write. The synthesized path is observationally
 indistinguishable from the LEAF-echo path; the only difference is that
 no terminate ever reaches the engine, which is precisely the property
@@ -256,7 +256,7 @@ way to act on the session from outside `handle_response`:
   initiated terminations respect coalescing transparency without
   extra work).
 
-The `KeepAliveMiddleware` (`keep_alive.py`) is the worked example for
+The `KeepAliveMiddleware` (`middleware/keep_alive.py`) is the worked example for
 this triple: it stashes capabilities in `on_session_start`, spawns a
 watchdog task that wakes on a schedule, observes heartbeat queries
 via `on_query` to keep its idle clock fresh, and terminates stranded
@@ -369,18 +369,26 @@ For an extender looking for the right file to read:
 | File | Layer | What lives here |
 |---|---|---|
 | `proxy_server.py` | 1 | `ProxyServer`, `ClientSession`, `RedirectSession`, `_main` |
-| `session_middleware.py` | 1 | `SessionMiddleware` ABC, `MiddlewareChain`, `IdentityMiddleware` |
-| `keep_alive.py` | 1 | `KeepAliveMiddleware` (per-session inactivity watchdog) |
-| `katago_effectful.py` | 1 | `AdaptiveReevaluateMiddleware` |
-| `analysis_enricher.py` | 1 | `analysis_enricher` Transformer factory (proxy-protocol-aware glue for `DeltaAnalysisState`) |
+| `pubsub_hub.py` | 2 | `PubSubHub`, `CoalescingPolicy`, `CacheStore` protocol |
+| `router.py` | 3 | `BackendRouter` ABC, `LeafRouter`, `RelayRouter`, `EchoRouter`, `LoadMetric`, `HashRing` |
+| | | |
+| `AbstractProxy/proxy_core.py` | All | `IdMapping`, `CompletionTracker`, `ProxyLink`, `ProxyChain`, `Prism`, `Dispatcher`, `Envelope`, `ReferentialField` (protocol-agnostic) |
+| `AbstractProxy/protocol_transformer.py` | 1 | `Transformer`, `TransformedChain` (Generic, protocol-agnostic) |
+| `katago/katago_proxy.py` | 1 | KataGo wire types (`KataGoQuery`, `KataGoResponse = AnalyzeResponse \| MetadataResponse`), prisms, parsers, completion bridge (`response_completion_signal`) |
+| | | |
+| `transformers/katago.py` | 1 | KataGo response post-processing factories (`min_visits_filter`, `add_score_delta`, `final_only`, `inject_defaults`, `standard_postprocessing`) |
+| `transformers/analysis_enricher.py` | 1 | `analysis_enricher` Transformer factory — proxy-protocol-aware glue for `DeltaAnalysisState` |
+| `transformers/transposition_enricher.py` | 1 | `transposition_enricher` Transformer factory — optional native-backed PV partitioning |
+| | | |
+| `middleware/session_middleware.py` | 1 | `SessionMiddleware` ABC, `MiddlewareChain`, `IdentityMiddleware`, `SessionCapabilities` |
+| `middleware/keep_alive.py` | 1 | `KeepAliveMiddleware` (per-session inactivity watchdog) |
+| `middleware/adaptive_reevaluate.py` | 1 | `AdaptiveReevaluateMiddleware` (the "all three at once" worked example) |
+| | | |
 | `delta_analysis.py` | — | `DeltaAnalysisState` (protocol-agnostic reactive analysis substance; uses `reactive_pipeline`) |
 | `registry_interpreter.py` | — | `RegistryInterpreter` (compiles user-supplied analysis expressions against a curated stdlib) |
 | `reactive_pipeline/` | — | Reactive-pipeline eDSL (`Pipeline`, `CompiledPipeline`, …) — experimental, used only by `delta_analysis.py` |
-| `AbstractProxy/protocol_transformer.py` | 1 | `Transformer`, `TransformedChain` |
-| `AbstractProxy/katago_transformers.py` | 1 | KataGo-specific transformers |
-| `pubsub_hub.py` | 2 | `PubSubHub`, `CoalescingPolicy`, `CacheStore` protocol |
-| `router.py` | 3 | `BackendRouter` ABC, `LeafRouter`, `RelayRouter`, `EchoRouter`, `LoadMetric`, `HashRing` |
-| `AbstractProxy/proxy_core.py` | All | `IdMapping`, `CompletionTracker`, `ProxyLink`, `ProxyChain`, `Prism`, `Dispatcher` |
-| `AbstractProxy/katago_proxy.py` | All | KataGo protocol types, prisms, parsers, response-variant union |
+| `contextual.py` | — | Generic Kleisli-style combinator for context-passing factory composition |
+| | | |
 | `sproxy_config.py` | All | Environment-driven configuration |
 | `logging_config.py` | All | Logging factory, `log_safe()`, `filter_dict()` for log readability |
+| `proxy_json.py` | All | Bounded-depth JSON loader (defends against deeply-nested JSON DoS) |

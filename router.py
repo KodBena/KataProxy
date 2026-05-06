@@ -43,7 +43,7 @@ from collections import deque
 from typing import Any, Awaitable, Callable, Deque, Optional
 
 from AbstractProxy.proxy_core import CompletionSignal, CompletionTracker
-from AbstractProxy.katago_proxy import (
+from katago import (
     KataGoAction,
     KataGoQuery,
     parse_response_from_wire,

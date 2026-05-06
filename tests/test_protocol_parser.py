@@ -1,6 +1,6 @@
 """
-test_protocol_parser.py — Unit tests for the KataGo wire-protocol parser
-in AbstractProxy/katago_proxy.py.
+tests/test_protocol_parser.py — Unit tests for the KataGo wire-protocol
+parser in katago/katago_proxy.py.
 
 Covers:
 
@@ -31,19 +31,23 @@ _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
-from AbstractProxy.katago_proxy import (  # noqa: E402
+from katago import (  # noqa: E402
     AnalyzeResponse,
     KATAGO_QUERY_PRISMS,
     KataGoAction,
     KataGoQuery,
     MetadataResponse,
-    RESPONSE_TERMINATE_ID_FIELD,
     parse_query_from_wire,
     parse_response_from_wire,
     response_completion_signal,
     translate_query_to_wire,
     translate_response_to_wire,
 )
+# RESPONSE_TERMINATE_ID_FIELD is a referential-field binding, used by tests
+# to exercise the variant-preserving _response_with_terminate_id contract.
+# Not part of katago/__init__.py's public re-exports — pulled directly from
+# the submodule.
+from katago.katago_proxy import RESPONSE_TERMINATE_ID_FIELD  # noqa: E402
 from AbstractProxy.proxy_core import Dispatcher  # noqa: E402
 
 

@@ -34,9 +34,17 @@ kataproxy = "proxy_server:main"
 Repository = "https://github.com/KodBena/kataproxy"
 
 [tool.hatch.build.targets.wheel]
-# Root-level application modules + sub-packages.
-# Phase 5 will reorganize these into a proper kataproxy/ package.
-packages = ["AbstractProxy", "rxp"]
+# Sub-packages (post-v1.0.14 layout):
+#   AbstractProxy     — protocol-agnostic core (proxy_core, protocol_transformer)
+#   katago            — KataGo-specific protocol types and parsers
+#   transformers      — Layer 1 transformer extensions
+#   middleware        — Layer 1 SessionMiddleware ABC + extensions
+#   reactive_pipeline — experimental reactive DSL (used only by delta_analysis)
+#
+# Root-level modules (proxy_server, router, pubsub_hub, sproxy_config,
+# logging_config, proxy_json, delta_analysis, registry_interpreter,
+# contextual) ride along through `sources = ["."]`.
+packages = ["AbstractProxy", "katago", "transformers", "middleware", "reactive_pipeline"]
 sources = ["."]
 
 [tool.mypy]

@@ -38,7 +38,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Optional
 
-from AbstractProxy.katago_proxy import KataGoAction, KataGoQuery
+from katago import KataGoAction, KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
 
 logger = logging.getLogger("kataproxy.tests.synthetic_backend")

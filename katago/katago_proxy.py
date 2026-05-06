@@ -1,5 +1,6 @@
 """
-katago_proxy.py — KataGo analysis engine protocol, assembled from proxy_core.
+katago/katago_proxy.py — KataGo analysis engine protocol, assembled from
+AbstractProxy.proxy_core.
 
 This module contains *only* KataGo-specific definitions. It imports the
 reusable abstractions and instantiates them for KataGo's wire protocol.
@@ -26,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Any, Callable, Optional
 
-from .proxy_core import (
+from AbstractProxy.proxy_core import (
     CompletionSignal,
     CompletionTracker,
     Envelope,

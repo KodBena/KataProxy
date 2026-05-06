@@ -1,8 +1,15 @@
 """
-katago_transformers.py — Transformers specific to KataGo analysis post-processing.
+transformers/katago.py — Transformers specific to KataGo analysis
+post-processing.
 
-These are assembled from the generic Transformer primitive. Each is
-independently testable and composable via `then`.
+Holds the stdlib of small KataGo response shapers — `min_visits_filter`,
+`add_score_delta`, `final_only`, `inject_defaults`, plus the worked-example
+composition `standard_postprocessing`. Each is built from the generic
+``Transformer`` primitive in ``AbstractProxy.protocol_transformer`` and
+composes via ``.then()``.
+
+(Renamed and relocated in v1.0.13 from
+``AbstractProxy/katago_transformers.py``.)
 """
 
 from __future__ import annotations
@@ -10,8 +17,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Callable, Optional
 
-from .protocol_transformer import Transformer
-from .katago_proxy import (
+from AbstractProxy.protocol_transformer import Transformer
+from katago import (
     AnalyzeResponse,
     KataGoQuery,
     KataGoResponse,

@@ -10,7 +10,7 @@ sortedcontainers, but nothing about KataGoQuery, KataGoResponse, the
 Transformer abstraction, or the proxy's session model. The wire-side
 plumbing that feeds it lives in analysis_enricher.py.
 
-(Renamed in v1.0.14 from bsa.py / BadukAnalysisState. The Go-specific
+(Renamed in v1.0.13 from bsa.py / BadukAnalysisState. The Go-specific
 intent survives in the ``sgfmill`` dependency and the black/white
 move-color assignment.)
 """

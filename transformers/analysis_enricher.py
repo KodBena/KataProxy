@@ -1,6 +1,6 @@
 """
-analysis_enricher.py — Transformer factory that wires DeltaAnalysisState
-into the proxy's response pipeline.
+transformers/analysis_enricher.py — Transformer factory that wires
+DeltaAnalysisState into the proxy's response pipeline.
 
 This is the *proxy-protocol-aware glue* between the wire-level Transformer
 extension surface and the protocol-agnostic analysis substance in
@@ -10,7 +10,7 @@ RegistryInterpreter (registry_interpreter.py compiles the user-supplied
 analysis expressions against a curated stdlib), and on each response
 attaches the analysis result to ``r.opaque['extra']``.
 
-(Renamed in v1.0.14 from baduk.py.)
+(Renamed and relocated in v1.0.13 from baduk.py at the proxy root.)
 """
 
 from scipy.stats import entropy
@@ -21,7 +21,7 @@ from delta_analysis import DeltaAnalysisState
 from typing import Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ProxyLink
-from AbstractProxy.katago_proxy import (
+from katago import (
     AnalyzeResponse,
     KataGoAction,
     KataGoQuery,

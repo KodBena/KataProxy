@@ -1,5 +1,8 @@
 """
-transposition_enricher.py — Optional response enricher for KataGo PVs.
+transformers/transposition_enricher.py — Optional response enricher
+for KataGo PVs.
+
+(Relocated in v1.0.13 from transposition_enricher.py at the proxy root.)
 
 When the native go_transposition module is available, this transformer
 post-processes analysis responses to partition the principal-variation
@@ -58,7 +61,7 @@ import json
 from typing import Any, Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ProxyLink
-from AbstractProxy.katago_proxy import (
+from katago import (
     KataGoAction,
     KataGoQuery,
     KataGoResponse,

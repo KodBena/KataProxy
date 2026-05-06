@@ -6,13 +6,29 @@ distinct variants. Written 2026-05-06 against proxy v1.0.12.
 Authoritative for the `refactor/response-variants` branch; superseded
 by the v1.0.13 release notes once tagged.
 
-> **Filename note (post-v1.0.14).** This document references files by
-> their pre-rename names (`baduk.py`, `bsa.py`, `reginterp.py`, `rxp/`).
-> In v1.0.14 these renamed to `analysis_enricher.py`, `delta_analysis.py`,
-> `registry_interpreter.py`, and `reactive_pipeline/` respectively, and
-> the class `BadukAnalysisState` renamed to `DeltaAnalysisState`. The
-> historical names are preserved here as the durable record of what the
-> v1.0.13 work touched; `git log --follow` traces the renames.
+> **Filename note (post-v1.0.13).** This document references files by
+> their pre-rename, pre-relocation paths (`baduk.py`, `bsa.py`,
+> `reginterp.py`, `rxp/`, `keep_alive.py`, `katago_effectful.py`,
+> `session_middleware.py`, `AbstractProxy/katago_proxy.py`,
+> `AbstractProxy/katago_transformers.py`, `transposition_enricher.py`).
+> In v1.0.13 these renamed and/or moved to:
+>
+>   - `transformers/analysis_enricher.py` (was `baduk.py`)
+>   - `delta_analysis.py` (was `bsa.py`; class `BadukAnalysisState` →
+>     `DeltaAnalysisState`)
+>   - `registry_interpreter.py` (was `reginterp.py`)
+>   - `reactive_pipeline/` (was `rxp/`)
+>   - `middleware/keep_alive.py` (was `keep_alive.py`)
+>   - `middleware/adaptive_reevaluate.py` (was `katago_effectful.py`)
+>   - `middleware/session_middleware.py` (was at root)
+>   - `katago/katago_proxy.py` (was `AbstractProxy/katago_proxy.py`)
+>   - `transformers/katago.py` (was
+>     `AbstractProxy/katago_transformers.py`)
+>   - `transformers/transposition_enricher.py` (was at root)
+>
+> The historical names are preserved here as the durable record of what
+> the v1.0.13 response-variants work touched; `git log --follow` traces
+> each file across the renames and relocations.
 
 This document is **scoped to the proxy submodule**. The wire shape
 emitted to clients does not change for analyze responses; metadata
