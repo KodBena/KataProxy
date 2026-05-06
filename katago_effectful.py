@@ -40,7 +40,15 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
 import sproxy_config as cfg
-from AbstractProxy.katago_proxy import KataGoAction, KataGoQuery, KataGoResponse
+from dataclasses import replace
+
+from AbstractProxy.katago_proxy import (
+    AnalyzeResponse,
+    KataGoAction,
+    KataGoQuery,
+    KataGoResponse,
+    MetadataResponse,
+)
 from session_middleware import SessionMiddleware, SubmitQuery, ResponseStream
 
 import logging
@@ -117,8 +125,12 @@ class AdaptiveReevaluateMiddleware(SessionMiddleware):
         # _buffered and _orig_queries are kept consistent at every
         # mutation site.
         self._expected: "OrderedDict[str, int]" = OrderedDict()
-        # orig_id → buffered (turn_number, response) pairs
-        self._buffered: Dict[str, List[Tuple[int, KataGoResponse]]] = {}
+        # orig_id → buffered (turn_number, response) pairs.
+        # Adaptive only buffers analyze finals — the metadata short-circuit
+        # in handle_response guarantees only AnalyzeResponse reaches the
+        # bucket — so the inner type narrows to AnalyzeResponse rather
+        # than the broader KataGoResponse union.
+        self._buffered: Dict[str, List[Tuple[int, AnalyzeResponse]]] = {}
         # orig_id → original KataGoQuery (needed to build the deeper query)
         self._orig_queries: Dict[str, KataGoQuery] = {}
 
@@ -164,6 +176,16 @@ class AdaptiveReevaluateMiddleware(SessionMiddleware):
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:
+        # ── Metadata responses pass through unchanged ───────────────────
+        # adaptive_reevaluate is analyze-shaped end-to-end; on_query
+        # already short-circuits non-analyze. Synthetic deeper queries
+        # are also analyze, so the synthetic-id branch below never sees
+        # a metadata response. This guard makes the analyze-only nature
+        # explicit at the type level.
+        if isinstance(response, MetadataResponse):
+            yield orig_id, response
+            return
+
         # ── Responses from injected deeper queries ──────────────────────
         if _is_synthetic(orig_id):
             # Re-label to the real client ID and pass through.
@@ -204,12 +226,13 @@ class AdaptiveReevaluateMiddleware(SessionMiddleware):
             # un-patched for turns that are truly complete now.
             for turn_n, final_r in finals:
                 if turn_n in turns_to_deepen:
-                    # Signal "still in progress" for this turn.
-                    yield orig_id, KataGoResponse(
-                        is_during_search=True,
-                        turn_number=final_r.turn_number,
-                        opaque=final_r.opaque,
-                    )
+                    # Signal "still in progress" for this turn. final_r
+                    # is structurally an AnalyzeResponse (the metadata
+                    # branch returned at the top of handle_response, and
+                    # the buffer is only populated below the analyze
+                    # discriminator), so dataclasses.replace returns an
+                    # AnalyzeResponse with is_during_search flipped.
+                    yield orig_id, replace(final_r, is_during_search=True)
                 else:
                     yield orig_id, final_r  # this turn is definitively done
 
@@ -228,7 +251,7 @@ class AdaptiveReevaluateMiddleware(SessionMiddleware):
     # Delta-analysis helpers
     # ------------------------------------------------------------------
 
-    def _find_worst_turns(self, responses: List[KataGoResponse]) -> List[int]:
+    def _find_worst_turns(self, responses: List[AnalyzeResponse]) -> List[int]:
         """Return turn numbers whose mean policy delta is in the worst quantile."""
         turn_maps: Dict[str, Dict[int, List[float]]] = {
             "black": defaultdict(list),

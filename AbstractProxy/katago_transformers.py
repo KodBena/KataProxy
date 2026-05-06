@@ -7,10 +7,16 @@ independently testable and composable via `then`.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from .protocol_transformer import Transformer
-from .katago_proxy import KataGoQuery, KataGoResponse
+from .katago_proxy import (
+    AnalyzeResponse,
+    KataGoQuery,
+    KataGoResponse,
+    MetadataResponse,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -21,17 +27,15 @@ def min_visits_filter(threshold: int) -> Transformer[KataGoQuery, KataGoResponse
     """Drop moveInfos entries with fewer than `threshold` visits."""
 
     def filter_response(_eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
-        if "moveInfos" in r.opaque:
+        # moveInfos is analyze-only by structural protocol; metadata
+        # responses carry no moveInfos and pass through unchanged.
+        if isinstance(r, AnalyzeResponse) and "moveInfos" in r.opaque:
             filtered = [
                 m for m in r.opaque["moveInfos"]
                 if m.get("visits", 0) >= threshold
             ]
             new_opaque = {**r.opaque, "moveInfos": filtered}
-            return KataGoResponse(
-                is_during_search=r.is_during_search,
-                turn_number=r.turn_number,
-                opaque=new_opaque,
-            )
+            return replace(r, opaque=new_opaque)
         return r
 
     return Transformer(
@@ -56,6 +60,10 @@ def add_score_delta() -> Transformer[KataGoQuery, KataGoResponse]:
     scores: dict[str, float] = {}  # eid → last known scoreLead
 
     def enrich_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+        # rootInfo is analyze-only by structural protocol; metadata
+        # responses carry no rootInfo and pass through unchanged.
+        if not isinstance(r, AnalyzeResponse):
+            return r
         root_info = r.opaque.get("rootInfo", {})
         current_score = root_info.get("scoreLead")
         if current_score is not None:
@@ -64,11 +72,7 @@ def add_score_delta() -> Transformer[KataGoQuery, KataGoResponse]:
             if previous is not None:
                 delta = current_score - previous
                 new_opaque = {**r.opaque, "scoreDelta": delta}
-                return KataGoResponse(
-                    is_during_search=r.is_during_search,
-                    turn_number=r.turn_number,
-                    opaque=new_opaque,
-                )
+                return replace(r, opaque=new_opaque)
         return r
 
     return Transformer(
@@ -87,12 +91,19 @@ def final_only() -> Transformer[KataGoQuery, KataGoResponse]:
 
     The client sees only final results. Useful when the proxy requests
     reportDuringSearchEvery for internal monitoring but the end client
-    doesn't want the noise.
+    doesn't want the noise. Metadata responses (query_version,
+    query_models, terminate ack) are inherently single-shot finals
+    and pass through unchanged.
     """
+    def filter_response(_eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+        if isinstance(r, MetadataResponse):
+            return r
+        return None if r.is_during_search else r
+
     return Transformer(
         name="final_only",
         on_query=lambda _eid, q: q,
-        on_response=lambda _eid, r: None if r.is_during_search else r,
+        on_response=filter_response,
     )
 
 

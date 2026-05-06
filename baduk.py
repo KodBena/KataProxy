@@ -12,12 +12,13 @@ from typing import Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ProxyLink
 from AbstractProxy.katago_proxy import (
+    AnalyzeResponse,
     KataGoAction,
-    KataGoQuery, 
-    KataGoResponse, 
-    translate_query_to_wire, 
+    KataGoQuery,
+    KataGoResponse,
+    translate_query_to_wire,
     translate_response_to_wire,
-    parse_response_from_wire
+    parse_response_from_wire,
 )
 import numpy as np
 from copy import deepcopy
@@ -96,7 +97,16 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
     def on_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
         # 1. Attempt enrichment
         req_analyzer = request_cache.get(eid)
-        if req_analyzer is not None and "moveInfos" in r.opaque:
+        # Tighten the gate from "moveInfos in opaque" (which was already
+        # an analyze-only check structurally) to the explicit isinstance
+        # narrowing the type system needs. moveInfos remains the second
+        # gate because not every analyze response carries it (errors,
+        # interrupted searches).
+        if (
+            req_analyzer is not None
+            and isinstance(r, AnalyzeResponse)
+            and "moveInfos" in r.opaque
+        ):
             try:
                 analysis = req_analyzer.push_packet(r.turn_number, (r.turn_number, r.opaque))
                 r.opaque['extra'] = deepcopy(analysis)
