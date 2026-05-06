@@ -55,6 +55,7 @@ class KataGoAction(Enum):
     TERMINATE = auto()
     TERMINATE_ALL = auto()
     QUERY_VERSION = auto()
+    QUERY_MODELS = auto()
     CLEAR_CACHE = auto()
 
 
@@ -238,6 +239,23 @@ def make_katago_chain(depth: int = 1) -> ProxyChain[str]:
 # Wire-level translation
 # ---------------------------------------------------------------------------
 
+# Closed-set vocabulary of supported KataGo wire action strings. The map is
+# the single source of truth: parse_query_from_wire raises on a string that
+# is not a key, and the dispatch prism (_action_preview below) gates on
+# membership before delegating to the parser. Adding a new action means
+# adding a member to KataGoAction *and* a key here — and the type checker
+# will not catch a missed half. See the module-level note above the prisms
+# for why the receive-loop side has to gate-not-raise.
+_KATAGO_WIRE_ACTIONS: dict[str, KataGoAction] = {
+    "analyze": KataGoAction.ANALYZE,
+    "terminate": KataGoAction.TERMINATE,
+    "terminate_all": KataGoAction.TERMINATE_ALL,
+    "query_version": KataGoAction.QUERY_VERSION,
+    "query_models": KataGoAction.QUERY_MODELS,
+    "clear_cache": KataGoAction.CLEAR_CACHE,
+}
+
+
 def translate_query_to_wire(query: KataGoQuery, envelope_id: str) -> dict[str, Any]:
     """Serialise a KataGoQuery to a wire-format dict."""
     wire: dict[str, Any] = {"id": envelope_id}
@@ -252,18 +270,31 @@ def translate_query_to_wire(query: KataGoQuery, envelope_id: str) -> dict[str, A
 
 
 def parse_query_from_wire(wire: dict[str, Any]) -> tuple[str, KataGoQuery]:
-    """Extract envelope ID and structured query from a wire-format dict."""
-    envelope_id: str = wire["id"]
-    action_str: str = wire.get("action", "analyze")
+    """Extract envelope ID and structured query from a wire-format dict.
 
-    action_map: dict[str, KataGoAction] = {
-        "analyze": KataGoAction.ANALYZE,
-        "terminate": KataGoAction.TERMINATE,
-        "terminate_all": KataGoAction.TERMINATE_ALL,
-        "query_version": KataGoAction.QUERY_VERSION,
-        "clear_cache": KataGoAction.CLEAR_CACHE,
-    }
-    action = action_map.get(action_str, KataGoAction.ANALYZE)
+    Per ADR-0002, an `action` key whose value is not in the closed-set
+    vocabulary is a protocol violation and raises ValueError — silently
+    coercing to ANALYZE was the v1.0.11-and-earlier shape that masked the
+    `query_models` regression. A missing `action` key still defaults to
+    ANALYZE for vanilla-KataGo wire compatibility (where the analyze
+    action is implicit).
+
+    Receive-loop callers must gate on `_KATAGO_WIRE_ACTIONS` membership
+    before invoking this parser to preserve the audit-H-3
+    per-connection-survive property; the prism layer below does that.
+    """
+    envelope_id: str = wire["id"]
+
+    if "action" in wire:
+        action_str = wire["action"]
+        if action_str not in _KATAGO_WIRE_ACTIONS:
+            raise ValueError(
+                f"unknown KataGo wire action: {action_str!r}; "
+                f"expected one of {sorted(_KATAGO_WIRE_ACTIONS)}"
+            )
+        action = _KATAGO_WIRE_ACTIONS[action_str]
+    else:
+        action = KataGoAction.ANALYZE
 
     known_keys = {"id", "action", "terminateId", "analyzeTurns"}
     opaque = {k: v for k, v in wire.items() if k not in known_keys}
@@ -331,6 +362,12 @@ def _action_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
         return None
     action = d.get("action")
     if action is None or action == "terminate":
+        return None
+    # Gate on the closed-set vocabulary so unknown actions fall through
+    # to the dispatcher's no-match path, where proxy_server emits the
+    # structured "malformed protocol message" ERROR (ADR-0002 loud
+    # surface) without raising into the receive loop (audit H-3).
+    if action not in _KATAGO_WIRE_ACTIONS:
         return None
     return (d["id"], parse_query_from_wire(d)[1])
 
