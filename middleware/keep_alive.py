@@ -1,5 +1,6 @@
 """
-keep_alive.py — Per-session inactivity watchdog as a SessionMiddleware.
+middleware/keep_alive.py — Per-session inactivity watchdog as a
+SessionMiddleware.
 
 KeepAliveMiddleware catches the case v1.0.7's orphan-cleanup cannot:
 when the WebSocket stays nominally open but the client is silent.
@@ -53,13 +54,13 @@ import logging
 from time import monotonic
 from typing import Callable, Optional
 
-from AbstractProxy.katago_proxy import (
+from katago import (
     AnalyzeResponse,
     KataGoAction,
     KataGoQuery,
     KataGoResponse,
 )
-from session_middleware import (
+from middleware.session_middleware import (
     ResponseStream,
     SessionCapabilities,
     SessionMiddleware,

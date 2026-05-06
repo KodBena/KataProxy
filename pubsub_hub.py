@@ -68,7 +68,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
-from AbstractProxy.katago_proxy import KataGoAction, KataGoQuery
+from katago import KataGoAction, KataGoQuery
 
 logger = logging.getLogger("kataproxy." + __name__)
 

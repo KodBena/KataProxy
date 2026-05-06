@@ -1,5 +1,6 @@
 """
-session_middleware.py — Session-level async middleware for response interception.
+middleware/session_middleware.py — Session-level async middleware for
+response interception.
 
 Architecture
 ────────────
@@ -47,7 +48,7 @@ from dataclasses import dataclass
 from typing import AsyncGenerator, Awaitable, Callable
 from typing import AsyncIterator, Awaitable, Callable
 
-from AbstractProxy.katago_proxy import KataGoQuery, KataGoResponse
+from katago import KataGoQuery, KataGoResponse
 
 __all__ = [
     "SessionMiddleware",

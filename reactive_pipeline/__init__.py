@@ -13,7 +13,7 @@ If you are looking for the proxy's response-transformation extension points,
 see AbstractProxy/protocol_transformer.py (Transformer) and
 session_middleware.py (SessionMiddleware) instead.
 
-(Renamed in v1.0.14 from rxp/. The ``core.py`` module was previously
+(Renamed in v1.0.13 from rxp/. The ``core.py`` module was previously
 ``rxp/rxp.py``.)
 """
 

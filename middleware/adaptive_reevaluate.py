@@ -1,5 +1,9 @@
 """
-katago_effectful.py — Adaptive re-evaluation as a SessionMiddleware.
+middleware/adaptive_reevaluate.py — Adaptive re-evaluation as a
+SessionMiddleware.
+
+(Renamed and relocated in v1.0.13 from katago_effectful.py at the proxy
+root.)
 
 Design
 ──────
@@ -42,14 +46,14 @@ import numpy as np
 import sproxy_config as cfg
 from dataclasses import replace
 
-from AbstractProxy.katago_proxy import (
+from katago import (
     AnalyzeResponse,
     KataGoAction,
     KataGoQuery,
     KataGoResponse,
     MetadataResponse,
 )
-from session_middleware import SessionMiddleware, SubmitQuery, ResponseStream
+from middleware.session_middleware import SessionMiddleware, SubmitQuery, ResponseStream
 
 import logging
 logger = logging.getLogger("kataproxy." + __name__)

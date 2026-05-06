@@ -1,25 +1,38 @@
 """
-AbstractProxy — Protocol-agnostic proxy abstractions and KataGo bindings.
+AbstractProxy — Protocol-agnostic proxy abstractions.
 
-The package is split into two layers:
+This package holds the reusable, protocol-agnostic core of the proxy
+framework. Two modules:
 
-  proxy_core, protocol_transformer
-      Reusable, protocol-agnostic abstractions: IdMapping, ProxyLink,
-      ProxyChain, Prism, Transformer, TransformedChain. Nothing in this
-      layer knows about KataGo.
+  proxy_core
+      ID translation and identity contracts: ``IdMapping``,
+      ``ProxyLink``, ``ProxyChain``, ``Prism``, ``Dispatcher``,
+      ``CompletionTracker``, ``CompletionSignal``, ``Envelope``,
+      ``ReferentialField``.
 
-  katago_proxy, katago_transformers
-      KataGo-specific instantiations of the above. KataGo wire format,
-      query/response types, and concrete transformers live here.
+  protocol_transformer
+      Synchronous content-transformation extension surface:
+      ``Transformer`` and ``TransformedChain``. Generic over query
+      and response types.
 
-Extenders adding a second protocol (e.g. an alternative analysis engine)
-should mirror the katago_* pattern: define the wire types, the prisms,
-the ProxyLink factory, and a transformer module.
+KataGo-specific instantiations of these abstractions live in sibling
+top-level packages (post-v1.0.13):
 
-See ARCHITECTURE.md for the full layer model and rough-edges discussion.
+  katago/                     — KataGo wire types, prisms, parsers,
+                                completion bridge.
+  transformers/               — concrete Transformer factories
+                                (KataGo post-processing, analysis
+                                enricher, transposition enricher).
+  middleware/                 — concrete SessionMiddleware extensions
+                                (keep-alive, adaptive-reevaluate)
+                                plus the middleware ABC + chain.
+
+Extenders adding a second protocol mirror this pattern: a sibling
+package for the wire types, plus protocol-specific transformer/middleware
+modules under ``transformers/`` and ``middleware/``.
+
+See ARCHITECTURE.md for the full layer model.
 """
 
-from . import katago_proxy
-from . import katago_transformers
 from . import protocol_transformer
 from . import proxy_core

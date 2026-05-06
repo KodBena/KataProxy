@@ -12,7 +12,7 @@ The package's public surface is re-exported from ``reactive_pipeline/__init__.py
 import ``Pipeline``, ``CompiledPipeline``, ``MonitoredNode``, ``MissingData``,
 ``CompiledNode`` from ``reactive_pipeline`` directly.
 
-(Renamed in v1.0.14 from ``rxp/rxp.py``.)
+(Renamed in v1.0.13 from ``rxp/rxp.py``.)
 """
 
 from __future__ import annotations
