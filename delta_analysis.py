@@ -1,10 +1,27 @@
+"""
+delta_analysis.py — DeltaAnalysisState, the reactive multi-resolution
+analysis manager for a stream of KataGo packets.
+
+DeltaAnalysisState owns two triangular matrices (one per color), per-color
+delta lists, optional CWT reductions on the full delta sequence, and
+optional unwindowed per-turn state functions. It is *protocol-agnostic*
+analysis substance — it knows about the reactive_pipeline DSL, numpy, and
+sortedcontainers, but nothing about KataGoQuery, KataGoResponse, the
+Transformer abstraction, or the proxy's session model. The wire-side
+plumbing that feeds it lives in analysis_enricher.py.
+
+(Renamed in v1.0.14 from bsa.py / BadukAnalysisState. The Go-specific
+intent survives in the ``sgfmill`` dependency and the black/white
+move-color assignment.)
+"""
+
 import ast
 import json
 import math
 from typing import Any,Callable,Dict,List,Optional,Tuple
 
 import numpy as np
-from rxp import CompiledPipeline,Pipeline
+from reactive_pipeline import CompiledPipeline,Pipeline
 from sgfmill.common import format_vertex,move_from_vertex
 from sortedcontainers.sortedlist import SortedList
 
@@ -41,7 +58,7 @@ import logging
 logger = logging.getLogger("kataproxy." + __name__)
 
 
-class BadukAnalysisState:
+class DeltaAnalysisState:
     """
     Reactive manager for two Triangular matrices (one per color) driven by a
     stream of KataGo analysis packets arriving at arbitrary move indices.
@@ -117,7 +134,7 @@ class BadukAnalysisState:
 
     Usage
     -----
-    state = BadukAnalysisState(
+    state = DeltaAnalysisState(
         board_size=19,
         moves=move_list,
         delta_fn=my_delta,

@@ -6,6 +6,14 @@ distinct variants. Written 2026-05-06 against proxy v1.0.12.
 Authoritative for the `refactor/response-variants` branch; superseded
 by the v1.0.13 release notes once tagged.
 
+> **Filename note (post-v1.0.14).** This document references files by
+> their pre-rename names (`baduk.py`, `bsa.py`, `reginterp.py`, `rxp/`).
+> In v1.0.14 these renamed to `analysis_enricher.py`, `delta_analysis.py`,
+> `registry_interpreter.py`, and `reactive_pipeline/` respectively, and
+> the class `BadukAnalysisState` renamed to `DeltaAnalysisState`. The
+> historical names are preserved here as the durable record of what the
+> v1.0.13 work touched; `git log --follow` traces the renames.
+
 This document is **scoped to the proxy submodule**. The wire shape
 emitted to clients does not change for analyze responses; metadata
 responses (the bug subject) gain transparency by no longer being

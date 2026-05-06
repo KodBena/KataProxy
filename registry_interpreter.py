@@ -1,11 +1,13 @@
 """
-reginterp.py — User-supplied analysis-expression compiler with a curated stdlib.
+registry_interpreter.py — User-supplied analysis-expression compiler with
+a curated stdlib.
 
 Architecture (post v1.0.3)
 ──────────────────────────
 The asteval Interpreter receives a `parameters` / `symbols` / `bindings`
-configuration from the caller (typically `analysis_enricher` in `baduk.py`,
-which reads `analysis_config` off an incoming KataGo query). Symbol bodies
+configuration from the caller (typically `analysis_enricher` in
+`analysis_enricher.py`, which reads `analysis_config` off an incoming
+KataGo query). Symbol bodies
 are compiled as `def <name>(x): return <expr>` blocks; bindings later
 resolve abstract roles (`delta_fn`, `summary_fn`, `state_fns`) to compiled
 symbol-table entries.
@@ -27,7 +29,7 @@ to the proxy. The corresponding security posture, established by the
     here to close.
   • Names not in the curated table are unbound at compile time and surface
     via `aeval.error` → `RuntimeError` from `_exec`. The caller in
-    `baduk.analysis_enricher` catches that and logs a warning so a single
+    `analysis_enricher.analysis_enricher` catches that and logs a warning so a single
     bad config does not kill the WebSocket connection.
 
 This design sits on the analysis-flexibility ↔ security Pareto frontier
@@ -429,7 +431,8 @@ def nonzero(x):
 # Anything not in this dict is unbound. asteval defers name resolution inside
 # def-bodies to call time, so a user symbol referencing e.g. `np` compiles
 # cleanly but raises NameError on first invocation; that exception propagates
-# through the BSA pipeline to baduk.analysis_enricher's on_response
+# through the DeltaAnalysisState pipeline to
+# analysis_enricher.analysis_enricher's on_response
 # except-Exception clause, where it surfaces as
 # `Enrichment failed: name '<X>' is not defined`. No other path to numpy or
 # scipy exists from a user expression.
@@ -516,7 +519,7 @@ class RegistryInterpreter:
     5. Store ``bindings`` for later resolution via ``get_*_fn()``.
 
     Compile-time errors raise ``RuntimeError`` from ``_exec``; the caller in
-    ``baduk.analysis_enricher`` catches them and logs a warning so a single
+    ``analysis_enricher.analysis_enricher`` catches them and logs a warning so a single
     bad ``analysis_config`` does not kill the WebSocket connection.
     """
 
@@ -577,7 +580,7 @@ class RegistryInterpreter:
         Falls back to ``lambda x: 0`` if the binding is missing or names a
         symbol that did not compile. The fallback's purpose is to keep the
         analysis pipeline running when one binding is broken — symmetric with
-        the warn-and-skip stance in ``baduk.analysis_enricher``.
+        the warn-and-skip stance in ``analysis_enricher.analysis_enricher``.
         """
         symbol_name = self.bindings.get(key)
         if symbol_name and symbol_name in self.aeval.symtable:
