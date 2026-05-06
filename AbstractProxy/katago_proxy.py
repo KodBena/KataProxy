@@ -8,12 +8,21 @@ No JSON parsing occurs here beyond wire-level dict access. The types represent
 the *structure* of KataGo messages as the proxy sees them — envelope ID,
 referential fields, and completion signals. Everything else is opaque
 pass-through.
+
+Responses are modelled as a discriminated union (`AnalyzeResponse |
+MetadataResponse`) reflecting the wire protocol's two structurally distinct
+shapes: analyze responses carry `isDuringSearch` and `turnNumber`, metadata
+responses (query_version, query_models, clear_cache ack, terminate ack,
+error responses for non-analyze queries) carry neither. The parser
+discriminates structurally on the presence of those keys; the bridge to
+the completion-tracker abstraction lives in `response_completion_signal`.
+See `docs/roadmap-response-variants.md` for the design rationale.
 """
 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Any, Callable, Optional
 
@@ -33,7 +42,10 @@ from .proxy_core import (
 __all__ = [
     "KataGoAction",
     "KataGoQuery",
+    "AnalyzeResponse",
+    "MetadataResponse",
     "KataGoResponse",
+    "response_completion_signal",
     "make_katago_link",
     "make_katago_chain",
     "parse_query_from_wire",
@@ -76,12 +88,58 @@ class KataGoQuery:
     opaque: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class KataGoResponse:
-    """The proxy-relevant fields of a KataGo response."""
+@dataclass(frozen=True)
+class AnalyzeResponse:
+    """A response to an `analyze` action.
+
+    The wire shape carries `isDuringSearch` and `turnNumber`. Per the
+    KataGo analysis-engine protocol, every analyze response — partial
+    (mid-search update) and final (per-turn completion, including the
+    last turn for queries with implicit `analyzeTurns`) — includes
+    both fields.
+    """
     is_during_search: bool
     turn_number: int
     opaque: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MetadataResponse:
+    """A response to a non-analyze action.
+
+    Covers `query_version`, `query_models`, `clear_cache` ack,
+    `terminate` ack, and error responses for non-analyze queries.
+    KataGo does not include `isDuringSearch` or `turnNumber` on these
+    wire shapes; the proxy must not synthesise them on emission.
+    """
+    opaque: dict[str, Any] = field(default_factory=dict)
+
+
+# A KataGo response on the wire is one of two structurally distinct
+# variants discriminated by the originating action. The parser decides
+# the variant from the presence/absence of `isDuringSearch`/`turnNumber`
+# in the wire dict; consumers that read those fields must narrow the
+# union with `isinstance` first. See `response_completion_signal` below
+# for the canonical bridge from the variant to the CompletionTracker
+# discriminator contract.
+KataGoResponse = AnalyzeResponse | MetadataResponse
+
+
+def response_completion_signal(response: KataGoResponse) -> tuple[int, bool]:
+    """Translate a KataGoResponse to the (discriminator, is_partial)
+    tuple that CompletionTracker.signal expects.
+
+    Metadata responses are single-shot; the synthetic (0, False) pairs
+    with the `[0]` discriminator set that `register_query_completion`
+    installs for non-analyze queries. This is the one named place where
+    the variant model meets the completion-tracking abstraction;
+    `make_katago_removal_predicate` and the two `tracker.signal` call
+    sites in `router.py` all delegate here so the bridge is spelled
+    once.
+    """
+    if isinstance(response, AnalyzeResponse):
+        return response.turn_number, response.is_during_search
+    return 0, False
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +157,17 @@ def _with_terminate_id(q: KataGoQuery, new_id: str) -> KataGoQuery:
 
 
 def _response_with_terminate_id(r: KataGoResponse, new_id: str) -> KataGoResponse:
-    """Functional update — returns a new KataGoResponse with terminateId in opaque replaced."""
+    """Functional update — returns a new response with terminateId in opaque replaced.
+
+    `dataclasses.replace` preserves the variant: an `AnalyzeResponse`
+    in produces an `AnalyzeResponse` out, and likewise for
+    `MetadataResponse`. In practice the terminate ack is metadata-shaped
+    so this nearly always operates on `MetadataResponse`, but the
+    contract is variant-preserving regardless.
+    """
     new_opaque = dict(r.opaque)
     new_opaque["terminateId"] = new_id
-    return KataGoResponse(
-        is_during_search=r.is_during_search,
-        turn_number=r.turn_number,
-        opaque=new_opaque,
-    )
+    return replace(r, opaque=new_opaque)
 
 
 TERMINATE_ID_FIELD: ReferentialField[KataGoQuery, str] = ReferentialField(
@@ -143,14 +204,17 @@ def make_katago_removal_predicate(
 ) -> Callable[[str, KataGoResponse], bool]:
     """Build the should_remove predicate for KataGo responses.
 
-    Returns True only when all expected turns for a query have delivered
-    their final (isDuringSearch=False) response.
+    Returns True only when all expected turns (analyze) or the single
+    expected metadata response have arrived. Variant discrimination
+    runs through `response_completion_signal` so the analyze /
+    metadata bridge is spelled once.
     """
     def should_remove(downstream_id: str, response: KataGoResponse) -> bool:
+        disc, is_partial = response_completion_signal(response)
         sig = tracker.signal(
             query_id=downstream_id,
-            discriminator=response.turn_number,
-            is_partial=response.is_during_search,
+            discriminator=disc,
+            is_partial=is_partial,
         )
         return sig == CompletionSignal.QUERY_COMPLETE
 
@@ -309,28 +373,57 @@ def parse_query_from_wire(wire: dict[str, Any]) -> tuple[str, KataGoQuery]:
 
 
 def parse_response_from_wire(wire: dict[str, Any]) -> tuple[str, KataGoResponse]:
-    """Extract envelope ID and structured response from a wire-format dict."""
+    """Extract envelope ID and structured response from a wire-format dict.
+
+    Discriminates the response variant structurally on the presence of
+    `isDuringSearch`/`turnNumber`: both keys present → `AnalyzeResponse`,
+    both absent → `MetadataResponse`. The two-fields-or-zero-fields
+    invariant is load-bearing — KataGo emits both together (analyze) or
+    neither (metadata, including terminate ack and error responses); a
+    wire with exactly one is a structural protocol violation per
+    ADR-0002 and raises ValueError. The receive-loop call sites in
+    `router.py` and `proxy_server.py` wrap this in try/except so the
+    raise lands in a structured ERROR log without tearing down the
+    receive loop (audit-H-3 posture).
+    """
     envelope_id: str = wire["id"]
+    has_search = "isDuringSearch" in wire
+    has_turn = "turnNumber" in wire
+
+    if has_search != has_turn:
+        raise ValueError(
+            f"response wire has exactly one of "
+            f"isDuringSearch/turnNumber: keys={sorted(wire.keys())}"
+        )
+
     known_keys = {"id", "isDuringSearch", "turnNumber"}
     opaque = {k: v for k, v in wire.items() if k not in known_keys}
 
-    response = KataGoResponse(
-        is_during_search=wire.get("isDuringSearch", False),
-        turn_number=wire.get("turnNumber", 0),
-        opaque=opaque,
-    )
+    response: KataGoResponse
+    if has_search:
+        response = AnalyzeResponse(
+            is_during_search=wire["isDuringSearch"],
+            turn_number=wire["turnNumber"],
+            opaque=opaque,
+        )
+    else:
+        response = MetadataResponse(opaque=opaque)
     return envelope_id, response
 
 
 def translate_response_to_wire(
     response: KataGoResponse, envelope_id: str
 ) -> dict[str, Any]:
-    """Reconstruct a wire-format dict from a structured response and translated ID."""
-    wire: dict[str, Any] = {
-        "id": envelope_id,
-        "isDuringSearch": response.is_during_search,
-        "turnNumber": response.turn_number,
-    }
+    """Reconstruct a wire-format dict from a structured response and translated ID.
+
+    Emits `isDuringSearch`/`turnNumber` only for `AnalyzeResponse`;
+    `MetadataResponse` round-trips with neither field, preserving wire
+    transparency to the originating KataGo response shape.
+    """
+    wire: dict[str, Any] = {"id": envelope_id}
+    if isinstance(response, AnalyzeResponse):
+        wire["isDuringSearch"] = response.is_during_search
+        wire["turnNumber"] = response.turn_number
     wire.update(response.opaque)
     return wire
 

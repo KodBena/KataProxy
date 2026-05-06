@@ -53,7 +53,12 @@ import logging
 from time import monotonic
 from typing import Callable, Optional
 
-from AbstractProxy.katago_proxy import KataGoAction, KataGoQuery, KataGoResponse
+from AbstractProxy.katago_proxy import (
+    AnalyzeResponse,
+    KataGoAction,
+    KataGoQuery,
+    KataGoResponse,
+)
 from session_middleware import (
     ResponseStream,
     SessionCapabilities,
@@ -140,7 +145,11 @@ class KeepAliveMiddleware(SessionMiddleware):
         # signal that the whole orig_id is done. AdaptiveReevaluateMiddleware
         # patches is_during_search=True on finals it intends to re-analyze,
         # so a False here is genuinely the last response for this orig_id.
-        if not response.is_during_search:
+        # Metadata responses (query_version, query_models, terminate ack)
+        # never enter `_in_flight` (only analyze queries are tracked there
+        # — see on_query above), so the discard is structurally limited
+        # to AnalyzeResponse.
+        if isinstance(response, AnalyzeResponse) and not response.is_during_search:
             self._in_flight.discard(orig_id)
         yield orig_id, response
 

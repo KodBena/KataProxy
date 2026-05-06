@@ -47,6 +47,7 @@ from AbstractProxy.katago_proxy import (
     KataGoAction,
     KataGoQuery,
     parse_response_from_wire,
+    response_completion_signal,
 )
 from proxy_json import loads_bounded, JsonDepthExceededError
 import sproxy_config as cfg
@@ -653,12 +654,11 @@ class LeafRouter(BackendRouter):
                 logger.error(f"parse error: {e}  wire={wire}")
                 continue
 
-            sig = self._tracker.signal(
-                canonical_id, response.turn_number, response.is_during_search
-            )
+            disc, is_partial = response_completion_signal(response)
+            sig = self._tracker.signal(canonical_id, disc, is_partial)
             logger.info(
                 f"canonical_id={canonical_id} "
-                f"turn={response.turn_number} during_search={response.is_during_search} "
+                f"turn={disc} during_search={is_partial} "
                 f"sig={sig.name}"
             )
 
@@ -983,12 +983,11 @@ class RelayRouter(BackendRouter):
                     logger.error(f"parse error: {e}")
                     continue
 
-                sig = self._tracker.signal(
-                    canonical_id, response.turn_number, response.is_during_search
-                )
+                disc, is_partial = response_completion_signal(response)
+                sig = self._tracker.signal(canonical_id, disc, is_partial)
                 logger.debug(
                     f"canonical_id={canonical_id} "
-                    f"turn={response.turn_number} during={response.is_during_search} "
+                    f"turn={disc} during={is_partial} "
                     f"sig={sig.name}"
                 )
 

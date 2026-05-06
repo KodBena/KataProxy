@@ -338,6 +338,18 @@ generic code (the `str` constraint on identity types, the assumption that
 turn numbers are integers). A second protocol implementation would surface
 these leaks quickly and is the test the abstraction has not yet had to pass.
 
+The response-side leak — a single `KataGoResponse` dataclass that conflated
+KataGo's two structurally distinct response variants (analyze responses,
+which carry `isDuringSearch`/`turnNumber`, and metadata responses, which do
+not) — was closed in v1.0.13. `KataGoResponse` is now the discriminated
+union `AnalyzeResponse | MetadataResponse`; the parser discriminates
+structurally on the presence of those keys; the bridge to the
+completion-tracker abstraction lives in `response_completion_signal`. See
+`docs/roadmap-response-variants.md` for the design rationale and consumer
+migration. The remaining leaks listed above (the `str` constraint, the
+integer-turn-number assumption in supposedly generic code) stay open
+items.
+
 ### The `rxp` reactive pipeline is experimental
 
 The `rxp/` subpackage was a reactive-pipeline experiment that is currently
