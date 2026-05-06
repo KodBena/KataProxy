@@ -67,8 +67,8 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
 
     // 1. Initial Stones
     if (req.contains("initialStones")) {
-        int nStones = (int)req["initialStones"].size();
 #ifdef DEBUG
+        int nStones = (int)req["initialStones"].size();
         fprintf(stderr, "[partition_pv] placing %d initial stones\n", nStones);
 #endif
         for (auto& s : req["initialStones"]) {
@@ -80,13 +80,14 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
         }
     }
 
-    // 2. Setup Starting Player
-    Stone nextPla = Stone::Black;
-    if (req.contains("initialPlayer")) {
-        nextPla = (req["initialPlayer"].get<std::string>() == "B" ? Stone::Black : Stone::White);
-    }
-
-    // 3. Replay Move History
+    // 2. Replay Move History
+    //
+    // An earlier form of this code also tracked a `nextPla` variable
+    // through the initialPlayer field and the in-loop opponent flip,
+    // but every read of it was unobserved — the PV walk below sources
+    // whose-turn-it-is from `resp["rootInfo"]["currentPlayer"]`
+    // (KataGo's own ground truth for the analyzed position) into
+    // `rootPla`. The hand-rolled tracker was redundant; removed.
     int targetTurn = resp.value("turnNumber", 0);
 #ifdef DEBUG
     fprintf(stderr, "[partition_pv] replaying to turnNumber=%d\n", targetTurn);
@@ -99,12 +100,11 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
             auto [r, c] = baseBoard.parseCoords(m[1].get<std::string>());
             if (r == -1) baseBoard.pass();
             else baseBoard.play(r, c, moveCol);
-            nextPla = opponent(moveCol);
             currentTurn++;
         }
     }
 
-    // 4. Union-Find on PVs
+    // 3. Union-Find on PVs
     auto& moveInfos = resp["moveInfos"];
     int k = moveInfos.size();
 #ifdef DEBUG
@@ -138,7 +138,16 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
         GoAnalyzer testBoard = baseBoard;
         Stone pla = rootPla;
 
-        for (const std::string& moveStr : moveInfos[i]["pv"]) {
+        // Iterate by value, not by `const std::string&`. nlohmann's
+        // iteration yields json& nodes; binding `const std::string&`
+        // to one triggers an implicit json→std::string conversion
+        // whose temporary's lifetime IS extended into the loop body
+        // (so the prior reference form was correct) — but the lifetime
+        // extension is subtle enough that GCC warns under
+        // -Wrange-loop-construct. The string content is short (move
+        // coords like "D4", "Q16") so SSO covers the per-iteration
+        // copy.
+        for (const std::string moveStr : moveInfos[i]["pv"]) {
             auto [r, c] = testBoard.parseCoords(moveStr);
             if (r == -1) testBoard.pass();
             else testBoard.play(r, c, pla);
@@ -166,7 +175,7 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
     fprintf(stderr, "[partition_pv] total merges=%d, distinct hashes seen=%zu\n", mergeCount, seenHashes.size());
 #endif
 
-    // 5. Compute total visits per cluster (after union-find is complete)
+    // 4. Compute total visits per cluster (after union-find is complete)
     std::unordered_map<int, long long> clusterVisits;
     for (int i = 0; i < k; ++i) {
         int root = find(i);
@@ -177,7 +186,7 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
     fprintf(stderr, "[partition_pv] computed visit sums for %zu clusters\n", clusterVisits.size());
 #endif
 
-    // 6. Sort clusters by decreasing total visits
+    // 5. Sort clusters by decreasing total visits
     std::vector<std::pair<long long, int>> clusterList;
     clusterList.reserve(clusterVisits.size());
     for (const auto& p : clusterVisits) {
@@ -188,7 +197,7 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
                   return a.first > b.first;   // descending visits
               });
 
-    // 7. Assign new clusterIds in decreasing-visit order
+    // 6. Assign new clusterIds in decreasing-visit order
     std::unordered_map<int, int> canonToId;
     int nextId = 0;
     for (const auto& p : clusterList) {
@@ -198,7 +207,7 @@ std::string partition_pv(const std::string& req_str, const std::string& resp_str
     fprintf(stderr, "[partition_pv] reassigned %d clusters ordered by decreasing total visits\n", nextId);
 #endif
 
-    // 8. Write the new clusterId into every moveInfo
+    // 7. Write the new clusterId into every moveInfo
     for (int i = 0; i < k; ++i) {
         int root = find(i);
         moveInfos[i]["clusterId"] = canonToId[root];
