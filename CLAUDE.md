@@ -38,6 +38,29 @@ name what was read and what was skipped — and ask the user how to
 proceed. Bluffing a citation is the failure mode the umbrella section
 is shaped to prevent.
 
+In addition, the umbrella's two proxy-to-proxy near-miss letters —
+`docs/dispatch/proxy-to-proxy-id-translation-near-miss.md` (2026-05-03)
+and `docs/dispatch/proxy-to-proxy-selector-canonical-key-near-miss.md`
+(2026-05-09) — supplement `ARCHITECTURE.md` and `FRAMEWORK.md` with
+refinements that only the code-read surfaces. They are mandatory
+alongside the architecture documents whenever substantive work
+requires reading those — i.e., for any wire-shape extension or
+layer-boundary change. The two letters compose: the first prescribes
+"read the abstractions first" (the failure mode being over-eager
+call-site debugging when the boundary's abstraction already does the
+work declaratively); the second prescribes "read them in full before
+claiming what falls out" (the failure mode being substituting the
+posture of trusting the architecture for the act of consulting it).
+The second letter's addendum records specific Layer 2 refinements —
+the two-hashes distinction in `pubsub_hub.py` (`content_hash` opt-in
+via `capturing_fields` versus `cache_key` opt-out via
+full-opaque-minus-the-three-control-flags), the proxy-control field
+family's non-uniform strip mechanism (the three control flags pop in
+`subscribe()`, `analysis_config` pops in `analysis_enricher.on_query`),
+and the conditional-strip hazard that per-query capability-style
+gating surfaces around fields like `analysis_config` — that the
+document graph alone does not surface.
+
 ## Architectural shape
 
 KataProxy is layered. The layering is not hexagonal — there is no
