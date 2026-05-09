@@ -897,17 +897,36 @@ def _build_advertised_capabilities() -> dict[str, dict]:
 
 
 async def _main() -> None:
-    advertised_caps = _build_advertised_capabilities()
-    logger.info(f"advertising capabilities: {sorted(advertised_caps.keys())}")
+    # Per-query capability gating is always wired — legacy clients (no
+    # capabilities field on the query) trigger auto-engage on the gate
+    # side, so all transformers/middleware run as in v1.0.13. The
+    # advertiser is gated by PROXY_ADVERTISE_CAPABILITIES so a
+    # v1.0.13 → v1.0.14 update is byte-identical on the wire by
+    # default; operators opt in to advertisement explicitly when
+    # they're ready for capability-aware clients to engage the new
+    # per-query contract.
+    chain = (
+        Contextual(capability_gate("delta_analysis", analysis_enricher))
+        .then(capability_gate("transposition", transposition_enricher))
+    )
+    if cfg.ADVERTISE_CAPABILITIES:
+        advertised_caps = _build_advertised_capabilities()
+        logger.info(
+            f"advertising capabilities: {sorted(advertised_caps.keys())} "
+            f"(PROXY_ADVERTISE_CAPABILITIES enabled)"
+        )
+        chain = chain.then(capabilities_advertiser(advertised_caps))
+    else:
+        logger.info(
+            "PROXY_ADVERTISE_CAPABILITIES is disabled (default); "
+            "query_version responses pass through unchanged. Set "
+            "PROXY_ADVERTISE_CAPABILITIES=true to advertise per-query "
+            "capabilities to capability-aware clients. Per-query gating "
+            "remains active on the proxy side regardless."
+        )
 
     server = ProxyServer(
-        # Per-query-gated synchronous content transformations + the
-        # always-on capability advertiser on query_version responses.
-        transformer_factory=(
-            Contextual(capability_gate("delta_analysis", analysis_enricher))
-            .then(capability_gate("transposition", transposition_enricher))
-            .then(capabilities_advertiser(advertised_caps))
-        ),
+        transformer_factory=chain,
         # Stateful async policy: capability-gated adaptive re-evaluation
         # chained with the keep-alive inactivity watchdog. A fresh
         # instance per session because middleware holds per-query state.

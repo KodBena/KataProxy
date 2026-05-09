@@ -322,12 +322,15 @@ preserves a small surface for Phase 1.
 
 ### `query_version_capabilities_advertiser` (new module: `transformers/capabilities_advertiser.py`)
 
-A new always-on Transformer factory. The advertised dict is
-constructed at server startup and passed to the factory. The
-Transformer's `on_query` is identity (it is a response-side
-transformer); `on_response` checks for `MetadataResponse` whose
-`opaque` corresponds to a `query_version` reply and adds
-`capabilities` to it.
+A new Transformer factory. The advertised dict is constructed at
+server startup and passed to the factory. The Transformer's
+`on_query` is identity (it is a response-side transformer);
+`on_response` checks for `MetadataResponse` whose `opaque`
+corresponds to a `query_version` reply and adds `capabilities` to it.
+
+**Wiring is gated by `PROXY_ADVERTISE_CAPABILITIES`** (default
+false); see *Operator opt-in* below for the wire-compatibility
+rationale.
 
 ```python
 def capabilities_advertiser(
@@ -354,9 +357,9 @@ def capabilities_advertiser(
 
 Per-query cost is one `isinstance` check and one `"version" in opaque`
 check on every response that flows through; structurally negligible.
-The advertisement is opt-in by Transformer presence — operators who
-do not want capability advertisement omit the factory from
-composition.
+The advertisement is opt-in by Transformer presence — and the
+Transformer itself is opt-in via `PROXY_ADVERTISE_CAPABILITIES`
+(see *Operator opt-in* below).
 
 ---
 
@@ -366,23 +369,25 @@ composition.
 
 ```python
 async def _main() -> None:
-    advertised_caps: dict[str, dict] = {
-        "delta_analysis": {},
-        "adaptive_reevaluate": {},
-    }
-    if _TRANSPOSITION_AVAILABLE:
-        advertised_caps["transposition"] = {}
+    chain = (
+        Contextual(capability_gate("delta_analysis", analysis_enricher))
+        .then(capability_gate("transposition", transposition_enricher))
+    )
+    if cfg.ADVERTISE_CAPABILITIES:
+        advertised_caps = _build_advertised_capabilities()
+        chain = chain.then(capabilities_advertiser(advertised_caps))
 
     server = ProxyServer(
-        transformer_factory=(
-            Contextual(capability_gate("delta_analysis", analysis_enricher))
-            .then(capability_gate("transposition", transposition_enricher))
-            .then(capabilities_advertiser(advertised_caps))
-        ),
+        transformer_factory=chain,
         middleware_factory=_make_middleware,
     )
     ...
 ```
+
+`_build_advertised_capabilities()` is called only when the env var
+is enabled; the function itself constructs the set unconditionally
+(`delta_analysis` and `adaptive_reevaluate` always; `transposition`
+iff the native module is importable).
 
 `_make_middleware`:
 
@@ -420,6 +425,37 @@ cache_key = self._compute_cache_key(query)
 # NEW: strip capabilities after both hashes are computed.
 query.opaque.pop("capabilities", None)
 ```
+
+---
+
+## Operator opt-in
+
+KataProxy is in live use beyond the LengYue umbrella — Go schools,
+online services, research groups sharing analysis machines (per the
+README). The `query_version` advertisement is the one wire-shape
+extension Phase 1 introduces, and even though it is strictly
+additive (a new key in the response opaque), any client that
+strictly validates `query_version`'s schema would see a breaking
+change. To keep a v1.0.13 → v1.0.14 update fully wire-safe by
+default, the advertiser is gated behind `PROXY_ADVERTISE_CAPABILITIES`.
+
+**Default off (`false`).** `query_version` responses pass through
+unchanged. Per-query capability gating still works on the proxy
+side; legacy clients (no `capabilities` field) auto-engage all
+wired transformers/middleware as in v1.0.13. Behaviour is byte-
+identical on the wire to v1.0.13.
+
+**Opt in (`true`/`1`/`yes`/`on`).** Operators set the env var when
+they have capability-aware clients ready to engage the new contract.
+The advertisement appears on `query_version` responses; the SPA
+(and any other capability-aware client) feature-detects it and
+sends `capabilities` per query. Legacy clients on the same
+deployment continue to work unchanged via auto-engage.
+
+The env var controls *advertisement only*, never gating. A future
+release may flip the default to `true` once the wire-shape extension
+has been broadly absorbed; the lifetime of the env var is
+indefinite (operators may always want explicit control).
 
 ---
 

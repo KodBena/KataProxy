@@ -236,3 +236,32 @@ ADAPTIVE_MAX_INFLIGHT: int = int(
 KEEP_ALIVE_IDLE_TIMEOUT_SECONDS: float = float(
     os.environ.get("KEEP_ALIVE_IDLE_TIMEOUT_SECONDS", "25.0")
 )
+
+
+# ---------------------------------------------------------------------------
+# Capability advertisement (v1.0.14)
+# ---------------------------------------------------------------------------
+#
+# When True, the proxy adds a `capabilities` field to every `query_version`
+# response, listing which proxy-side capabilities (delta_analysis,
+# transposition, adaptive_reevaluate) are wired and importable. New clients
+# use this advertisement to feature-detect and engage per-query opt-in via
+# their own `capabilities` field on analyze queries.
+#
+# Default False: a v1.0.13 → v1.0.14 update is byte-identical on the wire
+# unless the operator explicitly opts in. Operators running KataProxy with
+# unknown clients (Go schools, online services, research groups whose
+# parsers may or may not tolerate unknown JSON fields) can update without
+# fear of breaking those clients; per-query capability gating still works
+# on the proxy side regardless of the advertisement, but absence of
+# advertisement means new clients fall through to legacy auto-engage —
+# which is what every v1.0.13 client already does.
+#
+# Set PROXY_ADVERTISE_CAPABILITIES=true (or 1, yes, on) to enable. Once
+# enabled, capability-aware clients will engage the per-query contract;
+# legacy clients continue to work unchanged via auto-engage.
+
+ADVERTISE_CAPABILITIES: bool = (
+    os.environ.get("PROXY_ADVERTISE_CAPABILITIES", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
