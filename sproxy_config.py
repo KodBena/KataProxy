@@ -265,3 +265,68 @@ ADVERTISE_CAPABILITIES: bool = (
     os.environ.get("PROXY_ADVERTISE_CAPABILITIES", "false").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+
+# ---------------------------------------------------------------------------
+# SELECTOR upstream models (v1.0.15)
+# ---------------------------------------------------------------------------
+#
+# Required for the SELECTOR role; ignored by other roles. Names the
+# labelled upstreams the SelectorRouter routes to. The wire `model`
+# field on analysis queries is matched against these labels; the
+# corresponding URL receives the forwarded query.
+#
+# Format: comma-separated `label=url` entries.
+#
+#   SELECTOR_MODELS=strong=ws://host1:41948,weak=ws://host2:41948
+#
+# Whitespace around entries / labels / URLs is trimmed. Empty entries
+# (consecutive commas, leading/trailing whitespace) are skipped.
+# Malformed entries (no `=` separator) raise ValueError at parse time
+# — the proxy refuses to start with an ambiguous routing table per
+# ADR-0002. Duplicate labels are rejected at SELECTOR startup
+# (raised as SelectorStartupError, peer to LeafStartupError).
+#
+# Dedicated env var rather than extending UPSTREAM_URLS: the SELECTOR
+# role's invariant (named, distinguishable upstreams) is structurally
+# different from RELAY's (interchangeable pool); separating the env
+# var puts the structural difference in configuration space and
+# leaves UPSTREAM_URLS untouched for RELAY / REDIRECT operators.
+
+def _parse_selector_models(raw: str) -> tuple[tuple[str, str], ...]:
+    """Parse SELECTOR_MODELS into an ordered tuple of (label, url) pairs.
+
+    Returns an empty tuple when the env var is absent or blank.
+    Raises ValueError on a malformed entry (no `=` separator); names
+    the offending entry in the message so the operator can locate
+    the problem in their configuration.
+    """
+    pairs: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"SELECTOR_MODELS entry {entry!r} is missing a `label=url` "
+                f"separator; expected format is "
+                f"`label1=ws://host1:port1,label2=ws://host2:port2`"
+            )
+        label, _, url = entry.partition("=")
+        label = label.strip()
+        url = url.strip()
+        if not label:
+            raise ValueError(
+                f"SELECTOR_MODELS entry {entry!r} has an empty label"
+            )
+        if not url:
+            raise ValueError(
+                f"SELECTOR_MODELS entry {entry!r} has an empty url"
+            )
+        pairs.append((label, url))
+    return tuple(pairs)
+
+
+SELECTOR_MODELS: tuple[tuple[str, str], ...] = _parse_selector_models(
+    os.environ.get("SELECTOR_MODELS", "")
+)

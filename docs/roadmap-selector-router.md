@@ -174,9 +174,20 @@ authoritative line for the "never reaches KataGo" discipline;
 
 ### Hub-side post-hash pop (`pubsub_hub.subscribe`)
 
-The existing `query.opaque.pop("capabilities", None)` line gains a
-sibling: `query.opaque.pop("model", None)`. Both are post-hash and
-both are belt-and-braces with the central wire-strip.
+`capabilities` continues to pop after both hashes (Phase 1
+behaviour). `model` does **not** pop — SelectorRouter reads it from
+`query.opaque` in `dispatch()` to choose the upstream, so it must
+survive Layer 2. The central wire-strip in `translate_query_to_wire`
+(see *Pure units → `_PROXY_ONLY_FIELDS`*) is what guarantees `model`
+is excluded from the wire emitted to upstream LEAFs.
+
+The asymmetry between `capabilities` (pops in subscribe) and `model`
+(does not pop in subscribe) reflects the layer where each is
+consumed: `capabilities` is consumed by Layer 1 (transformer +
+middleware gates) before subscribe runs, so by the time subscribe
+sees the query the field has done its job; `model` is consumed by
+Layer 3 (SelectorRouter) after subscribe, so it must remain in the
+opaque dict for the router to read.
 
 ### `SELECTOR_MODELS` parser (`sproxy_config.py`)
 

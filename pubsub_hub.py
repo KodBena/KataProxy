@@ -184,6 +184,12 @@ class CoalescingPolicy:
         # after the hash is computed (see also the central wire-strip
         # discipline in katago/katago_proxy.py:translate_query_to_wire).
         "capabilities",
+        # Same shape as `capabilities`: SELECTOR routes by `model`,
+        # so two queries differing only in `model` go to different
+        # upstreams and produce different responses. Stripped post-hash
+        # in subscribe(); excluded from the wire by the central
+        # _PROXY_ONLY_FIELDS strip.
+        "model",
     )
 
     def query_hash(self, query: KataGoQuery) -> str:
@@ -432,18 +438,29 @@ class PubSubHub:
 
         # -------------------------------------------------------------------
         # 3a. Strip proxy-control fields that the proxy interprets but the
-        #     engine must not see. `capabilities` is a Phase 1 addition;
-        #     it has already been folded into both content_hash (via
+        #     engine must not see. `capabilities` is a Phase 1 addition,
+        #     `model` is a Phase 2+3 addition; both have already been
+        #     folded into both content_hash (via
         #     CoalescingPolicy.capturing_fields) and cache_key (via
         #     full-opaque inclusion), so popping here is post-hash and
         #     therefore safe. The central wire-strip discipline in
         #     katago/katago_proxy.py:translate_query_to_wire is the
-        #     authoritative line; this pop is belt-and-braces, ensuring
-        #     the field is also absent from any consumer that observes
-        #     the post-subscribe query directly (e.g. the router's
-        #     dispatch path).
+        #     authoritative line; these pops are belt-and-braces,
+        #     ensuring the fields are also absent from any consumer that
+        #     observes the post-subscribe query directly (e.g. the
+        #     router's dispatch path — and SELECTOR specifically reads
+        #     `model` from the wire_dict before forwarding to the
+        #     selected upstream, so the field round-trips through Layer
+        #     2 without the wire builder needing to see it).
         # -------------------------------------------------------------------
         query.opaque.pop("capabilities", None)
+        # NOTE: `model` is NOT popped here for SELECTOR — the SelectorRouter
+        # reads it from query.opaque to choose the upstream. The central
+        # wire-strip in translate_query_to_wire ensures it is excluded
+        # from the wire emitted to upstream LEAFs (where vanilla KataGo
+        # would not understand it). For non-SELECTOR roles, the field is
+        # harmless if present (LeafRouter writes the wire built by
+        # translate_query_to_wire, which strips it).
 
         # -------------------------------------------------------------------
         # 4. Replay-cache short-circuit (analysis-level exact match)
