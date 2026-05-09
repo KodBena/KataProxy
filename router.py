@@ -67,6 +67,8 @@ __all__ = [
     "LeafRouter",
     "LeafStartupError",
     "RelayRouter",
+    "SelectorRouter",
+    "SelectorStartupError",
     "EchoRouter",
     "make_router",
 ]
@@ -80,6 +82,19 @@ class LeafStartupError(RuntimeError):
     captured stderr tail is included in the message because that is
     where KataGo records the actual cause (missing config, missing model,
     GPU initialisation failure, etc.).
+    """
+
+
+class SelectorStartupError(RuntimeError):
+    """SELECTOR configuration violation prevents the router from starting.
+
+    Raised by ``SelectorRouter.start()`` on configuration violations:
+    empty ``SELECTOR_MODELS`` (the SELECTOR role requires at least one
+    labelled upstream); duplicate labels (each label must be unique so
+    routing is unambiguous). Peer to ``LeafStartupError``: ADR-0002's
+    startup-time loud-failure register — a misconfigured SELECTOR
+    refuses to bind, with the specific violation named in the
+    exception message.
     """
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1136,654 @@ class RelayRouter(BackendRouter):
 
 
 # ---------------------------------------------------------------------------
+# SelectorRouter
+# ---------------------------------------------------------------------------
+
+class SelectorRouter(BackendRouter):
+    """Routes queries by `model` field to labelled upstream LEAFs.
+
+    Distinct from ``RelayRouter`` even though both manage WebSocket
+    upstreams: SELECTOR's invariant is that upstreams are *named*
+    (distinguishable), not *interchangeable*. Dispatch is a labelled-
+    dictionary lookup, not hash-ring routing; there is no LoadMetric
+    (the upstreams are not fungible) and no fallback (each model is
+    unique, so a query for model X cannot be served by model Y).
+
+    Per-upstream failure budget mirrors ``LeafRouter._MAX_RESTARTS``:
+    each label has up to ``max_connect_failures`` reconnect attempts
+    after a disconnect (the initial connect attempt does not count, by
+    analogy with LeafRouter where the initial spawn does not count
+    against the restart budget). Budget exhaustion marks the label
+    UNHEALTHY; queries to an unhealthy model fail loudly with a
+    structured error response naming the unavailable model. Other
+    labels continue to serve normally. Recovery is restart-only —
+    matching LeafRouter's posture, where the proxy is the unit of
+    operational restart.
+
+    Action-routing matrix (different from RelayRouter's uniform
+    hash-ring dispatch):
+
+      ANALYZE        → routed by ``query.opaque['model']`` to the
+                       labelled upstream
+      TERMINATE      → routed via the dedicated ``terminate()`` method
+                       by remembered label for the canonical_id
+      QUERY_MODELS   → synthesised from the configured label set; no
+                       upstream traffic. Wire shape:
+                       ``{"id": ..., "models": [{"label": l}, ...]}``
+                       (list-of-dicts leaves room for future per-label
+                       enrichment; the SPA uses ``entry.label`` as the
+                       routing key)
+      QUERY_VERSION  → forwarded to the first healthy upstream so the
+                       capabilities_advertiser at Layer 1 sees a real
+                       MetadataResponse with a "version" key to enrich
+      CLEAR_CACHE    → forwarded to the first healthy upstream as an
+      TERMINATE_ALL    MVP limitation; broadcast semantics across all
+                       upstreams are deferred (see roadmap-selector-
+                       router.md, "Out of scope"). A WARNING is logged
+                       so operators see the limited semantic in action.
+    """
+
+    _MAX_CONNECT_FAILURES = 3  # mirrors LeafRouter._MAX_RESTARTS
+    _RECONNECT_INITIAL_DELAY_S = 2.0
+    _RECONNECT_MAX_DELAY_S = 60.0
+    _MISSING_MODEL_ERROR = "missing 'model' field for SELECTOR routing"
+    _UNKNOWN_MODEL_ERROR_TEMPLATE = (
+        "unknown model {requested!r}; available models: {available}"
+    )
+    _UNHEALTHY_MODEL_ERROR_TEMPLATE = (
+        "model {label!r} is currently unavailable "
+        "(reconnect budget exhausted; restart the proxy to retry)"
+    )
+    _DISCONNECTED_MODEL_ERROR_TEMPLATE = (
+        "model {label!r} is temporarily disconnected; please retry"
+    )
+    _NO_HEALTHY_UPSTREAM_ERROR = (
+        "no healthy upstream available to serve this action"
+    )
+
+    def __init__(
+        self,
+        models: tuple[tuple[str, str], ...],
+        max_connect_failures: Optional[int] = None,
+    ) -> None:
+        self._models = models
+        self._max_connect_failures = (
+            self._MAX_CONNECT_FAILURES
+            if max_connect_failures is None
+            else max_connect_failures
+        )
+        # Label → upstream URL. Populated in start() after duplicate-
+        # label validation; an explicit dict makes the dispatch lookup
+        # explicit rather than scanning the ordered tuple every query.
+        self._url_for_label: dict[str, str] = {}
+        # Label → live websocket. Absent → not currently connected
+        # (either reconnecting within budget or marked unhealthy).
+        # ws is typed as Any because the websockets library has no
+        # stable type stubs across major versions; the runtime contract
+        # (.send, async iteration) is enforced behaviourally.
+        self._connections: dict[str, Any] = {}
+        # Per-label reader task and reconnect tasks; tracked so stop()
+        # can cancel everything.
+        self._reader_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reconnect_tasks: set[asyncio.Task[None]] = set()
+        # Per-label remaining reconnect budget. Decremented by failed
+        # reconnect attempts (not by the initial connect attempt).
+        # Hits zero → label is added to _unhealthy_models and the
+        # reconnect loop exits.
+        self._failure_budget: dict[str, int] = {}
+        # Labels whose budget has been exhausted. Terminal until a
+        # proxy restart, mirroring LeafRouter's unhealthy state.
+        self._unhealthy_models: set[str] = set()
+        # Completion-tracker shared with the read loop; the wire-id-
+        # uniqueness invariant is the same as LeafRouter / RelayRouter.
+        self._tracker: CompletionTracker[str, int] = CompletionTracker()
+        # canonical_id → (on_response, on_complete, label). The label is
+        # the routing record consulted by terminate() to send the
+        # cancel to the correct upstream.
+        self._callbacks: dict[
+            str, tuple[OnResponse, OnComplete, str]
+        ] = {}
+
+    # -----------------------------------------------------------------------
+    # Lifecycle
+    # -----------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Validate configuration; connect to all upstreams in parallel.
+
+        Raises ``SelectorStartupError`` on empty ``SELECTOR_MODELS`` or
+        duplicate labels — the routing table must be unambiguous before
+        the server binds. Initial connect failures do not block startup;
+        the affected labels schedule reconnect-with-backoff in the
+        background. The disposition is logged at INFO so operators can
+        see which models are healthy at startup.
+        """
+        if not self._models:
+            raise SelectorStartupError(
+                "SELECTOR role requires at least one entry in "
+                "SELECTOR_MODELS (format: "
+                "label1=ws://host1:port1,label2=ws://host2:port2)"
+            )
+        seen: set[str] = set()
+        for label, url in self._models:
+            if label in seen:
+                raise SelectorStartupError(
+                    f"duplicate label {label!r} in SELECTOR_MODELS; "
+                    f"each label must be unique so the routing table "
+                    f"is unambiguous"
+                )
+            seen.add(label)
+            self._url_for_label[label] = url
+            self._failure_budget[label] = self._max_connect_failures
+
+        labels = list(self._url_for_label.keys())
+        logger.info(
+            f"connecting to {len(labels)} labelled upstream(s): {labels}"
+        )
+        await asyncio.gather(
+            *(self._connect(label) for label in labels),
+            return_exceptions=True,
+        )
+        self._log_health_disposition()
+
+    def _log_health_disposition(self) -> None:
+        """Emit a single INFO line summarising per-label connect status."""
+        healthy: list[str] = []
+        retrying: list[str] = []
+        unhealthy: list[str] = []
+        for label in self._url_for_label:
+            if label in self._unhealthy_models:
+                unhealthy.append(label)
+            elif label in self._connections:
+                healthy.append(label)
+            else:
+                retrying.append(label)
+        logger.info(
+            f"SELECTOR ready: healthy={healthy} "
+            f"reconnecting={retrying} unhealthy={unhealthy}"
+        )
+
+    async def _connect(self, label: str) -> None:
+        """Initial connect attempt for a label; on failure, schedule retry.
+
+        The initial attempt does not consume the reconnect budget — by
+        analogy with ``LeafRouter`` where the initial spawn doesn't
+        count against the restart budget. Only failed reconnect
+        attempts decrement the budget.
+        """
+        import websockets
+        url = self._url_for_label[label]
+        logger.info(f"label={label!r} → {url}")
+        try:
+            ws = await websockets.connect(url, max_size=_WS_MAX_SIZE)
+        except Exception as e:
+            logger.error(f"connect failed for label={label!r} ({url}): {e}")
+            self._schedule_reconnect(label)
+            return
+        self._connections[label] = ws
+        task = asyncio.create_task(
+            self._read_loop(label, ws), name=f"selector-reader:{label}"
+        )
+        self._reader_tasks[label] = task
+        logger.info(f"connected: label={label!r} ({url})")
+
+    def _schedule_reconnect(self, label: str) -> None:
+        """Spawn a reconnect-with-backoff task and track it for cancellation.
+
+        No-op if the label is already unhealthy (terminal state) — the
+        reconnect loop has nothing to do once budget is exhausted.
+        """
+        if label in self._unhealthy_models:
+            return
+        logger.info(f"scheduling reconnect for label={label!r}")
+        task = asyncio.create_task(
+            self._reconnect_with_backoff(label),
+            name=f"selector-reconnect:{label}",
+        )
+        self._reconnect_tasks.add(task)
+        # Self-prune on completion so stop()'s set scan stays bounded.
+        task.add_done_callback(self._reconnect_tasks.discard)
+
+    async def _reconnect_with_backoff(self, label: str) -> None:
+        """Retry connecting to an upstream until success or budget exhausted.
+
+        Exponential backoff capped at ``_RECONNECT_MAX_DELAY_S``.
+        Each failed attempt decrements ``_failure_budget[label]``; on
+        exhaustion the label is added to ``_unhealthy_models`` and the
+        loop exits. On success the new websocket and reader task
+        replace any prior entries.
+        """
+        import websockets
+        delay = self._RECONNECT_INITIAL_DELAY_S
+        url = self._url_for_label[label]
+        while label not in self._unhealthy_models:
+            await asyncio.sleep(delay)
+            try:
+                ws = await websockets.connect(url, max_size=_WS_MAX_SIZE)
+            except Exception as e:
+                self._failure_budget[label] -= 1
+                if self._failure_budget[label] <= 0:
+                    logger.error(
+                        f"label={label!r} reconnect budget exhausted; "
+                        f"marking UNHEALTHY. Queries to this model "
+                        f"will fail loudly until the proxy is restarted."
+                    )
+                    self._unhealthy_models.add(label)
+                    return
+                logger.warning(
+                    f"reconnect still failing for label={label!r}: {e}; "
+                    f"reconnect attempts remaining: "
+                    f"{self._failure_budget[label]}"
+                )
+                delay = min(delay * 2.0, self._RECONNECT_MAX_DELAY_S)
+                continue
+            self._connections[label] = ws
+            task = asyncio.create_task(
+                self._read_loop(label, ws),
+                name=f"selector-reader:{label}",
+            )
+            self._reader_tasks[label] = task
+            logger.info(f"reconnected: label={label!r} ({url})")
+            return
+
+    # -----------------------------------------------------------------------
+    # Reader loop (per-label)
+    # -----------------------------------------------------------------------
+
+    async def _read_loop(self, label: str, ws: Any) -> None:
+        """Read responses from one labelled upstream; dispatch by canonical_id.
+
+        Mirrors ``RelayRouter._read_loop`` in shape; the only structural
+        difference is that connections are keyed by label rather than
+        URL. On connection loss, the finally block schedules a
+        reconnect (subject to the budget).
+        """
+        try:
+            async for raw_msg in ws:
+                logger.debug(f"label={label!r} raw={log_safe(raw_msg)}")
+                try:
+                    wire: WireDict = loads_bounded(
+                        raw_msg, max_depth=cfg.JSON_MAX_DEPTH
+                    )
+                except JsonDepthExceededError as e:
+                    logger.error(
+                        f"refused depth-bombed message from label={label!r}: {e}"
+                    )
+                    continue
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON error from label={label!r}: {e}")
+                    continue
+
+                if "proxy_meta" in wire:
+                    logger.info(
+                        f"proxy_meta from label={label!r}: {wire['proxy_meta']}"
+                    )
+                    continue
+
+                canonical_id = wire.get("id")
+                if canonical_id is None:
+                    logger.warning(
+                        f"response missing 'id' from label={label!r}"
+                    )
+                    continue
+
+                cb = self._callbacks.get(canonical_id)
+                if cb is None:
+                    logger.info(
+                        f"no callback for {canonical_id!r} (already cleaned up?)"
+                    )
+                    continue
+                on_response, on_complete, _assigned_label = cb
+
+                try:
+                    _, response = parse_response_from_wire(wire)
+                except Exception as e:
+                    logger.error(f"parse error from label={label!r}: {e}")
+                    continue
+
+                disc, is_partial = response_completion_signal(response)
+                sig = self._tracker.signal(canonical_id, disc, is_partial)
+                logger.debug(
+                    f"canonical_id={canonical_id} "
+                    f"turn={disc} during={is_partial} sig={sig.name}"
+                )
+
+                await on_response(canonical_id, wire)
+
+                if sig == CompletionSignal.QUERY_COMPLETE:
+                    self._callbacks.pop(canonical_id, None)
+                    await on_complete(canonical_id)
+
+        except Exception as e:
+            logger.error(f"connection lost for label={label!r}: {e}")
+        finally:
+            self._connections.pop(label, None)
+            self._reader_tasks.pop(label, None)
+            if label not in self._unhealthy_models:
+                self._schedule_reconnect(label)
+
+    # -----------------------------------------------------------------------
+    # Routing helpers
+    # -----------------------------------------------------------------------
+
+    def _first_healthy_label(self) -> Optional[str]:
+        """Return the first connected, healthy label in configuration order."""
+        for label, _url in self._models:
+            if (
+                label in self._connections
+                and label not in self._unhealthy_models
+            ):
+                return label
+        return None
+
+    async def _send_synthetic_response(
+        self,
+        canonical_id: str,
+        opaque: dict[str, Any],
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        """Synthesise a single MetadataResponse-shaped wire and complete."""
+        wire: WireDict = {"id": canonical_id, **opaque}
+        await on_response(canonical_id, wire)
+        await on_complete(canonical_id)
+
+    async def _send_structured_error(
+        self,
+        canonical_id: str,
+        message: str,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+        field: Optional[str] = None,
+    ) -> None:
+        """Synthesise a structured error response in the proxy's error shape.
+
+        Wire shape: ``{"id": canonical_id, "error": message[, "field": field]}``.
+        Single response, immediate completion. Mirrors the structured
+        errors the LeafRouter emits when KataGo is unavailable.
+        """
+        wire: WireDict = {"id": canonical_id, "error": message}
+        if field is not None:
+            wire["field"] = field
+        await on_response(canonical_id, wire)
+        await on_complete(canonical_id)
+
+    # -----------------------------------------------------------------------
+    # Dispatch (action-routing matrix)
+    # -----------------------------------------------------------------------
+
+    async def dispatch(
+        self,
+        canonical_id: str,
+        wire_dict: WireDict,
+        query: KataGoQuery,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        action = query.action
+        logger.debug(
+            f"canonical_id={canonical_id} action={action.name}"
+        )
+
+        # QUERY_MODELS: synthesise the union of configured labels.
+        # No upstream traffic — operators with all upstreams down still
+        # get a meaningful enumeration.
+        if action == KataGoAction.QUERY_MODELS:
+            await self._send_synthetic_response(
+                canonical_id,
+                {"models": [{"label": label} for label, _ in self._models]},
+                on_response,
+                on_complete,
+            )
+            return
+
+        # ANALYZE: route by `model` field.
+        if action == KataGoAction.ANALYZE:
+            requested = query.opaque.get("model")
+            if requested is None:
+                logger.warning(
+                    f"ANALYZE without `model` field; failing loudly "
+                    f"({canonical_id})"
+                )
+                await self._send_structured_error(
+                    canonical_id,
+                    self._MISSING_MODEL_ERROR,
+                    on_response,
+                    on_complete,
+                    field="model",
+                )
+                return
+            if requested not in self._url_for_label:
+                available = sorted(self._url_for_label.keys())
+                err = self._UNKNOWN_MODEL_ERROR_TEMPLATE.format(
+                    requested=requested,
+                    available=available,
+                )
+                logger.warning(
+                    f"unknown model {requested!r} ({canonical_id}); "
+                    f"available: {available}"
+                )
+                await self._send_structured_error(
+                    canonical_id,
+                    err,
+                    on_response,
+                    on_complete,
+                    field="model",
+                )
+                return
+            if requested in self._unhealthy_models:
+                err = self._UNHEALTHY_MODEL_ERROR_TEMPLATE.format(
+                    label=requested
+                )
+                logger.warning(
+                    f"model {requested!r} unhealthy; failing loudly "
+                    f"({canonical_id})"
+                )
+                await self._send_structured_error(
+                    canonical_id, err, on_response, on_complete,
+                    field="model",
+                )
+                return
+            await self._forward(
+                canonical_id, wire_dict, query, requested,
+                on_response, on_complete,
+            )
+            return
+
+        # QUERY_VERSION / CLEAR_CACHE / TERMINATE_ALL: forward to first
+        # healthy upstream. CLEAR_CACHE / TERMINATE_ALL are MVP-limited
+        # to a single upstream; broadcast semantics are deferred per the
+        # roadmap. The WARNING surface tells operators which upstream
+        # was actually targeted.
+        if action in (
+            KataGoAction.QUERY_VERSION,
+            KataGoAction.CLEAR_CACHE,
+            KataGoAction.TERMINATE_ALL,
+        ):
+            label = self._first_healthy_label()
+            if label is None:
+                logger.error(
+                    f"{action.name} requested ({canonical_id}) but no "
+                    f"healthy upstream available"
+                )
+                await self._send_structured_error(
+                    canonical_id,
+                    self._NO_HEALTHY_UPSTREAM_ERROR,
+                    on_response,
+                    on_complete,
+                )
+                return
+            if action != KataGoAction.QUERY_VERSION:
+                logger.warning(
+                    f"{action.name} routed to single upstream {label!r}; "
+                    f"broadcast semantics across all upstreams are "
+                    f"deferred for SELECTOR (Phase 2+3 MVP limitation)"
+                )
+            await self._forward(
+                canonical_id, wire_dict, query, label,
+                on_response, on_complete,
+            )
+            return
+
+        # TERMINATE is dispatched via the dedicated terminate() method,
+        # not via dispatch(); landing here is a misuse upstream of
+        # SELECTOR. Fail loudly so the misroute is visible.
+        logger.error(
+            f"unexpected action {action.name} in dispatch() "
+            f"({canonical_id}); SELECTOR routes terminate via the "
+            f"dedicated terminate() method"
+        )
+        await self._send_structured_error(
+            canonical_id,
+            f"unsupported action for SELECTOR.dispatch: {action.name}",
+            on_response,
+            on_complete,
+        )
+
+    async def _forward(
+        self,
+        canonical_id: str,
+        wire_dict: WireDict,
+        query: KataGoQuery,
+        label: str,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        """Forward wire_dict to the labelled upstream's WebSocket.
+
+        ``wire_dict`` already has ``model`` stripped by the central
+        wire-strip in ``translate_query_to_wire`` (the ``model`` field
+        is in ``_PROXY_ONLY_FIELDS``). Vanilla KataGo on the upstream
+        side never sees the field.
+
+        Disconnected (within retry budget) → structured error: the
+        operator may have a transient blip; the SPA can retry. We don't
+        queue the query to wait for reconnect — that would conflict
+        with the fail-loud posture and the per-query timing semantics
+        the SPA expects.
+        """
+        ws = self._connections.get(label)
+        if ws is None:
+            logger.warning(
+                f"label={label!r} disconnected (within retry budget); "
+                f"failing query {canonical_id!r} loudly"
+            )
+            await self._send_structured_error(
+                canonical_id,
+                self._DISCONNECTED_MODEL_ERROR_TEMPLATE.format(label=label),
+                on_response,
+                on_complete,
+                field="model",
+            )
+            return
+        _register_query(self._tracker, canonical_id, query)
+        self._callbacks[canonical_id] = (on_response, on_complete, label)
+        try:
+            await ws.send(json.dumps(wire_dict))
+        except Exception as e:
+            logger.error(
+                f"send failed for label={label!r} ({canonical_id}): {e}"
+            )
+            self._tracker.cancel(canonical_id)
+            self._callbacks.pop(canonical_id, None)
+            await self._send_structured_error(
+                canonical_id,
+                self._DISCONNECTED_MODEL_ERROR_TEMPLATE.format(label=label),
+                on_response,
+                on_complete,
+                field="model",
+            )
+            return
+        logger.debug(f"sent to label={label!r}: {json.dumps(wire_dict)}")
+
+    # -----------------------------------------------------------------------
+    # Terminate (label-routed)
+    # -----------------------------------------------------------------------
+
+    async def terminate(
+        self,
+        canonical_id: str,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        """Cancel an in-flight query at its routed-to upstream.
+
+        Looks up the label remembered for ``canonical_id`` in
+        ``_callbacks``; routes the terminate to that upstream's
+        WebSocket. If the upstream is gone or no in-flight entry
+        exists, synthesises a terminate ack so the client doesn't
+        freeze. Mirrors ``RelayRouter.terminate()``.
+        """
+        cb = self._callbacks.pop(canonical_id, None)
+
+        async def _send_synthetic_ack() -> None:
+            term_wire_id = f"kg_{secrets.token_hex(6)}"
+            synthetic_ack: WireDict = {
+                "id": term_wire_id,
+                "action": "terminate",
+                "terminateId": canonical_id,
+            }
+            await on_response(term_wire_id, synthetic_ack)
+            await on_complete(term_wire_id)
+
+        if cb is None:
+            logger.info(
+                f"no in-flight entry for {canonical_id!r}; "
+                f"synthesising terminate ack"
+            )
+            await _send_synthetic_ack()
+            return
+
+        _, _, label = cb
+        self._tracker.cancel(canonical_id)
+
+        ws = self._connections.get(label)
+        if ws is None:
+            logger.warning(
+                f"label={label!r} disconnected; cannot send terminate "
+                f"for {canonical_id!r}; synthesising ack"
+            )
+            await _send_synthetic_ack()
+            return
+
+        term_wire_id = f"kg_{secrets.token_hex(6)}"
+        term_wire: WireDict = {
+            "id": term_wire_id,
+            "action": "terminate",
+            "terminateId": canonical_id,
+        }
+
+        self._tracker.register_count(term_wire_id, 1)
+        self._callbacks[term_wire_id] = (on_response, on_complete, label)
+
+        try:
+            await ws.send(json.dumps(term_wire))
+        except Exception as e:
+            logger.warning(
+                f"send-terminate failed for label={label!r} "
+                f"({canonical_id!r}): {e}"
+            )
+            self._tracker.cancel(term_wire_id)
+            self._callbacks.pop(term_wire_id, None)
+            await _send_synthetic_ack()
+            return
+        logger.debug(f"→ label={label!r}: {term_wire}")
+
+    async def stop(self) -> None:
+        """Cancel reader/reconnect tasks and close all upstream connections."""
+        for task in list(self._reader_tasks.values()):
+            task.cancel()
+        for task in list(self._reconnect_tasks):
+            task.cancel()
+        for ws in list(self._connections.values()):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        logger.info("done")
+
+
+# ---------------------------------------------------------------------------
 # EchoRouter
 # ---------------------------------------------------------------------------
 
@@ -1201,6 +1864,16 @@ def make_router(
         if load_metric is None:
             load_metric = InFlightQueryLoad()
         return RelayRouter(upstream_urls, load_metric)
+
+    if role_upper == "SELECTOR":
+        # SelectorRouter consumes its own dedicated env var
+        # (SELECTOR_MODELS) rather than UPSTREAM_URLS — the role's
+        # invariant (named, distinguishable upstreams) is structurally
+        # different from RELAY's (interchangeable pool), and the env
+        # var puts the structural difference in configuration space.
+        # Empty configuration / duplicate labels raise
+        # SelectorStartupError at start() per ADR-0002.
+        return SelectorRouter(models=cfg.SELECTOR_MODELS)
 
     if role_upper == "ECHO":
         return EchoRouter()

@@ -344,6 +344,15 @@ _PROXY_ONLY_FIELDS: frozenset[str] = frozenset({
     "replay_final_only",
     "analysis_config",
     "capabilities",
+    # SELECTOR (v1.0.15): the `model` field is read by SelectorRouter
+    # to choose which upstream LEAF receives the query, then stripped
+    # by this central wire-strip before forwarding. Vanilla KataGo does
+    # not understand the field; this discipline prevents leakage into
+    # the engine regardless of which router serves the role. The field
+    # is intentionally NOT popped in pubsub_hub.subscribe (unlike
+    # `capabilities`), so SelectorRouter can read it from query.opaque
+    # to choose the upstream; the central strip handles the wire side.
+    "model",
 })
 
 
