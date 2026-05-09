@@ -1865,6 +1865,16 @@ def make_router(
             load_metric = InFlightQueryLoad()
         return RelayRouter(upstream_urls, load_metric)
 
+    if role_upper == "SELECTOR":
+        # SelectorRouter consumes its own dedicated env var
+        # (SELECTOR_MODELS) rather than UPSTREAM_URLS — the role's
+        # invariant (named, distinguishable upstreams) is structurally
+        # different from RELAY's (interchangeable pool), and the env
+        # var puts the structural difference in configuration space.
+        # Empty configuration / duplicate labels raise
+        # SelectorStartupError at start() per ADR-0002.
+        return SelectorRouter(models=cfg.SELECTOR_MODELS)
+
     if role_upper == "ECHO":
         return EchoRouter()
 

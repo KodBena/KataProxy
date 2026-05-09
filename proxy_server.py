@@ -879,7 +879,15 @@ def _build_advertised_capabilities() -> dict[str, dict]:
     transformers/transposition_enricher.py and keeps the advertisement
     honest about what the proxy can actually do.
 
-    All capabilities ship with empty metadata in Phase 1 — the
+    selector (Phase 2+3) is advertised iff cfg.ROLE == "SELECTOR" — the
+    role-gated routing capability that tells SPA clients to render the
+    model dropdown. Unlike the behavioural capabilities, `selector` is
+    not engaged per-query via the capabilities field; routing flows
+    through the dedicated `model` field on the analysis query. The
+    advertisement is presence-as-signal so the SPA can feature-detect
+    and decide whether to render the model UI.
+
+    All capabilities ship with empty metadata in Phase 1+2+3 — the
     metadata-schema-formalisation per the dispatch's Q4 answer is
     on the *query* side (e.g. adaptive_reevaluate's worst_quantile /
     extra_visits overrides), not the advertisement side.
@@ -893,6 +901,8 @@ def _build_advertised_capabilities() -> dict[str, dict]:
         advertised["transposition"] = {}
     except ImportError:
         pass
+    if cfg.ROLE.upper() == "SELECTOR":
+        advertised["selector"] = {}
     return advertised
 
 
