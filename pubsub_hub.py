@@ -176,6 +176,14 @@ class CoalescingPolicy:
         "boardXSize",
         "boardYSize",
         "moves",
+        # Proxy-control field that participates in identity for
+        # coalescing purposes: two queries with different capability
+        # opt-in sets produce different transformer/middleware chains
+        # and therefore different response artefacts; they must not
+        # coalesce. Stripped from the wire payload in subscribe()
+        # after the hash is computed (see also the central wire-strip
+        # discipline in katago/katago_proxy.py:translate_query_to_wire).
+        "capabilities",
     )
 
     def query_hash(self, query: KataGoQuery) -> str:
@@ -421,6 +429,21 @@ class PubSubHub:
         # 3. Compute analysis-level cache key (FULL query, separate from content_hash)
         # -------------------------------------------------------------------
         cache_key = self._compute_cache_key(query)
+
+        # -------------------------------------------------------------------
+        # 3a. Strip proxy-control fields that the proxy interprets but the
+        #     engine must not see. `capabilities` is a Phase 1 addition;
+        #     it has already been folded into both content_hash (via
+        #     CoalescingPolicy.capturing_fields) and cache_key (via
+        #     full-opaque inclusion), so popping here is post-hash and
+        #     therefore safe. The central wire-strip discipline in
+        #     katago/katago_proxy.py:translate_query_to_wire is the
+        #     authoritative line; this pop is belt-and-braces, ensuring
+        #     the field is also absent from any consumer that observes
+        #     the post-subscribe query directly (e.g. the router's
+        #     dispatch path).
+        # -------------------------------------------------------------------
+        query.opaque.pop("capabilities", None)
 
         # -------------------------------------------------------------------
         # 4. Replay-cache short-circuit (analysis-level exact match)
