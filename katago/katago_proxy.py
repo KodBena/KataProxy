@@ -321,8 +321,40 @@ _KATAGO_WIRE_ACTIONS: dict[str, KataGoAction] = {
 }
 
 
+# Proxy-control fields that the proxy interprets but the engine must
+# never see. The wire builder is the single authoritative line for the
+# "never reaches KataGo" discipline; per-consumer pops elsewhere
+# (pubsub_hub.subscribe pops the three cache-control flags;
+# transformers/analysis_enricher.on_query pops analysis_config;
+# pubsub_hub.subscribe pops capabilities post-hash) become belt-and-
+# braces with this central enforcement, and adding a future proxy-only
+# field is a one-line tuple extension to a single known location.
+#
+# Without this central strip, per-query capability gating would create
+# a regression hazard: a query opting out of delta_analysis while
+# still carrying analysis_config in opaque would let analysis_config
+# survive past the (now-skipped) analysis_enricher.on_query and reach
+# KataGo, crashing it as in the empty-board-ponder failure mode that
+# v1.0.13's analysis_config-strip fix closed. See the umbrella's
+# docs/dispatch/proxy-to-proxy-selector-canonical-key-near-miss.md
+# (addendum, "downstream hazard" section) for the full rationale.
+_PROXY_ONLY_FIELDS: frozenset[str] = frozenset({
+    "cache",
+    "lookup_cache",
+    "replay_final_only",
+    "analysis_config",
+    "capabilities",
+})
+
+
 def translate_query_to_wire(query: KataGoQuery, envelope_id: str) -> dict[str, Any]:
-    """Serialise a KataGoQuery to a wire-format dict."""
+    """Serialise a KataGoQuery to a wire-format dict.
+
+    Excludes any key in `_PROXY_ONLY_FIELDS` — those fields are
+    proxy-interpreted and must never reach KataGo. See the module-level
+    comment on `_PROXY_ONLY_FIELDS` for the rationale and the
+    belt-and-braces relationship with per-consumer pops elsewhere.
+    """
     wire: dict[str, Any] = {"id": envelope_id}
     if query.action != KataGoAction.ANALYZE:
         wire["action"] = query.action.name.lower()
@@ -331,7 +363,10 @@ def translate_query_to_wire(query: KataGoQuery, envelope_id: str) -> dict[str, A
     if query.analyze_turns is not None:
         wire["analyzeTurns"] = query.analyze_turns
     wire.update(query.opaque)
-    return {k: v for k, v in wire.items() if v is not None}
+    return {
+        k: v for k, v in wire.items()
+        if v is not None and k not in _PROXY_ONLY_FIELDS
+    }
 
 
 def parse_query_from_wire(wire: dict[str, Any]) -> tuple[str, KataGoQuery]:
