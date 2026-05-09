@@ -830,7 +830,10 @@ class ProxyServer:
 from contextual import Contextual
 from transformers.transposition_enricher import transposition_enricher
 from transformers.analysis_enricher import analysis_enricher
+from transformers.capability_gate import capability_gate
+from transformers.capabilities_advertiser import capabilities_advertiser
 from middleware.adaptive_reevaluate import adaptive_reevaluate
+from middleware.capability_gate import CapabilityGatedMiddleware
 from middleware.keep_alive import KeepAliveMiddleware
 
 
@@ -838,14 +841,23 @@ def _make_middleware() -> SessionMiddleware:
     """Per-session middleware factory.
 
     Composes the adaptive re-evaluation policy (inner) with the keep-alive
-    inactivity watchdog (outer). When KEEP_ALIVE_IDLE_TIMEOUT_SECONDS is
-    set to 0 or negative, the watchdog is omitted and the chain degrades
-    to bare adaptive_reevaluate.
+    inactivity watchdog (outer). adaptive_reevaluate is wrapped in a
+    CapabilityGatedMiddleware so per-query opt-out of `adaptive_reevaluate`
+    bypasses the middleware entirely (no observation, no submit_query, no
+    GPU cycles spent on deeper analysis). KeepAliveMiddleware is *not*
+    capability-gated: it is a watchdog that should always run.
+
+    When KEEP_ALIVE_IDLE_TIMEOUT_SECONDS is set to 0 or negative, the
+    watchdog is omitted and the chain degrades to bare
+    CapabilityGatedMiddleware around adaptive_reevaluate.
     """
-    base = adaptive_reevaluate(
-        worst_quantile=0.25,
-        extra_visits=800,
-        window_size=3,
+    base = CapabilityGatedMiddleware(
+        "adaptive_reevaluate",
+        adaptive_reevaluate(
+            worst_quantile=0.25,
+            extra_visits=800,
+            window_size=3,
+        ),
     )
     if cfg.KEEP_ALIVE_IDLE_TIMEOUT_SECONDS <= 0:
         return base
@@ -857,13 +869,48 @@ def _make_middleware() -> SessionMiddleware:
     )
 
 
+def _build_advertised_capabilities() -> dict[str, dict]:
+    """Construct the server's capability advertisement at startup.
+
+    delta_analysis and adaptive_reevaluate are unconditionally wired
+    below in _main, so they are unconditionally advertised. transposition
+    is advertised iff the native go_transposition module is importable;
+    this mirrors the runtime check in
+    transformers/transposition_enricher.py and keeps the advertisement
+    honest about what the proxy can actually do.
+
+    All capabilities ship with empty metadata in Phase 1 — the
+    metadata-schema-formalisation per the dispatch's Q4 answer is
+    on the *query* side (e.g. adaptive_reevaluate's worst_quantile /
+    extra_visits overrides), not the advertisement side.
+    """
+    advertised: dict[str, dict] = {
+        "delta_analysis": {},
+        "adaptive_reevaluate": {},
+    }
+    try:
+        import go_transposition  # noqa: F401
+        advertised["transposition"] = {}
+    except ImportError:
+        pass
+    return advertised
+
+
 async def _main() -> None:
+    advertised_caps = _build_advertised_capabilities()
+    logger.info(f"advertising capabilities: {sorted(advertised_caps.keys())}")
+
     server = ProxyServer(
-        # Pure synchronous content transformations (enrichment, filtering).
-        transformer_factory=Contextual(analysis_enricher).then(transposition_enricher),
-        # Stateful async policy: adaptive re-evaluation chained with the
-        # keep-alive inactivity watchdog. A fresh instance per session
-        # because middleware holds per-query state.
+        # Per-query-gated synchronous content transformations + the
+        # always-on capability advertiser on query_version responses.
+        transformer_factory=(
+            Contextual(capability_gate("delta_analysis", analysis_enricher))
+            .then(capability_gate("transposition", transposition_enricher))
+            .then(capabilities_advertiser(advertised_caps))
+        ),
+        # Stateful async policy: capability-gated adaptive re-evaluation
+        # chained with the keep-alive inactivity watchdog. A fresh
+        # instance per session because middleware holds per-query state.
         middleware_factory=_make_middleware,
     )
     try:
