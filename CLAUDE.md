@@ -259,6 +259,117 @@ The companion regression-test files are:
     `tests/diagnose_watchdog_relay.py` (topology-level RELAY + N
     phantom upstreams heartbeat broadcast).
 
+## Logging conventions (load-bearing for the structured envelope)
+
+The proxy's log surface is structured: a closed `Event` vocabulary,
+per-event required-field schemas validated at the call site, three
+formatters chosen by env var, role-tinted bind chains. The shape is
+recorded in `proxy/docs/logging-design.md`; the operator-facing
+runtime view is in `proxy/docs/logging.md`. The conventions below
+apply when authoring or migrating call sites.
+
+### When to introduce a typed event vs. `Event.DIAGNOSTIC`
+
+The closed `Event` enum lives in `proxy_logging/events.py`. Adding
+a member is a code change — the same PR adds the new member, its
+`EVENT_REQUIRED_FIELDS` entry, and (where >2 call sites will use
+it) a helper in `proxy_logging/lifecycle.py`. The threshold is
+"this records a meaningful protocol or lifecycle moment that
+operators will want to filter on." Examples that warrant a typed
+event: a new dispatch-style action, a new failure mode that needs
+its own structured cause field, a new middleware-engagement
+discriminator. Examples that **don't**: a one-off warning inside
+an existing flow, a per-record diagnostic with no aggregator-
+visible structure, a transient compute failure.
+
+For the latter category, use `Event.DIAGNOSTIC`. It carries the
+full structured envelope (`role`, `module`, `ts`, `level`, `msg`)
+but no event-specific required fields, so the call site can supply
+whatever context is locally useful via `msg=` plus structured
+fields the bind chain or call site happens to carry. Do not lean
+on it as a substitute for typing — every DIAGNOSTIC is a small
+admission that the lifecycle category was wrong-sized — but it's
+the right shape for the ten-percent that don't fit.
+
+### When to wrap a typed event in a `lifecycle.*` helper
+
+`proxy_logging/lifecycle.py` is a thin convenience layer: each
+helper wraps `ProxyLogger.<level>(Event.X, …)` with the right
+default `msg=` and field sequence. The threshold for adding a
+helper is "more than two call sites would emit this event with
+the same default shape." A single call site can emit the event
+directly via the adapter; the helper exists so the wire shape
+stays consistent across call sites without each one re-spelling
+the boilerplate.
+
+A helper that takes a `level` parameter (or splits internally on
+a `kind` discriminator) is the right pattern when the event needs
+to fire at multiple levels — see `lifecycle.forward` for the
+worked example: `partial` → DEBUG, `final`/`metadata`/`error` →
+INFO. The discriminator stays in the helper, so call sites pass
+`kind=…` and the level decision is one place to maintain.
+
+### Reserved-name collisions are loud, not silent
+
+Stdlib's `logging.LogRecord` reserves a closed set of attribute
+names (`name`, `msg`, `args`, `levelname`, `levelno`, `pathname`,
+`filename`, `module`, `exc_info`, `lineno`, `funcName`, `created`,
+`msecs`, `thread`, `threadName`, `processName`, `process`,
+`message`, `asctime`, `taskName`). The `proxy_logging` adapter
+rejects any `bind()` field or call-site kwarg that collides —
+`LogContractError` raises immediately, regardless of level filter.
+The reserved-name check lives in
+`proxy_logging/adapter.py:_LOGRECORD_RESERVED` and runs **before**
+the level-filter step so a DEBUG-only call site can't ship a
+collision that would surface only when an operator turned DEBUG
+on later.
+
+The v1.0.20 `name` → `orch_name` rename is the worked example:
+the orchestration framework's `Event.ORCHESTRATION_SPAWN` /
+`Event.ORCHESTRATION_DONE` originally bound a field named `name`
+(the orchestration's display name), which collided with
+`LogRecord.name`. Tests passed at the level the framework
+typically logs (INFO) but raised at DEBUG-filtered call sites in
+production. The fix: rename the field; reorder the validator to
+check reserved-names at all levels; add a regression test.
+
+When introducing a new event, audit its required-field set against
+the reserved-name list before merging. The static check is in
+`tests/test_proxy_logging.py:test_no_event_field_collides_with_logrecord`.
+
+### Bind chains, not call-site repetition
+
+The role / session / upstream / label / cid context is bound once,
+not re-supplied on every call. The pattern:
+
+  - Process-wide: `set_process_role(role)` at startup binds `role`
+    onto every `get_proxy_logger(name)` return.
+  - Per-`ClientSession`: the constructor builds `self._log =
+    get_proxy_logger(__name__).bind(session=peer)`.
+  - Per-upstream (RELAY / SELECTOR): the per-upstream session
+    refines further with `.bind(upstream=url, label=name)`.
+  - Per-call-site: only the event-specific fields go in the
+    `lifecycle.X(...)` or `logger.info(Event.X, …)` call.
+
+A call site that re-supplies a bound field is a code smell — it
+either means the bind chain didn't reach the call site (audit
+needed) or the field is fan-in across multiple bind chains (rare;
+worth a comment if intentional). The reserved-name check
+guarantees the bind chain can't silently override a `LogRecord`
+attribute through this mechanism either.
+
+### File / module references
+
+  - `proxy/docs/logging.md` — operator runtime view.
+  - `proxy/docs/logging-design.md` — design memo (event vocabulary
+    rationale, schema invariants, formatter shapes, phasing).
+  - `proxy/proxy_logging/__init__.py` — public API.
+  - `proxy/proxy_logging/events.py` — closed `Event` enum and
+    `EVENT_REQUIRED_FIELDS` schema (read this before adding events).
+  - `proxy/proxy_logging/lifecycle.py` — convenience helpers.
+  - `proxy/tests/test_role_coverage.py` — per-role coverage
+    contract tests; extend when adding role-bound events.
+
 ## The licensing boundary is load-bearing
 
 The repository carries two licenses, by directory:

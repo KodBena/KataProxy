@@ -402,3 +402,285 @@ class TestSchemaContract:
                 f"event={record.event!r} missing role field; "
                 f"record={record.__dict__}"
             )
+
+
+# ===========================================================================
+# Negative-path coverage — dispatch_error
+# ===========================================================================
+#
+# kg_crash and kg_unhealthy are deferred (require a real KataGo
+# subprocess or extensive Popen mocking). The subprocess events are
+# covered by integration testing rather than unit-level capture.
+# parse_error fires from ClientSession's _handle_incoming, which is
+# tested at the integration layer via the diagnose_phase* scripts —
+# adding a unit-level capture test here would require constructing
+# a full ClientSession with mock ws / hub / router / chain /
+# middleware. Acceptable Phase 4 scope cap.
+
+
+@pytest.mark.asyncio
+class TestRelayDispatchError:
+    """RELAY emits dispatch_error when a per-upstream send fails during
+    broadcast (the canonical case: one of N upstreams' WebSockets is
+    closed). The broadcast must continue to the rest, and each failure
+    surfaces as a structured record so operators can see partial-fanout
+    failures explicitly.
+    """
+
+    async def test_broadcast_send_failure_emits_dispatch_error(
+        self, capture: _CaptureHandler,
+    ) -> None:
+        router = RelayRouter(
+            upstream_urls=["ws://a:1", "ws://b:2", "ws://c:3"],
+            load_metric=InFlightQueryLoad(),
+        )
+        # Three sockets: A and C healthy, B closed (send raises).
+        sockets = {url: _MockWebSocket(url) for url in router._urls}
+        sockets["ws://b:2"].closed = True
+        for url, ws in sockets.items():
+            router._connections[url] = ws
+
+        async def on_response(_cid, _w): pass
+        async def on_complete(_cid): pass
+
+        q = _heartbeat_query()
+        wire = translate_query_to_wire(q, "cid-hb")
+        await router.dispatch(
+            "cid-hb", wire, q, on_response, on_complete,
+        )
+
+        # The closed socket's send failure surfaces as dispatch_error.
+        # Other upstreams succeed; broadcast itself still fires.
+        assert "broadcast" in capture.events
+        assert "dispatch_error" in capture.events
+        # The error record should carry the upstream URL and an
+        # error_kind so the failed peer is identifiable.
+        assert capture.field_at("dispatch_error", "upstream") == "ws://b:2"
+        error_kind = capture.field_at("dispatch_error", "error_kind")
+        assert "send_failed" in error_kind, (
+            f"dispatch_error.error_kind should describe the failure shape; "
+            f"got {error_kind!r}"
+        )
+
+
+# ===========================================================================
+# Hub-coalescing coverage — coalesce
+# ===========================================================================
+#
+# cache_hit is harder to drive in isolation because it requires a
+# pre-populated LRUCacheStore record at the right cache_key, and the
+# hub's caching path is only exercised end-to-end (subscribe, dispatch,
+# response delivery, on_complete fires the cache write). Adding a
+# capture test here would couple to the internal cache layout. The
+# emission shape is unit-tested via lifecycle.cache_hit in
+# test_proxy_logging.py:TestLifecycleHelpers.
+
+
+@pytest.mark.asyncio
+class TestHubCoalesceEvent:
+    """When a second subscriber joins an existing canonical (identical
+    analyze query, no cache flags), the hub emits coalesce instead of
+    a new subscribe. The capture confirms the discriminated emission
+    that ClientSession-level tests previously could not see (the
+    pre-Phase-3 shape unconditionally emitted subscribe from
+    _handle_query, masking the discrimination)."""
+
+    async def test_second_identical_subscribe_emits_coalesce(
+        self, capture: _CaptureHandler,
+    ) -> None:
+        import asyncio
+        from pubsub_hub import PubSubHub
+        from proxy_logging import get_proxy_logger, Role
+        # Bind role + session: the SUBSCRIBE / COALESCE events require
+        # the session field via the bind chain (production source: the
+        # ClientSession constructor binds session=peer onto self._log
+        # before passing through to hub.subscribe).
+        #
+        # Use a per-test logger name to avoid level state bleed from
+        # other tests in the suite that .setLevel() on shared loggers
+        # without restoring (e.g., TestLevelGating in
+        # test_proxy_logging.py).
+        plog = (
+            get_proxy_logger("kataproxy.test_role_coverage.coalesce")
+            .bind(role=Role.LEAF, session="peer:test")
+        )
+
+        hub = PubSubHub()
+        q = _analyze_query()
+        # First subscriber.
+        is_new1, canonical1 = hub.subscribe(
+            query=q,
+            subscriber_internal_id="iid-1",
+            subscriber_queue=asyncio.Queue(),
+            proxy_log=plog,
+            orig_id="orig-1",
+        )
+        # Second subscriber, same query. The hub.subscribe API
+        # consumes the cache flags via .pop(), so re-build a fresh
+        # query to pass to the second call (otherwise capabilities
+        # / model fields would have already been popped).
+        q2 = _analyze_query()
+        is_new2, canonical2 = hub.subscribe(
+            query=q2,
+            subscriber_internal_id="iid-2",
+            subscriber_queue=asyncio.Queue(),
+            proxy_log=plog,
+            orig_id="orig-2",
+        )
+
+        assert is_new1 is True, "first subscribe should be new"
+        assert is_new2 is False, "second identical subscribe should coalesce"
+        assert canonical1 == canonical2, "should ride the same canonical"
+
+        assert "subscribe" in capture.events
+        assert "coalesce" in capture.events
+        assert capture.field_at("coalesce", "cid") == canonical1
+        assert capture.field_at("coalesce", "orig") == "orig-2"
+        assert capture.field_at("coalesce", "subscriber_count") == 2
+
+
+# ===========================================================================
+# Middleware-engagement coverage — middleware_engage
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestMiddlewareEngageEvent:
+    """CapabilityGatedMiddleware emits middleware_engage when a per-query
+    opt-in registers the wrapped middleware as engaged for that
+    orig_id. The discriminator confirms which capability gated which
+    query — operators see this when adaptive_reevaluate (or any other
+    capability-gated middleware) takes effect.
+    """
+
+    async def test_per_query_opt_in_emits_middleware_engage(
+        self, capture: _CaptureHandler,
+    ) -> None:
+        from middleware.capability_gate import CapabilityGatedMiddleware
+        from middleware.session_middleware import (
+            IdentityMiddleware,
+            SessionCapabilities,
+        )
+        from proxy_logging import get_proxy_logger, Role
+
+        # Recorder middleware that just identifies as "wrapped".
+        wrapped = IdentityMiddleware()
+        gated = CapabilityGatedMiddleware("test_capability", wrapped)
+        # The gate uses the structured logger inside its own
+        # implementation; the role is bound onto the test fixture's
+        # capture so the schema-validity contract holds end-to-end.
+        get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
+
+        gated.on_session_start(
+            SessionCapabilities(submit_query=None, terminate_query=None),
+        )
+
+        # Per-query opt-in: capabilities dict naming the gated cap.
+        q = _analyze_query()
+        q.opaque["capabilities"] = {"test_capability": {}}
+        gated.on_query("orig-1", q)
+
+        # The gate's engagement decision lands as middleware_engage.
+        # `middleware_name` is the wrapped class name (the helper
+        # required field), `capability` is the gate's own name (the
+        # gate-specific discriminator).
+        assert "middleware_engage" in capture.events
+        assert (
+            capture.field_at("middleware_engage", "middleware_name")
+            == "IdentityMiddleware"
+        )
+        assert (
+            capture.field_at("middleware_engage", "capability")
+            == "test_capability"
+        )
+        assert capture.field_at("middleware_engage", "orig") == "orig-1"
+        assert capture.field_at("middleware_engage", "cause") == "opt_in"
+
+
+# ===========================================================================
+# Orchestration coverage — orchestration_spawn / orchestration_done
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestOrchestrationSpawnEvent:
+    """OrchestrationMiddleware emits orchestration_spawn when a coroutine
+    submits a sub-query via ctx.spawn, and orchestration_done with the
+    outcome (normal / cancelled / error) when the coroutine completes.
+
+    Operators tracing one cid see (engage if gated) → spawn → done
+    framing the orchestration's lifetime. The spawn event carries the
+    sub-query's synthetic orig_id (`__orch__<hex>`) so the operator
+    can correlate the parent's lifetime with the deeper-query's own
+    dispatch / respond / complete sequence.
+    """
+
+    async def test_spawn_emits_orchestration_spawn_with_sub_orig_id(
+        self, capture: _CaptureHandler,
+    ) -> None:
+        import asyncio
+        from middleware.orchestration import (
+            OrchestrationContext,
+            orchestration_middleware,
+        )
+        from middleware.session_middleware import SessionCapabilities
+
+        submitted: list = []
+
+        async def submit(oid, q):
+            submitted.append((oid, q))
+
+        async def terminate(_oid):
+            pass
+
+        @orchestration_middleware(name="test_orch")
+        async def coro(parent, ctx):
+            # Discard originals so the framework doesn't buffer; we're
+            # testing the spawn emission shape.
+            await ctx.discard_originals()
+            sub = _analyze_query()
+            async for resp in ctx.spawn(sub):
+                yield resp
+
+        m = coro()
+        m.on_session_start(
+            SessionCapabilities(
+                submit_query=submit, terminate_query=terminate,
+            ),
+        )
+        m.on_query("parent-orig", _analyze_query())
+
+        # Allow the coroutine to reach ctx.spawn → submit_query.
+        for _ in range(50):
+            if submitted:
+                break
+            await asyncio.sleep(0.005)
+        assert submitted, "coroutine never reached spawn"
+
+        # orchestration_spawn event captured with the synthetic
+        # sub_orig_id and the orchestration's name.
+        assert "orchestration_spawn" in capture.events
+        sub_orig = capture.field_at("orchestration_spawn", "sub_orig")
+        assert sub_orig.startswith("__orch__"), (
+            f"sub_orig should carry the synthetic prefix; got {sub_orig!r}"
+        )
+        assert (
+            capture.field_at("orchestration_spawn", "orch_name")
+            == "test_orch"
+        )
+        assert capture.field_at("orchestration_spawn", "cid") == "parent-orig"
+
+
+# ===========================================================================
+# Forward emission coverage — forward (per-kind level split)
+# ===========================================================================
+#
+# The lifecycle.forward helper's level-split contract is unit-tested
+# in test_proxy_logging.py:TestLifecycleForwardKindLevel. The
+# integration test (driving it from ClientSession._deliver_upstream)
+# is covered by the diagnose_phase* scripts; adding a capture-based
+# unit test here would require constructing a full ClientSession
+# (mock ws, hub, router, chain, middleware, link). Acceptable Phase 4
+# scope cap; the helper-level pin in test_proxy_logging.py guards the
+# DEBUG/INFO discrimination, and ClientSession's call site is one
+# line wired through the helper.

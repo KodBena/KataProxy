@@ -744,6 +744,63 @@ class TestLifecycleHelpers:
         assert rec.levelname == "ERROR"
 
 
+class TestLifecycleForwardKindLevel:
+    """Validate the kind-aware level split in lifecycle.forward.
+
+    The contract: `partial` → DEBUG (volume scales with
+    reportDuringSearchEvery × turns and would flood INFO);
+    `final`/`metadata`/`error` → INFO (one per turn or per non-analyze
+    query; visible at the default level so the demand-edge timestamp
+    is operator-readable). The split lives inside the helper so call
+    sites pass `kind=…` and don't pick the level themselves.
+
+    Pinning the helper's contract here means refactors that "simplify"
+    the helper by collapsing the split (or accidentally swap DEBUG/INFO)
+    fail loudly rather than silently degrading the operator's visibility.
+    """
+
+    def test_partial_kind_emits_at_debug(
+        self, memory_handler: _MemoryHandler
+    ) -> None:
+        plog = get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
+        lifecycle.forward(plog, cid="hub_x", orig="r1", kind="partial")
+        rec = memory_handler.records[0]
+        assert rec.event == "forward"
+        assert rec.levelname == "DEBUG"
+        assert rec.kind == "partial"
+        assert rec.direction == Direction.FORWARD
+
+    def test_final_kind_emits_at_info(
+        self, memory_handler: _MemoryHandler
+    ) -> None:
+        plog = get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
+        lifecycle.forward(plog, cid="hub_x", orig="r1", kind="final")
+        rec = memory_handler.records[0]
+        assert rec.event == "forward"
+        assert rec.levelname == "INFO"
+        assert rec.kind == "final"
+
+    def test_metadata_kind_emits_at_info(
+        self, memory_handler: _MemoryHandler
+    ) -> None:
+        plog = get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
+        lifecycle.forward(plog, cid="hub_x", orig="r1", kind="metadata")
+        rec = memory_handler.records[0]
+        assert rec.event == "forward"
+        assert rec.levelname == "INFO"
+        assert rec.kind == "metadata"
+
+    def test_error_kind_emits_at_info(
+        self, memory_handler: _MemoryHandler
+    ) -> None:
+        plog = get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
+        lifecycle.forward(plog, cid="hub_x", orig="r1", kind="error")
+        rec = memory_handler.records[0]
+        assert rec.event == "forward"
+        assert rec.levelname == "INFO"
+        assert rec.kind == "error"
+
+
 # ===========================================================================
 # logging_config.py shim — backward compat
 # ===========================================================================
