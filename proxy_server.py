@@ -1028,6 +1028,15 @@ def _build_advertised_capabilities() -> dict[str, dict]:
 
 
 async def _main() -> None:
+    # Install the structured-logging handler at startup so the
+    # ProxyLogger emissions from ClientSession / routers / etc. land
+    # on the chosen formatter (console by default when stderr is a
+    # tty; logfmt otherwise). Idempotent — calling twice is a no-op.
+    # See proxy_logging.formatters.configure_logging_from_env() and
+    # proxy/docs/logging-design.md §6 / §8 for the env-var matrix.
+    from proxy_logging import configure_logging_from_env
+    configure_logging_from_env()
+
     # Per-query capability gating is always wired — legacy clients (no
     # capabilities field on the query) trigger auto-engage on the gate
     # side, so all transformers/middleware run as in v1.0.13. The

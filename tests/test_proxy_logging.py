@@ -490,6 +490,38 @@ class TestConsoleFormatter:
         assert "hub_full_canonical_id" in out
         assert "range-full-orig-id" in out
 
+    def test_unmigrated_record_falls_back_to_module(self) -> None:
+        # A record without the `event` structured field — the case
+        # for un-migrated stdlib `logger.info(f"...")` calls during
+        # the gradual sweep. Should render in a minimal "ts level
+        # [module] msg" shape rather than a confused [?] block.
+        formatter = ConsoleFormatter(abbrev=True)
+        rec = _make_record(
+            name="kataproxy.router",
+            level=logging.INFO,
+            msg="listening on ws://localhost:1235",
+            extra=None,
+        )
+        out = formatter.format(rec)
+        assert "?" not in out, (
+            f"unmigrated record should not render as event=?, got: {out!r}"
+        )
+        assert "listening on ws://localhost:1235" in out
+        # The module fallback uses record.module which is whatever
+        # makeRecord populated; for our test fixture's pathname it's
+        # the file's basename without extension.
+
+    def test_level_is_abbreviated_to_five_chars(self) -> None:
+        formatter = ConsoleFormatter(abbrev=True)
+        # WARNING is 7 chars; should render as "WARN " (5).
+        rec = _make_record(
+            level=logging.WARNING,
+            extra={"event": "rate_limited", "role": "LEAF", "session": "p"},
+        )
+        out = formatter.format(rec)
+        assert "WARN " in out
+        assert "WARNING" not in out  # not the full stdlib name
+
 
 class TestLogfmtFormatter:
     def test_emits_key_value_pairs(self) -> None:

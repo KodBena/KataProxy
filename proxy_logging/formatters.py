@@ -83,6 +83,14 @@ _COLORS = {
     "ERROR":    "\x1b[31m",   # red
     "CRITICAL": "\x1b[1;41m", # bold on red bg
 }
+# Stable 5-char-wide abbreviations for visual column alignment.
+_LEVEL_ABBREV = {
+    "DEBUG":    "DEBUG",
+    "INFO":     "INFO ",
+    "WARNING":  "WARN ",
+    "ERROR":    "ERROR",
+    "CRITICAL": "CRIT ",
+}
 _RESET = "\x1b[0m"
 _DIM = "\x1b[2m"
 _ROLE_TINT = {
@@ -165,9 +173,42 @@ class ConsoleFormatter(logging.Formatter):
         fields = _record_fields(record)
         level = record.levelname
         ts = fields.get("ts", "")
-        # Time-only render (date is implicit in the file/session).
-        time_only = ts.split("T", 1)[1].rstrip("+-0123456789:") if "T" in ts else ts
+        # Time-only render: HH:MM:SS.mmm (the date is implicit in the
+        # file/session). Strips both the date prefix (everything up
+        # to and including the "T") and the timezone offset suffix
+        # (everything from the first "+" or "-" of the offset to
+        # end). isoformat with timespec="milliseconds" produces
+        # "YYYY-MM-DDTHH:MM:SS.mmm{+|-}HH:MM"; we want HH:MM:SS.mmm.
+        if "T" in ts:
+            after_t = ts.split("T", 1)[1]
+            # Find the timezone-offset start. Walk from end; the
+            # offset is the trailing "[+-]HH:MM" suffix.
+            tz_idx = max(after_t.rfind("+"), after_t.rfind("-"))
+            time_only = after_t[:tz_idx] if tz_idx > 0 else after_t
+        else:
+            time_only = ts
+        msg = record.getMessage()
 
+        level_abbrev = _LEVEL_ABBREV.get(level, level[:5].ljust(5))
+        level_color = _COLORS.get(level, "") if _supports_color(record) else ""
+        level_reset = _RESET if level_color else ""
+        time_render = (
+            f"{_DIM}{time_only}{_RESET}"
+            if _supports_color(record)
+            else time_only
+        )
+        prefix = f"{time_render} {level_color}{level_abbrev}{level_reset}"
+
+        event = fields.get("event")
+        if event is None:
+            # Unmigrated stdlib logger call — no structured fields.
+            # Render in a minimal "ts level [module] msg" shape so
+            # the user can still read it. Phase 3 sweeps these to
+            # the structured form.
+            module = fields.get("module", record.name.rsplit(".", 1)[-1])
+            return f"{prefix} [{module}] {msg}"
+
+        # Structured-fields path.
         role = fields.get("role")
         label = fields.get("label")
         upstream = fields.get("upstream")
@@ -187,7 +228,6 @@ class ConsoleFormatter(logging.Formatter):
             ctx_parts.append(f"peer={session}")
         ctx = f"[{' '.join(ctx_parts)}]" if ctx_parts else ""
 
-        event = fields.get("event", "?")
         cid = fields.get("cid")
         orig = fields.get("orig")
         cid_render = (
@@ -197,18 +237,7 @@ class ConsoleFormatter(logging.Formatter):
             f" orig={_abbrev(orig) if self._abbrev else orig}" if orig else ""
         )
 
-        # The message body — typically the human-readable summary
-        # the call site passed via msg=.
-        msg = record.getMessage()
-
-        level_color = _COLORS.get(level, "") if _supports_color(record) else ""
-        level_reset = _RESET if level_color else ""
-
-        line = (
-            f"{_DIM}{time_only}{_RESET if _supports_color(record) else ''} "
-            f"{level_color}{level:<5}{level_reset} "
-            f"{ctx} {event}{cid_render}{orig_render}"
-        )
+        line = f"{prefix} {ctx} {event}{cid_render}{orig_render}"
         if msg and msg != event:
             line += f"  {msg}"
         return line
@@ -421,14 +450,19 @@ def configure_logging_from_env() -> None:
 
 def _resolve_level() -> int:
     raw = os.environ.get("PYTHONLOGLEVEL", "INFO").upper()
+    # logging.getLevelNamesMapping() is 3.11+; the proxy targets
+    # 3.10+ per pyproject.toml. logging.getLevelName is the
+    # symmetric pre-3.11 lookup — given a name it returns the
+    # numeric level, given a non-name it returns "Level <name>"
+    # (which doesn't equal an int, so we detect that and fall
+    # through to numeric/default parsing).
+    name_lookup = logging.getLevelName(raw)
+    if isinstance(name_lookup, int):
+        return name_lookup
     try:
-        return logging.getLevelNamesMapping()[raw]
-    except KeyError:
-        # Fall back to numeric parse, then INFO.
-        try:
-            return int(raw)
-        except ValueError:
-            return logging.INFO
+        return int(raw)
+    except ValueError:
+        return logging.INFO
 
 
 def _build_handler(dest: str) -> logging.Handler:
