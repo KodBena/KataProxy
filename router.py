@@ -884,16 +884,39 @@ class LeafRouter(BackendRouter):
 class RelayRouter(BackendRouter):
     """Routes queries to upstream SovereignProxy nodes via WebSocket.
 
-    Selection policy:
+    Selection policy (single-target, per-query actions):
       1. Hash canonical_id through the ring → preferred upstream.
       2. Walk the ring until a connected node with load < max_load is found.
       3. If all are over max_load, use the least-loaded connected node.
 
+    Action-routing matrix:
+
+      ANALYZE        → single-target via _select_upstream (above policy).
+      TERMINATE      → single-target via remembered routing for the
+                       canonical_id (label in _callbacks).
+      QUERY_VERSION  → broadcast to every connected upstream. First
+      CLEAR_CACHE      response wins; subsequent responses drop at
+      TERMINATE_ALL    _read_loop's "no callback" branch. Heartbeat
+                       fanout (QUERY_VERSION) is load-bearing for
+                       downstream LEAF KeepAliveMiddleware — without
+                       it, every upstream the hash ring doesn't route
+                       the heartbeat to fires its watchdog after
+                       idle_timeout on whatever ANALYZE the ring
+                       lands on it. CLEAR_CACHE fanout follows from
+                       KataGo's per-LEAF cache; TERMINATE_ALL fanout
+                       follows from "every in-flight query, regardless
+                       of which upstream it was hash-routed to". See
+                       proxy/CLAUDE.md's heartbeat-fanout-contract
+                       section and the SELECTOR watchdog postmortem in
+                       the umbrella's docs/notes/.
+
     Each upstream connection has its own asyncio reader task.  Disconnections
     trigger a reconnect loop with exponential back-off.
 
-    The LoadMetric is called around dispatch and completion; it does not
-    participate in any other logic.
+    The LoadMetric is called around dispatch and completion for the
+    single-target path; it does not participate in any other logic and
+    is skipped for the broadcast path (heartbeats and metadata fanouts
+    aren't in-flight in the load sense).
     """
 
     def __init__(
@@ -1060,6 +1083,20 @@ class RelayRouter(BackendRouter):
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
+        action = query.action
+        # Broadcast the metadata-shaped fanout actions. See the class
+        # docstring's action-routing matrix and _broadcast below.
+        if action in (
+            KataGoAction.QUERY_VERSION,
+            KataGoAction.CLEAR_CACHE,
+            KataGoAction.TERMINATE_ALL,
+        ):
+            await self._broadcast(
+                canonical_id, wire_dict, query, on_response, on_complete,
+            )
+            return
+
+        # Single-target path (ANALYZE and any future per-query action).
         url = self._select_upstream(canonical_id)
         if url is None:
             logger.warning(f"no upstream available for {canonical_id!r}; dropping")
@@ -1071,6 +1108,101 @@ class RelayRouter(BackendRouter):
         ws = self._connections[url]
         await ws.send(json.dumps(wire_dict))
         logger.debug(f"sent: {json.dumps(wire_dict)}")
+
+    async def _broadcast(
+        self,
+        canonical_id: str,
+        wire_dict: WireDict,
+        query: KataGoQuery,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        """Forward wire_dict to every currently-connected upstream.
+
+        Used for the actions whose semantic is "reach every backend":
+
+          - QUERY_VERSION — heartbeat fanout. Every downstream LEAF
+            runs its own KeepAliveMiddleware against the RELAY's
+            connection; without per-upstream heartbeat propagation
+            the LEAFs the hash ring doesn't route the heartbeat to
+            fire their watchdogs on whatever ANALYZE the ring lands
+            on them. The same root cause was first surfaced on
+            SELECTOR (see umbrella's
+            docs/notes/postmortem-selector-watchdog-2026-05.md);
+            RELAY's hash-ring routing differs in mechanism but
+            shares the structural failure mode.
+          - TERMINATE_ALL — cancel every in-flight query the
+            session holds, regardless of which upstream the ring
+            routed each to.
+          - CLEAR_CACHE — KataGo's analysis cache is per-subprocess;
+            a SPA-issued clear_cache wants every upstream cleared.
+
+        First response wins. Each upstream emits an independent
+        response for the same canonical_id; the first one fires
+        on_response and on_complete (the latter pops self._callbacks),
+        subsequent responses land at _read_loop's "no callback for
+        canonical_id" branch and are silently dropped. The SPA sees
+        exactly one response.
+
+        The LoadMetric is skipped — heartbeats and metadata fanouts
+        aren't in-flight in the load sense, and tracking N
+        on_query_sent calls against a single on_query_complete (the
+        first response that pops _callbacks) would leak counts on
+        the (N-1) upstreams that never paired through. The synthetic
+        "__broadcast__" sentinel in the URL slot of the _callbacks
+        entry is what _read_loop sees on the first-response path —
+        it's a no-op for terminate (broadcast actions are not
+        targets of per-query SPA terminate) and is benign through
+        InFlightQueryLoad.on_query_complete (max(0, ...) keeps the
+        synthetic count at 0).
+
+        Per-upstream send failures log at error and continue. The
+        broadcast aborts only when zero sends succeed; in that case
+        the callback is popped and the canonical is silently dropped
+        (matching the single-target dispatch's no-upstream-available
+        behaviour — RELAY's existing convention).
+        """
+        connected = list(self._connections.keys())
+        if not connected:
+            logger.warning(
+                f"{query.action.name} ({canonical_id}): no connected "
+                f"upstream available; dropping"
+            )
+            return
+
+        _register_query(self._tracker, canonical_id, query)
+        self._callbacks[canonical_id] = (
+            on_response, on_complete, "__broadcast__",
+        )
+
+        sent_to: list[str] = []
+        for url in connected:
+            ws = self._connections.get(url)
+            if ws is None:
+                continue
+            try:
+                await ws.send(json.dumps(wire_dict))
+            except Exception as e:
+                logger.error(
+                    f"broadcast send failed for {url} "
+                    f"({canonical_id}, {query.action.name}): {e}"
+                )
+                continue
+            sent_to.append(url)
+
+        if not sent_to:
+            self._callbacks.pop(canonical_id, None)
+            self._tracker.cancel(canonical_id)
+            logger.error(
+                f"broadcast {query.action.name} ({canonical_id}) sent to "
+                f"zero of {len(connected)} connected upstream(s)"
+            )
+            return
+
+        logger.debug(
+            f"broadcast {query.action.name} ({canonical_id}) sent to "
+            f"{len(sent_to)}/{len(connected)} upstream(s): {sent_to}"
+        )
 
     async def terminate(
         self,

@@ -205,12 +205,26 @@ to every healthy upstream) and reverts the band-aid. See the
 SELECTOR watchdog postmortem in the umbrella's docs/notes/ for the
 full diagnosis.
 
-**RELAY has the same shape and has not been fixed yet.** Hash-ring
-routing of `query_version` lands the heartbeat on one upstream
-deterministically; ANALYZE queries with different content land on
-(potentially) different upstreams; the same watchdog-fires-on-
-non-heartbeat-LEAF failure mode applies. The fix is the same
-broadcast pattern; tracked as a follow-up in the postmortem.
+**RELAY had the same shape and was fixed in v1.0.19.** Hash-ring
+routing of `query_version` landed the heartbeat on one upstream
+deterministically; ANALYZE queries with different content landed
+on (potentially) different upstreams; the same watchdog-fires-on-
+non-heartbeat-LEAF failure mode applied. v1.0.19 lands the same
+broadcast pattern in `RelayRouter._broadcast` plus a new unit-level
+test file (`tests/test_relay_router.py`) and a topology
+diagnostic (`tests/diagnose_watchdog_relay.py`). The
+single-target hash-ring path remains untouched for ANALYZE; the
+broadcast skips the `LoadMetric` (heartbeats and metadata fanouts
+aren't in-flight in the load sense and would leak counts via the
+N-1 upstreams whose responses drop at the read loop's "no
+callback" branch).
+
+Both routers are now compliant. A new multi-upstream
+`BackendRouter` author should treat this contract as a checklist
+entry rather than a discovery — `SelectorRouter._broadcast` and
+`RelayRouter._broadcast` are the reference shapes; the
+audit-checklist below names the dispatch-matrix entries to
+inspect.
 
 When introducing a new multi-upstream `BackendRouter`, audit the
 `dispatch()` matrix against the heartbeat contract before shipping:
@@ -233,11 +247,17 @@ When introducing a new multi-upstream `BackendRouter`, audit the
      not "routes to first healthy", which silently encodes a
      contract violation as the expected behaviour.
 
-The companion regression-test files for the SELECTOR contract are
-`tests/test_selector_router.py` (unit-level dispatch matrix) and
-`tests/diagnose_watchdog_selector.py` (topology-level
-SELECTOR + N phantom LEAFs heartbeat broadcast). RELAY needs
-analogous coverage when its broadcast fix lands.
+The companion regression-test files are:
+
+  - SELECTOR (v1.0.18): `tests/test_selector_router.py` (unit-level
+    dispatch matrix) + `tests/diagnose_watchdog_selector.py`
+    (topology-level SELECTOR + N phantom LEAFs heartbeat broadcast).
+  - RELAY (v1.0.19): `tests/test_relay_router.py` (unit-level
+    dispatch matrix; single-target hash-ring still works,
+    broadcast covers the three metadata actions, no-connected /
+    per-upstream-failure / all-failing edge cases) +
+    `tests/diagnose_watchdog_relay.py` (topology-level RELAY + N
+    phantom upstreams heartbeat broadcast).
 
 ## The licensing boundary is load-bearing
 
