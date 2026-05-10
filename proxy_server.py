@@ -49,6 +49,7 @@ import logging
 import math
 import uuid
 from collections import OrderedDict
+from time import monotonic
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -58,6 +59,14 @@ from websockets.exceptions import ConnectionClosed
 
 from logging_config import filter_dict, get_logger, log_safe
 logger = get_logger("kataproxy")
+
+from proxy_logging import (
+    Direction,
+    Event,
+    Role,
+    get_proxy_logger,
+    lifecycle,
+)
 
 
 import sproxy_config as cfg
@@ -109,6 +118,26 @@ def global_extended_encoder(self, obj):
     return original_default(self, obj)
 
 json.JSONEncoder.default = global_extended_encoder
+
+
+# ---------------------------------------------------------------------------
+# Role resolution for the structured logger
+# ---------------------------------------------------------------------------
+
+def _resolve_role() -> Role:
+    """Map cfg.ROLE (env var) to the Role enum.
+
+    Defaults to LEAF when the env var is missing or unrecognised —
+    LEAF is the most permissive bind in the structured-logging
+    contract (no upstream / label fields required) and the most
+    common deployment shape. REDIRECT / DELEGATE roles route via
+    RedirectSession, not ClientSession, so this helper is only
+    consulted by ClientSession-side code paths.
+    """
+    try:
+        return Role(cfg.ROLE.upper())
+    except ValueError:
+        return Role.LEAF
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +232,24 @@ class ClientSession:
         transformer_factory: Optional[TransformerFactory] = None,
         middleware: Optional[SessionMiddleware] = None,
         rate_limit: Optional[_PerIpRateLimit] = None,
+        proxy_log=None,
     ):
         self._ws = ws
         self._peer = peer
+        # Structured-logging adapter: bound to role + session for
+        # every record this ClientSession emits. Production callers
+        # (ProxyServer._handle_connection) pass an already-bound
+        # adapter so connect/disconnect emit through the same
+        # instance; tests / diagnose scripts construct ClientSession
+        # directly and let it bind its own.
+        if proxy_log is None:
+            proxy_log = get_proxy_logger("kataproxy.proxy_server").bind(
+                role=_resolve_role(), session=peer,
+            )
+        self._log = proxy_log
+        # Per-query start-time tracking for the `complete` event's
+        # duration_ms field. Keyed by orig_id.
+        self._query_started_at: dict[str, float] = {}
         # Extract IP for the per-IP rate limiter. ws.remote_address is a
         # (host, port) tuple from the websockets library; falls back to the
         # full peer string if the tuple shape isn't available.
@@ -320,20 +364,26 @@ class ClientSession:
         # Per-IP rate limit. Off when the limiter is disabled (the default),
         # so this is a single attribute read on the hot path otherwise.
         if self._rate_limit is not None and not self._rate_limit.allow(self._peer_ip):
-            logger.warning(
-                f"peer={self._peer_ip} rate limit exceeded; dropping message"
+            self._log.warning(
+                Event.RATE_LIMITED,
+                peer_ip=self._peer_ip,
+                msg=f"rate limit exceeded for peer={self._peer_ip}",
             )
             return
 
         try:
             outer = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
         except JsonDepthExceededError as e:
-            logger.error(
-                f"peer={self._peer} refused depth-bombed payload: {e} "
-                f"raw={log_safe(raw_msg)}"
+            self._log.error(
+                Event.PARSE_ERROR,
+                error_kind="depth_bomb",
+                raw_excerpt=log_safe(raw_msg),
+                msg=f"refused depth-bombed payload: {e}",
             )
             return
         except json.JSONDecodeError:
+            # Silently drop alien JSON to keep the bot-noise floor low;
+            # the malformed-but-near-valid case below is the louder one.
             return
 
         result = self._dispatcher.match(outer)
@@ -344,18 +394,22 @@ class ClientSession:
             # ADR-0002's loudness hierarchy; the message specificity is
             # what changes.
             if isinstance(outer, dict) and ("action" in outer or "id" in outer):
-                logger.error(
-                    f"peer={self._peer} malformed protocol message "
-                    f"(looks like a query but no prism matched): "
-                    f"keys={sorted(outer.keys())} "
-                    f"action={log_safe(outer.get('action'))} "
-                    f"id_present={'id' in outer} "
-                    f"raw={log_safe(raw_msg)}"
+                self._log.error(
+                    Event.PARSE_ERROR,
+                    error_kind="malformed_protocol",
+                    raw_excerpt=log_safe(raw_msg),
+                    keys=sorted(outer.keys()),
+                    msg=(
+                        f"malformed protocol message "
+                        f"(looks like a query but no prism matched)"
+                    ),
                 )
             else:
-                logger.error(
-                    f"peer={self._peer} unknown protocol branch: "
-                    f"raw={log_safe(raw_msg)}"
+                self._log.error(
+                    Event.PARSE_ERROR,
+                    error_kind="unknown_protocol",
+                    raw_excerpt=log_safe(raw_msg),
+                    msg="unknown protocol branch",
                 )
             return
 
@@ -397,6 +451,18 @@ class ClientSession:
         )
 
         self._active_queries[orig_id] = (subscriber_internal_id, canonical_id)
+        # Lifecycle emission per the structured-logging schema. The
+        # subscribe event fires unconditionally for every accepted
+        # query — operators tracing a cid back through its origin
+        # find the subscribe at the entry. Phase 3's deeper hub
+        # sweep splits this into discriminated subscribe/coalesce/
+        # cache_hit events using a richer subscribe() return; until
+        # then, all three sub-cases collapse to a single subscribe.
+        self._query_started_at[orig_id] = monotonic()
+        lifecycle.subscribe(
+            self._log,
+            cid=canonical_id, orig=orig_id, action=query.action.name,
+        )
         logger.debug(
             f"orig={orig_id!r} internal={subscriber_internal_id!r} "
             f"canonical={canonical_id!r} is_new={is_new}"
@@ -416,7 +482,7 @@ class ClientSession:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
-            logger.warn(
+            logger.warning(
                 f"cannot translate terminateId: {e} "
                 f"(query may have already completed)"
             )
@@ -435,11 +501,17 @@ class ClientSession:
 
         canonical_id = self._internal_to_canonical(target_internal_id)
         if canonical_id is None:
-            logger.warn(
+            logger.warning(
                 f"no canonical_id for "
                 f"internal={target_internal_id!r}; query may have already completed"
             )
             return
+
+        # Lifecycle emission: terminate received. cid points at the
+        # target query's canonical; orig is the terminate request's
+        # own id (same convention as subscribe/dispatch — the "what
+        # message is being processed right now" identifier).
+        lifecycle.terminate_recv(self._log, cid=canonical_id, orig=orig_id)
 
         was_last = self._hub.unsubscribe(target_internal_id, canonical_id)
         self._active_queries = {
@@ -455,6 +527,12 @@ class ClientSession:
         if was_last:
             # Sole subscriber on this canonical: terminate at the LEAF and
             # forward the real KataGo ack via relabelling. Existing flow.
+            self._log.info(
+                Event.TERMINATE_DISPATCH,
+                cid=canonical_id, orig=orig_id,
+                direction=Direction.PROXY_TO_UPSTREAM,
+                msg=f"terminate → upstream (canonical={canonical_id})",
+            )
 
             async def on_terminate_response(wire_id: str, wire: dict) -> None:
                 relabelled = dict(wire)
@@ -468,9 +546,12 @@ class ClientSession:
                 await send_queue.put(relabelled)
 
             async def on_terminate_complete(wire_id: str) -> None:
-                logger.debug(
-                    f"on_terminate_complete "
-                    f"wire_id={wire_id!r}"
+                # Lifecycle: terminate ack received from upstream and
+                # delivered to the client. Fires once per terminate
+                # round-trip; coalesced with the wire_id-keyed
+                # callback shape.
+                lifecycle.terminate_complete(
+                    self._log, cid=canonical_id, orig=orig_id,
                 )
 
             await self._router.terminate(
@@ -498,10 +579,8 @@ class ClientSession:
                 "action": "terminate",
                 "terminateId": target_internal_id,
             }
-            logger.debug(
-                f"coalescing-transparent terminate: canonical={canonical_id!r} "
-                f"retained other subscriber(s); synthesizing ack for "
-                f"orig={orig_id!r}"
+            lifecycle.terminate_synthesized(
+                self._log, cid=canonical_id, orig=orig_id, cause="coalesced",
             )
             await send_queue.put(synthesized_ack)
 
@@ -606,7 +685,26 @@ class ClientSession:
         # delivery (audit M-4).
         completed_orig_id = translated_env.id
         if self._link.mapping.forward(completed_orig_id) is None:
-            self._active_queries.pop(completed_orig_id, None)
+            active_entry = self._active_queries.pop(completed_orig_id, None)
+            # Lifecycle emission: query lifecycle ended cleanly.
+            # Duration is the gap from subscribe to completion (the
+            # `_query_started_at` ts was set in _handle_query). For
+            # injected sub-queries (orchestration's spawn path) that
+            # bypass _handle_query the ts is absent and we omit
+            # duration_ms.
+            started_at = self._query_started_at.pop(completed_orig_id, None)
+            duration_ms = (
+                int((monotonic() - started_at) * 1000.0)
+                if started_at is not None
+                else None
+            )
+            if active_entry is not None:
+                cid = active_entry[1]
+                lifecycle.complete(
+                    self._log,
+                    cid=cid, orig=completed_orig_id,
+                    duration_ms=duration_ms,
+                )
 
         # Pass through the middleware.  It yields zero or more (orig_id, response)
         # pairs; each becomes one WebSocket frame.
@@ -774,19 +872,39 @@ class ProxyServer:
 
     async def _handle_connection(self, ws) -> None:
         peer = str(ws.remote_address)
+        peer_ip = (
+            ws.remote_address[0]
+            if isinstance(getattr(ws, "remote_address", None), tuple)
+            else peer
+        )
+
+        # Session-scoped structured-log adapter. Bound to role + session
+        # at the connection boundary so connect / connect_refused /
+        # disconnect emit through the same instance, and the same
+        # adapter is forwarded into ClientSession (for in-session
+        # events like parse_error / subscribe / dispatch / terminate /
+        # complete) so everything in one connection's stream shares
+        # the same context.
+        conn_log = get_proxy_logger("kataproxy.proxy_server").bind(
+            role=_resolve_role(), session=peer,
+        )
 
         # Concurrent-session cap (audit M-1). Refused connections close with
         # WebSocket code 1013 ("try again later"), which the websockets
         # library translates appropriately for the client.
         if cfg.MAX_SESSIONS > 0 and self._active_sessions >= cfg.MAX_SESSIONS:
-            logger.warning(
-                f"refusing {peer}: session cap reached "
-                f"({self._active_sessions} >= {cfg.MAX_SESSIONS})"
+            conn_log.warning(
+                Event.CONNECT_REFUSED,
+                peer_ip=peer_ip, cause="max_sessions",
+                msg=(
+                    f"refused {peer}: session cap reached "
+                    f"({self._active_sessions} >= {cfg.MAX_SESSIONS})"
+                ),
             )
             await ws.close(code=1013, reason="server too busy")
             return
 
-        logger.info(f"accepted {peer}")
+        lifecycle.connect(conn_log, peer_ip=peer_ip)
         self._active_sessions += 1
         try:
             role = cfg.ROLE.upper()
@@ -811,10 +929,11 @@ class ProxyServer:
                     transformer_factory=self._transformer_factory,
                     middleware=middleware,
                     rate_limit=self._rate_limit,
+                    proxy_log=conn_log,
                 )
 
             await session.run()
-            logger.info(f"{peer} disconnected")
+            lifecycle.disconnect(conn_log)
         finally:
             self._active_sessions -= 1
 
