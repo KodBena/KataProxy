@@ -194,9 +194,13 @@ a protocol-fidelity bug worth seeing, not silently tolerating.
 
 ## Extension points
 
-There are two extension surfaces, and the choice between them is
+There are three extension surfaces, and the choice between them is
 load-bearing. Pick wrong and your extension will be either much harder than
 it needs to be or quietly broken.
+
+(The third — OrchestrationMiddleware — was added in v1.0.16. See
+`FRAMEWORK.md` §6 and `proxy/docs/roadmap-orchestration-middleware.md`
+for the full design rationale.)
 
 ### Transformers (synchronous, per-message)
 
@@ -233,7 +237,36 @@ Reach for middleware when:
 The defining example is `adaptive_reevaluate`: it watches scores across
 turns, identifies the worst-performing positions in a window, and submits
 follow-up queries with higher visit counts. This requires history, async
-submission, and control over response timing — all three.
+submission, and control over response timing — all three. As of v1.0.16
+it is implemented as an orchestration coroutine (the third extension
+surface, see below) rather than a manual SessionMiddleware state
+machine, but the conceptual fit is the same.
+
+### Orchestration middleware (v1.0.16, sub-query fork-join)
+
+When the policy needs to spawn one or more derived sub-queries from
+a parent and combine their responses, use OrchestrationMiddleware
+(`middleware/orchestration.py`) — a third extension surface that
+wraps a coroutine of shape
+`(parent_query, ctx) -> AsyncIterator[response]`. The framework
+provides `ctx.spawn(query)` (iterate one sub-query's responses),
+`ctx.parallel(*queries)` (fork-join over N), `ctx.original_stream()`
+(iterate the parent's responses), and `ctx.discard_originals()`
+(release the original buffer when the coroutine fully replaces
+originals). The framework owns parent-child tracking, lifecycle,
+cleanup, and cancellation; the coroutine owns *what* gets spawned
+and *how results are joined*.
+
+`adaptive_reevaluate` is the worked example, refactored to use this
+surface in v1.0.16. The validation criterion (per the roadmap):
+the file shrunk from ~382 lines to ~268, with the savings concentrated
+in the deletion of the manual per-orig_id state machine.
+
+`MiddlewareChain` enforces at most one OrchestrationMiddleware per
+chain — the limit is algebraic, not operational; chained
+orchestration is implementable but does not compose under the
+coroutine substrate without a true effects system. See the roadmap
+for the full reasoning.
 
 #### Lifecycle hooks and `SessionCapabilities`
 
@@ -380,9 +413,11 @@ For an extender looking for the right file to read:
 | `transformers/analysis_enricher.py` | 1 | `analysis_enricher` Transformer factory — proxy-protocol-aware glue for `DeltaAnalysisState` |
 | `transformers/transposition_enricher.py` | 1 | `transposition_enricher` Transformer factory — optional native-backed PV partitioning |
 | | | |
-| `middleware/session_middleware.py` | 1 | `SessionMiddleware` ABC, `MiddlewareChain`, `IdentityMiddleware`, `SessionCapabilities` |
+| `middleware/session_middleware.py` | 1 | `SessionMiddleware` ABC, `MiddlewareChain` (with multi-orchestration guard), `IdentityMiddleware`, `SessionCapabilities` |
+| `middleware/orchestration.py` | 1 | `OrchestrationMiddleware`, `OrchestrationContext`, `orchestration_middleware` decorator (the third extension surface, v1.0.16) |
 | `middleware/keep_alive.py` | 1 | `KeepAliveMiddleware` (per-session inactivity watchdog) |
-| `middleware/adaptive_reevaluate.py` | 1 | `AdaptiveReevaluateMiddleware` (the "all three at once" worked example) |
+| `middleware/adaptive_reevaluate.py` | 1 | `adaptive_reevaluate` factory + the orchestration coroutine (refactored to use `OrchestrationMiddleware` in v1.0.16) |
+| `middleware/capability_gate.py` | 1 | `CapabilityGatedMiddleware` (per-query capability opt-in wrapper, v1.0.14) |
 | | | |
 | `delta_analysis.py` | — | `DeltaAnalysisState` (protocol-agnostic reactive analysis substance; uses `reactive_pipeline`) |
 | `registry_interpreter.py` | — | `RegistryInterpreter` (compiles user-supplied analysis expressions against a curated stdlib) |

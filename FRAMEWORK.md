@@ -92,3 +92,101 @@ When implementing the replay in `pubsub_hub.py`, ensure the following:
 * **Concurrency:** Replays should run in their own `asyncio.Task` to avoid blocking the Hub's main coordination loop.
 
 ---
+
+## 6. Orchestration Middleware (v1.0.16) — the Third Extension Surface
+
+In addition to **Transformers** (sync per-message; §2 above) and
+**SessionMiddleware** (async per-stream; described in
+`ARCHITECTURE.md` and `middleware/session_middleware.py`), the
+proxy provides a third extension surface:
+**OrchestrationMiddleware** (`middleware/orchestration.py`).
+
+### When to reach for it
+
+Use OrchestrationMiddleware when the policy needs to:
+
+* **Spawn one or more derived sub-queries** from a parent query and
+  combine their responses (fork-join).
+* **Express the orchestration as sequential async/await code** rather
+  than as a manual state machine over per-orig_id buffers.
+* **Have parent-child relationships, sub-query lifecycle, and
+  cancellation cleanup** managed by the framework rather than
+  reimplemented per-policy.
+
+The canonical example is `adaptive_reevaluate` (refactored in v1.0.16
+to use this surface): it observes original responses, decides whether
+to deepen worst-quantile turns, and spawns a single deeper-analysis
+sub-query whose responses are auto-relabelled onto the parent's
+orig_id.
+
+If the policy is purely per-message (no state, no sub-queries), use
+a Transformer. If the policy needs state or async but no sub-queries
+(e.g., a watchdog like `KeepAliveMiddleware`), use a plain
+SessionMiddleware. If it does fork-join over sub-queries, use
+OrchestrationMiddleware.
+
+### The shape
+
+```python
+from middleware.orchestration import (
+    OrchestrationContext,
+    orchestration_middleware,
+)
+
+@orchestration_middleware(name="my_policy")
+async def coro(parent: KataGoQuery, ctx: OrchestrationContext):
+    # Iterate the parent's own responses.
+    async for resp in ctx.original_stream():
+        yield resp
+
+    # Spawn a sub-query; iterate its responses (auto-relabelled
+    # onto the parent's orig_id when yielded below).
+    sub = build_some_derived_query(parent)
+    async for resp in ctx.spawn(sub):
+        yield resp
+
+    # Or fork-join over N sub-queries:
+    response_lists = await ctx.parallel(
+        build_query_a(parent),
+        build_query_b(parent),
+    )
+    yield combine(response_lists)
+```
+
+The decorator returns a *factory*; call it (`coro()`) at the
+ProxyServer construction site to instantiate. Wrap with
+`CapabilityGatedMiddleware` for per-query opt-in; compose with other
+middlewares via `MiddlewareChain` (subject to the algebraic-laws
+limit below).
+
+### Single-orchestration-per-chain (algebraic-laws limit)
+
+`MiddlewareChain` enforces at most one OrchestrationMiddleware per
+chain. The reason is algebraic, not operational: chained
+orchestration is implementable but not algebraically composable
+under the coroutine substrate — `ctx.parent_query`, `ctx.spawn`, and
+`ctx.original_stream` presuppose a single, well-defined parent, and
+chaining two orchestrations leaves the outer's parent semantics
+underdetermined (the original client query? the inner's emissions?).
+Either resolution works operationally; neither composes in the
+laws-shaped sense.
+
+A future migration to a true effects system would make orchestration
+composition laws-mechanical; until then, the limit is the honest
+scope of the abstraction. `MiddlewareChainConfigurationError` is
+raised at chain construction so the limit is explicit.
+
+See `proxy/docs/roadmap-orchestration-middleware.md` (§*On chained
+orchestration: an algebraic-laws note*) and
+`proxy/docs/design-fork-join-orchestration.md` (the broader design
+exploration that landed Option C, generator-style coroutines, over
+Options A/B/D/E) for the full rationale.
+
+### Configuration
+
+* `PROXY_ORCHESTRATION_BUFFER_MAX` (default 1024) bounds the
+  per-context original-stream buffer for misbehaving coroutines that
+  don't iterate `ctx.original_stream()` or call
+  `ctx.discard_originals()`.
+
+---
