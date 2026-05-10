@@ -16,12 +16,16 @@ Covers all of Phase 2+3's pure and effectful units:
         available labels
       ANALYZE with healthy `model` → forwarded to the right upstream
       ANALYZE with unhealthy `model` → structured error
-      QUERY_MODELS → synthesised from configured labels; no upstream
-        traffic
-      QUERY_VERSION → forwarded to first healthy upstream
-      QUERY_VERSION with no healthy upstream → structured error
-      CLEAR_CACHE / TERMINATE_ALL → forwarded to first healthy with
-        WARNING (MVP limited semantic)
+      QUERY_MODELS → synthesised from configured labels (no upstream
+        traffic); each entry carries `healthy: bool` so the SPA's
+        model-selector dropdown can grey out advertised-but-disconnected
+        labels
+      QUERY_VERSION / CLEAR_CACHE / TERMINATE_ALL → broadcast to every
+        healthy upstream; first response wins; per-upstream send
+        failures log and continue
+      Broadcast with no healthy upstream → structured error
+      Broadcast with all sends raising → structured error (degenerate
+        case: every healthy upstream's WS refused the send)
   - SelectorRouter.terminate routes by remembered label; synthesises
     ack on dead upstream.
   - Capabilities advertiser includes `selector` when cfg.ROLE ==
@@ -409,10 +413,15 @@ class TestSelectorDispatch:
         # Synthesised — no upstream traffic.
         assert sockets["strong"].sent == []
         assert sockets["weak"].sent == []
-        # Response shape: list of {label} entries in configuration order.
+        # Response shape: list of {label, healthy} entries in
+        # configuration order. Both labels are healthy in this setup,
+        # so both `healthy` fields are True.
         assert len(responses) == 1
         models = responses[0][1]["models"]
-        assert models == [{"label": "strong"}, {"label": "weak"}]
+        assert models == [
+            {"label": "strong", "healthy": True},
+            {"label": "weak", "healthy": True},
+        ]
         assert completes == ["cid-qm"]
 
     async def test_query_models_works_with_no_healthy_upstreams(self) -> None:
@@ -429,11 +438,19 @@ class TestSelectorDispatch:
         q = KataGoQuery(action=KataGoAction.QUERY_MODELS, opaque={})
         wire = translate_query_to_wire(q, "cid-qm")
         await router.dispatch("cid-qm", wire, q, on_response, on_complete)
+        # Both labels are unhealthy — the SPA's dropdown grey-outs both.
         assert responses[0][1]["models"] == [
-            {"label": "strong"}, {"label": "weak"}
+            {"label": "strong", "healthy": False},
+            {"label": "weak", "healthy": False},
         ]
 
-    async def test_query_version_forwarded_to_first_healthy(self) -> None:
+    async def test_query_version_broadcasts_to_all_healthy(self) -> None:
+        # Heartbeat fanout: every healthy LEAF must receive query_version
+        # so its KeepAliveMiddleware._last_heartbeat resets. The
+        # pre-fix "forward to first healthy upstream" routing let the
+        # other LEAF's watchdog fire on long ANALYZE queries routed to
+        # it by `model`. See the SELECTOR watchdog postmortem in the
+        # umbrella's docs/notes/.
         router = _make_router()
         sockets = _populate_post_start_state(
             router, healthy_labels=["strong", "weak"]
@@ -445,11 +462,58 @@ class TestSelectorDispatch:
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
         await router.dispatch("cid-qv", wire, q, on_response, on_complete)
-        # First healthy is "strong" (configuration order).
-        assert len(sockets["strong"].sent) == 1
-        assert sockets["weak"].sent == []
 
-    async def test_query_version_no_healthy_returns_error(self) -> None:
+        # Every healthy upstream received the wire exactly once.
+        assert len(sockets["strong"].sent) == 1
+        assert len(sockets["weak"].sent) == 1
+        # _callbacks holds a single entry for the canonical, with the
+        # broadcast sentinel as the label slot.
+        assert "cid-qv" in router._callbacks
+        _on_resp, _on_comp, label_slot = router._callbacks["cid-qv"]
+        assert label_slot == "__broadcast__"
+        # The SPA hasn't seen a synthetic response — it waits for the
+        # first upstream's reply through the read loop.
+        assert responses == []
+
+    async def test_terminate_all_broadcasts_to_all_healthy(self) -> None:
+        # Same broadcast semantic as query_version. The SPA's
+        # expectation for TERMINATE_ALL is "cancel every in-flight
+        # query the session has, regardless of which LEAF carries it";
+        # routing to a single LEAF would silently leave queries on the
+        # other LEAFs running.
+        router = _make_router()
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["strong", "weak"]
+        )
+        async def on_response(cid, w): pass
+        async def on_complete(cid): pass
+
+        q = KataGoQuery(action=KataGoAction.TERMINATE_ALL, opaque={})
+        wire = translate_query_to_wire(q, "cid-ta")
+        await router.dispatch("cid-ta", wire, q, on_response, on_complete)
+
+        assert len(sockets["strong"].sent) == 1
+        assert len(sockets["weak"].sent) == 1
+
+    async def test_clear_cache_broadcasts_to_all_healthy(self) -> None:
+        # KataGo's analysis cache is per-LEAF (per-subprocess); a
+        # SPA-issued CLEAR_CACHE wants every LEAF cleared. Routing to a
+        # single LEAF would silently leave the others' caches stale.
+        router = _make_router()
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["strong", "weak"]
+        )
+        async def on_response(cid, w): pass
+        async def on_complete(cid): pass
+
+        q = KataGoQuery(action=KataGoAction.CLEAR_CACHE, opaque={})
+        wire = translate_query_to_wire(q, "cid-cc")
+        await router.dispatch("cid-cc", wire, q, on_response, on_complete)
+
+        assert len(sockets["strong"].sent) == 1
+        assert len(sockets["weak"].sent) == 1
+
+    async def test_broadcast_no_healthy_returns_error(self) -> None:
         router = _make_router()
         _populate_post_start_state(
             router, healthy_labels=[], unhealthy_labels=["strong", "weak"]
@@ -463,32 +527,64 @@ class TestSelectorDispatch:
         await router.dispatch("cid-qv", wire, q, on_response, on_complete)
         assert "no healthy upstream" in responses[0][1]["error"]
 
-    async def test_clear_cache_routed_to_first_healthy(self) -> None:
-        # MVP-limited semantic: routed to one upstream. Documented
-        # limitation; the WARNING log is incidental to the test.
-        router = _make_router()
-        sockets = _populate_post_start_state(
-            router, healthy_labels=["strong", "weak"]
-        )
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
-
-        q = KataGoQuery(action=KataGoAction.CLEAR_CACHE, opaque={})
-        wire = translate_query_to_wire(q, "cid-cc")
-        await router.dispatch("cid-cc", wire, q, on_response, on_complete)
-        assert len(sockets["strong"].sent) == 1
-        assert sockets["weak"].sent == []
-
-    async def test_first_healthy_skips_unhealthy(self) -> None:
-        # If the first configured label is unhealthy, _first_healthy_label
-        # falls through to the next.
+    async def test_broadcast_skips_unhealthy_targets_remainder(self) -> None:
+        # When the first configured label is unhealthy, the broadcast
+        # falls through to the next healthy label(s) — only labels in
+        # _connections AND not in _unhealthy_models receive the wire.
         router = _make_router()
         sockets = _populate_post_start_state(
             router,
             healthy_labels=["weak"],
             unhealthy_labels=["strong"],
         )
+        async def on_response(cid, w): pass
+        async def on_complete(cid): pass
+
+        q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
+        wire = translate_query_to_wire(q, "cid-qv")
+        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        # "strong" is unhealthy → not in _connections in this fixture
+        # AND in _unhealthy_models. "weak" is healthy. Broadcast hits
+        # only "weak".
+        assert len(sockets["weak"].sent) == 1
+        # "strong" has no socket entry at all (unhealthy state) — the
+        # _populate_post_start_state helper doesn't create one for
+        # unhealthy labels. The dispatch must not raise.
+
+    async def test_broadcast_continues_after_per_upstream_send_failure(self) -> None:
+        # If one upstream's WebSocket send raises, the broadcast logs
+        # and continues to the next. The healthy upstream still
+        # receives the wire; the canonical's _callbacks entry is
+        # installed (the broadcast didn't abort).
+        router = _make_router()
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["strong", "weak"]
+        )
+        # "strong" refuses every send.
+        sockets["strong"].closed = True
+        async def on_response(cid, w): pass
+        async def on_complete(cid): pass
+
+        q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
+        wire = translate_query_to_wire(q, "cid-qv")
+        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+
+        # "weak" got it; "strong" didn't (the send raised).
+        assert sockets["strong"].sent == []
+        assert len(sockets["weak"].sent) == 1
+        # _callbacks still has the entry — broadcast didn't abort.
+        assert "cid-qv" in router._callbacks
+
+    async def test_broadcast_all_sends_failing_returns_error(self) -> None:
+        # Degenerate case: every healthy upstream's send raised. The
+        # broadcast pops the _callbacks entry and surfaces a structured
+        # error (a hung canonical would be the worse outcome).
+        router = _make_router()
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["strong", "weak"]
+        )
+        sockets["strong"].closed = True
+        sockets["weak"].closed = True
         responses: list[tuple[str, dict]] = []
         async def on_response(cid, w): responses.append((cid, w))
         async def on_complete(cid): pass
@@ -496,7 +592,12 @@ class TestSelectorDispatch:
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
         await router.dispatch("cid-qv", wire, q, on_response, on_complete)
-        assert len(sockets["weak"].sent) == 1
+
+        # _callbacks was popped — the canonical isn't hung.
+        assert "cid-qv" not in router._callbacks
+        # SPA sees a structured error.
+        assert len(responses) == 1
+        assert "no healthy upstream" in responses[0][1]["error"]
 
 
 # ===========================================================================

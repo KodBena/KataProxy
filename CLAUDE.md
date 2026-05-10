@@ -170,6 +170,75 @@ The distinction is: invariant violations halt; transient external
 failures recover with a visible budget; budget exhaustion fails loudly
 in the response stream rather than silently in the log.
 
+## The heartbeat-fanout contract (load-bearing for multi-upstream routers)
+
+When the proxy is wired with `KeepAliveMiddleware` (the per-session
+inactivity watchdog from v1.0.9), the keep-alive contract has an
+implicit dependency on heartbeat propagation that any new
+`BackendRouter` author needs to observe explicitly:
+
+  **Any router that fans out a single client session's traffic
+  across multiple downstream `ClientSession`s is responsible for
+  fanning heartbeats out too.**
+
+A single-upstream router (LEAF connecting to one KataGo subprocess,
+ECHO returning synthetic responses) trivially satisfies this — the
+client's `query_version` heartbeats reach the one place a
+`KeepAliveMiddleware` would observe them. A multi-upstream router
+(SELECTOR with N labelled LEAFs, RELAY with N hash-ringed LEAFs,
+any future fanout role) does not — each downstream LEAF runs its
+own `ClientSession` against the router's WebSocket-client side,
+each with its own `KeepAliveMiddleware`, each tracking its own
+`_last_heartbeat`. If the router routes `query_version` to one
+specific upstream (whether by label, by hash, or by any other
+single-target rule), every other upstream's watchdog fires after
+`idle_timeout` on whatever `ANALYZE` the router happens to land on
+it.
+
+This is what shipped in v1.0.15 (SELECTOR) and went undiagnosed
+until v1.0.18: SELECTOR's first-healthy-only QUERY_VERSION routing
+broke the contract for any analyze on a non-first model. The
+v1.0.17 `KEEP_ALIVE_IDLE_TIMEOUT_SECONDS` 25→250 band-aid widened
+the failure window without identifying the cause; v1.0.18 fixes
+the routing (broadcast QUERY_VERSION / TERMINATE_ALL / CLEAR_CACHE
+to every healthy upstream) and reverts the band-aid. See the
+SELECTOR watchdog postmortem in the umbrella's docs/notes/ for the
+full diagnosis.
+
+**RELAY has the same shape and has not been fixed yet.** Hash-ring
+routing of `query_version` lands the heartbeat on one upstream
+deterministically; ANALYZE queries with different content land on
+(potentially) different upstreams; the same watchdog-fires-on-
+non-heartbeat-LEAF failure mode applies. The fix is the same
+broadcast pattern; tracked as a follow-up in the postmortem.
+
+When introducing a new multi-upstream `BackendRouter`, audit the
+`dispatch()` matrix against the heartbeat contract before shipping:
+
+  1. For each action the router handles, identify whether it has
+     a single-target or fanout semantic at the protocol level.
+     `QUERY_VERSION` is structurally fanout under the keep-alive
+     contract above; `ANALYZE` is per-query single-target;
+     `TERMINATE_ALL` is fanout by name; `CLEAR_CACHE` depends on
+     whether the upstream caches are independent (per-LEAF KataGo
+     subprocesses are independent → fanout); `TERMINATE` is
+     single-target by remembered routing.
+  2. For each fanout action, broadcast to every healthy upstream;
+     first response wins (subsequent responses for the same
+     canonical drop at the read loop's "no callback" branch);
+     per-upstream send failures log and continue. The
+     `SelectorRouter._broadcast` helper (post-v1.0.18) is the
+     reference shape.
+  3. Add a regression test that asserts the broadcast property —
+     not "routes to first healthy", which silently encodes a
+     contract violation as the expected behaviour.
+
+The companion regression-test files for the SELECTOR contract are
+`tests/test_selector_router.py` (unit-level dispatch matrix) and
+`tests/diagnose_watchdog_selector.py` (topology-level
+SELECTOR + N phantom LEAFs heartbeat broadcast). RELAY needs
+analogous coverage when its broadcast fix lands.
+
 ## The licensing boundary is load-bearing
 
 The repository carries two licenses, by directory:

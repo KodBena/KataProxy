@@ -1169,18 +1169,30 @@ class SelectorRouter(BackendRouter):
                        by remembered label for the canonical_id
       QUERY_MODELS   → synthesised from the configured label set; no
                        upstream traffic. Wire shape:
-                       ``{"id": ..., "models": [{"label": l}, ...]}``
-                       (list-of-dicts leaves room for future per-label
-                       enrichment; the SPA uses ``entry.label`` as the
-                       routing key)
-      QUERY_VERSION  → forwarded to the first healthy upstream so the
-                       capabilities_advertiser at Layer 1 sees a real
-                       MetadataResponse with a "version" key to enrich
-      CLEAR_CACHE    → forwarded to the first healthy upstream as an
-      TERMINATE_ALL    MVP limitation; broadcast semantics across all
-                       upstreams are deferred (see roadmap-selector-
-                       router.md, "Out of scope"). A WARNING is logged
-                       so operators see the limited semantic in action.
+                       ``{"id": ..., "models": [{"label": l, "healthy": b}, ...]}``
+                       — list-of-dicts; the SPA reads ``entry.label`` as
+                       the routing key and ``entry.healthy`` to gate the
+                       model-selector dropdown's enabled state. Old
+                       SPAs that read only ``entry.label`` continue to
+                       work unchanged.
+      QUERY_VERSION  → broadcast to every healthy upstream. First
+      CLEAR_CACHE      response wins; subsequent responses for the
+      TERMINATE_ALL    same canonical drop at the read loop's "no
+                       callback" branch (entry was popped on
+                       QUERY_COMPLETE). Heartbeat fanout
+                       (QUERY_VERSION) is load-bearing for downstream
+                       LEAF KeepAliveMiddleware: any LEAF that doesn't
+                       receive heartbeats fires its watchdog after
+                       ``idle_timeout`` on whatever ANALYZE the
+                       SELECTOR routed to it by ``model``. See the
+                       SELECTOR watchdog postmortem in the umbrella's
+                       docs/notes/ for the full diagnosis. CLEAR_CACHE
+                       fanout follows from KataGo's per-LEAF cache;
+                       TERMINATE_ALL fanout follows from "every
+                       in-flight query, regardless of which LEAF it
+                       was routed to". All three responses are single-
+                       message metadata, so first-response-wins is
+                       correct (no aggregation required).
     """
 
     _MAX_CONNECT_FAILURES = 3  # mirrors LeafRouter._MAX_RESTARTS
@@ -1466,15 +1478,19 @@ class SelectorRouter(BackendRouter):
     # Routing helpers
     # -----------------------------------------------------------------------
 
-    def _first_healthy_label(self) -> Optional[str]:
-        """Return the first connected, healthy label in configuration order."""
-        for label, _url in self._models:
-            if (
-                label in self._connections
-                and label not in self._unhealthy_models
-            ):
-                return label
-        return None
+    def _healthy_labels(self) -> list[str]:
+        """Return all currently-connected, non-budget-exhausted labels.
+
+        Used both by the broadcast dispatch path (QUERY_VERSION /
+        CLEAR_CACHE / TERMINATE_ALL) and by the QUERY_MODELS
+        synthesised response that surfaces per-label availability to
+        the SPA.
+        """
+        return [
+            label for label, _url in self._models
+            if label in self._connections
+            and label not in self._unhealthy_models
+        ]
 
     async def _send_synthetic_response(
         self,
@@ -1527,11 +1543,21 @@ class SelectorRouter(BackendRouter):
 
         # QUERY_MODELS: synthesise the union of configured labels.
         # No upstream traffic — operators with all upstreams down still
-        # get a meaningful enumeration.
+        # get a meaningful enumeration. Each entry carries `healthy`
+        # so the SPA's model-selector dropdown can gate its enabled
+        # state per-label (a label that's advertised but currently
+        # disconnected, or whose reconnect budget is exhausted, should
+        # not be a selectable analyze target). Old SPAs that read only
+        # `entry.label` continue to work — the addition is wire-
+        # compatible.
         if action == KataGoAction.QUERY_MODELS:
+            healthy = set(self._healthy_labels())
             await self._send_synthetic_response(
                 canonical_id,
-                {"models": [{"label": label} for label, _ in self._models]},
+                {"models": [
+                    {"label": label, "healthy": label in healthy}
+                    for label, _ in self._models
+                ]},
                 on_response,
                 on_complete,
             )
@@ -1590,38 +1616,19 @@ class SelectorRouter(BackendRouter):
             )
             return
 
-        # QUERY_VERSION / CLEAR_CACHE / TERMINATE_ALL: forward to first
-        # healthy upstream. CLEAR_CACHE / TERMINATE_ALL are MVP-limited
-        # to a single upstream; broadcast semantics are deferred per the
-        # roadmap. The WARNING surface tells operators which upstream
-        # was actually targeted.
+        # QUERY_VERSION / CLEAR_CACHE / TERMINATE_ALL: broadcast to
+        # every healthy upstream. First response wins; subsequent
+        # responses for the same canonical drop at the read loop's
+        # "no callback" branch (the entry was popped on the first
+        # QUERY_COMPLETE). Heartbeat fanout is load-bearing — see
+        # _broadcast and the class docstring.
         if action in (
             KataGoAction.QUERY_VERSION,
             KataGoAction.CLEAR_CACHE,
             KataGoAction.TERMINATE_ALL,
         ):
-            label = self._first_healthy_label()
-            if label is None:
-                logger.error(
-                    f"{action.name} requested ({canonical_id}) but no "
-                    f"healthy upstream available"
-                )
-                await self._send_structured_error(
-                    canonical_id,
-                    self._NO_HEALTHY_UPSTREAM_ERROR,
-                    on_response,
-                    on_complete,
-                )
-                return
-            if action != KataGoAction.QUERY_VERSION:
-                logger.warning(
-                    f"{action.name} routed to single upstream {label!r}; "
-                    f"broadcast semantics across all upstreams are "
-                    f"deferred for SELECTOR (Phase 2+3 MVP limitation)"
-                )
-            await self._forward(
-                canonical_id, wire_dict, query, label,
-                on_response, on_complete,
+            await self._broadcast(
+                canonical_id, wire_dict, query, on_response, on_complete,
             )
             return
 
@@ -1695,6 +1702,114 @@ class SelectorRouter(BackendRouter):
             )
             return
         logger.debug(f"sent to label={label!r}: {json.dumps(wire_dict)}")
+
+    async def _broadcast(
+        self,
+        canonical_id: str,
+        wire_dict: WireDict,
+        query: KataGoQuery,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        """Forward wire_dict to every currently-healthy upstream.
+
+        Used for the actions whose semantic is "reach every backend":
+
+          - QUERY_VERSION — heartbeat fanout. Every downstream LEAF runs
+            its own KeepAliveMiddleware against the SELECTOR's
+            connection; that middleware's _last_heartbeat resets on
+            on_query of a query_version. Without fanout, only the first
+            healthy LEAF sees heartbeats, and any other LEAF the
+            SELECTOR routes ANALYZE to (by `model`) fires its watchdog
+            after idle_timeout on the in-flight query. The SELECTOR
+            watchdog postmortem in the umbrella's docs/notes/ records
+            the real-deployment failure mode this fanout closes.
+          - TERMINATE_ALL — cancel every in-flight query the session
+            holds, regardless of which LEAF carries it.
+          - CLEAR_CACHE — KataGo's analysis cache is per-LEAF
+            (per-subprocess); a SPA-issued clear_cache wants every
+            LEAF cleared.
+
+        First response wins. Each upstream emits an independent
+        response for the same canonical_id; the first one fires
+        on_response and on_complete (the latter pops self._callbacks),
+        subsequent responses land at _read_loop's "no callback for
+        canonical_id" branch and are silently dropped. The SPA sees
+        exactly one response. Aggregation across upstreams isn't
+        required for any of the three actions: QUERY_VERSION's
+        response is metadata (any healthy LEAF's version answers the
+        SPA's identity probe; capabilities_advertiser at Layer 1
+        enriches), TERMINATE_ALL/CLEAR_CACHE responses are acks.
+
+        Per-upstream send failures log at error and continue to the
+        remaining upstreams. The broadcast aborts only when zero
+        sends succeed (no healthy upstream, OR every healthy
+        upstream's send raised); a structured error is returned in
+        that case rather than a hung canonical.
+        """
+        healthy = self._healthy_labels()
+        if not healthy:
+            logger.error(
+                f"{query.action.name} requested ({canonical_id}) but no "
+                f"healthy upstream available"
+            )
+            await self._send_structured_error(
+                canonical_id,
+                self._NO_HEALTHY_UPSTREAM_ERROR,
+                on_response,
+                on_complete,
+            )
+            return
+
+        _register_query(self._tracker, canonical_id, query)
+        # _callbacks holds a single (on_response, on_complete) tuple.
+        # The first upstream's response triggers QUERY_COMPLETE and
+        # pops the entry; subsequent responses find no callback and
+        # are dropped. The "label" slot carries a synthetic sentinel
+        # — broadcast queries are not the target of a
+        # SelectorRouter.terminate (the SPA never terminates a
+        # query_version, and TERMINATE_ALL is itself the
+        # terminate-shaped action).
+        self._callbacks[canonical_id] = (
+            on_response, on_complete, "__broadcast__",
+        )
+
+        sent_to: list[str] = []
+        for label in healthy:
+            ws = self._connections[label]
+            try:
+                await ws.send(json.dumps(wire_dict))
+            except Exception as e:
+                logger.error(
+                    f"broadcast send failed for label={label!r} "
+                    f"({canonical_id}, {query.action.name}): {e}"
+                )
+                continue
+            sent_to.append(label)
+
+        if not sent_to:
+            # All upstreams refused the send. Pop the callbacks we
+            # just installed and surface a structured error rather
+            # than a hung canonical.
+            self._callbacks.pop(canonical_id, None)
+            self._tracker.cancel(canonical_id)
+            logger.error(
+                f"broadcast {query.action.name} ({canonical_id}) "
+                f"could not be sent to any of {len(healthy)} "
+                f"healthy upstream(s)"
+            )
+            await self._send_structured_error(
+                canonical_id,
+                self._NO_HEALTHY_UPSTREAM_ERROR,
+                on_response,
+                on_complete,
+            )
+            return
+
+        logger.debug(
+            f"broadcast {query.action.name} ({canonical_id}) sent to "
+            f"{len(sent_to)}/{len(healthy)} upstream(s): {sent_to}"
+        )
 
     # -----------------------------------------------------------------------
     # Terminate (label-routed)
