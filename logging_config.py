@@ -1,99 +1,54 @@
 # logging_config.py
 """
-logging_config.py — Logging factory and log-safety helpers for KataProxy.
+logging_config.py — Backward-compatibility shim.
 
-Attempts to use ColoredLogger (private, optional) for enhanced terminal
-output. Falls back transparently to the stdlib logger. All other modules
-use logging.getLogger() directly and are unaffected by this choice.
+The structured logging surface lives at ``proxy_logging`` (added in
+the v1.0.20 logging arc; see ``proxy/docs/logging-design.md``). This
+module is kept as a thin wrapper that re-exports the three public
+helpers existing call sites expect — ``get_logger``, ``log_safe``,
+``filter_dict`` — so the migration to ``proxy_logging`` can proceed
+file-by-file without a flag-day rewrite.
 
-Default level (post v1.0.4): INFO. The pre-v1.0.4 default was DEBUG,
-which (a) emitted operator-visible records for every wire frame received
-and sent — including full client query JSON with potential PII like SGF
-player names — and (b) embedded peer-controlled strings into log records
-without sanitisation, opening a log-injection surface (a client could
-forge log lines by including newlines in the message, audit H-4).
-PYTHONLOGLEVEL=DEBUG re-enables verbose logging when needed.
+New code: import from ``proxy_logging`` directly:
 
-Two log-rendering helpers live here:
+    from proxy_logging import get_proxy_logger, log_safe, filter_dict, lifecycle, Event
 
-  - ``log_safe(s)`` — quoted, length-bounded, newline-escaped repr of an
-    untrusted string (defends against log injection + unbounded growth).
-    Use for any value that originated from the wire.
+Migration in progress: ``proxy_server.py`` and the router /
+middleware / transformer modules continue to import from
+``logging_config`` until their per-module sweep in Phase 2 / 3 of
+the logging arc.
 
-  - ``filter_dict(d)`` — strips three high-volume KataGo response keys
-    (``moveInfos``, ``ownership``, ``policy``) so log records remain
-    readable. Use when emitting an entire response dict at DEBUG.
+For the operator-facing schema, event vocabulary, format options,
+and env-var matrix, read ``proxy/docs/logging-design.md`` (or
+``proxy/docs/logging.md`` once Phase 4 lands).
 
 License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
+
+from __future__ import annotations
+
 import logging
-import os
-from typing import Any
 
-
-_DEFAULT_LOG_TRUNCATE = int(os.environ.get("PROXY_LOG_TRUNCATE", "256"))
+from proxy_logging.summarize import filter_dict, log_safe
 
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Return an appropriately configured logger for the given name.
+    """Return a stdlib Logger configured for the kataproxy hierarchy.
 
-    If ColoredLogger is available in the environment, it is used for
-    enhanced terminal output. Otherwise a standard stdlib logger is
-    returned. The interface is identical in both cases.
+    Backward-compat with the pre-arc API. New code should call
+    ``proxy_logging.get_proxy_logger(name)`` instead — that returns
+    the structured-fields adapter the new logging contract is built
+    around. This wrapper still exists because Phase 2 / 3 of the
+    arc are mid-sweep; not every call site has migrated.
+
+    The returned Logger is the underlying stdlib instance the
+    ProxyLogger adapter wraps, so a call site mid-migration can
+    continue using ``logger.info("…")`` while the same hierarchy's
+    new call sites use ``proxy_log.info(Event.…)``.
     """
-    try:
-        from colored_logger import ColoredLogger  # type: ignore[import]
-        return ColoredLogger(
-            n_colors=5,
-            time_format="%H:%M:%S",
-            logger_name=name,
-            level=level,
-        )
-    except ImportError:
-        logger = logging.getLogger(name)
-        logger.setLevel(level)
-        return logger
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    return logger
 
 
-def log_safe(s: object, *, max_len: int = _DEFAULT_LOG_TRUNCATE) -> str:
-    """Render *s* for inclusion in a log record, defended against log
-    injection and unbounded log-line growth.
-
-    The result is the Python ``repr()`` of the (possibly-truncated)
-    input. ``repr()`` escapes newlines, carriage returns, and tab
-    characters consistently for both ``str`` and ``bytes``, so a client
-    that sends ``{"id":"x\\n[FAKE LOG ENTRY]","moves":[]}`` cannot use
-    that newline to forge log lines once the value flows through this
-    helper. The truncation cap (default 256 chars; configurable via
-    ``PROXY_LOG_TRUNCATE``) bounds the per-record size so a single
-    multi-megabyte message can't blow up the log file.
-
-    Use for ANY value that originated from the wire — client query
-    bodies, peer addresses, KataGo stdout lines, upstream RELAY
-    messages — before f-stringing them into a log record.
-    """
-    if isinstance(s, (bytes, bytearray)):
-        truncated = bytes(s[:max_len]) + (b"..." if len(s) > max_len else b"")
-    else:
-        text = str(s)
-        truncated = text[:max_len] + ("..." if len(text) > max_len else "")
-    return repr(truncated)
-
-
-# Three KataGo response keys are bulky enough that logging them inline
-# defeats the readability of every other field. moveInfos can be hundreds
-# of move-info dicts; ownership is a board-area-shaped float array; policy
-# is a per-cell distribution. Strip them when the goal is "show the shape
-# of this response in a log record" rather than "preserve every byte."
-_BULKY_KATAGO_RESPONSE_KEYS = frozenset({"moveInfos", "ownership", "policy"})
-
-
-def filter_dict(d: dict[str, Any]) -> dict[str, Any]:
-    """Drop bulky KataGo response keys for log readability.
-
-    The three stripped keys (``moveInfos``, ``ownership``, ``policy``)
-    each carry per-move or per-cell payload that drowns out the rest of
-    the response shape in a log record. Used by the proxy_server and
-    router log paths when emitting whole-response DEBUG records.
-    """
-    return {k: v for k, v in d.items() if k not in _BULKY_KATAGO_RESPONSE_KEYS}
+__all__ = ["filter_dict", "get_logger", "log_safe"]
