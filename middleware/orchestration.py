@@ -50,8 +50,15 @@ from middleware.session_middleware import (
     SessionMiddleware,
     SubmitQuery,
 )
+from proxy_logging import Event, get_proxy_logger
 
 logger = logging.getLogger("kataproxy." + __name__)
+# Module-level structured-fields adapter. Used for diagnostics that
+# fire from OrchestrationContext (which doesn't hold a reference to
+# the per-session ProxyLogger). The session-bound logger lives on
+# OrchestrationMiddleware._log; OrchestrationContext-internal
+# diagnostics use this module-level one.
+_log = get_proxy_logger(__name__)
 
 __all__ = [
     "MiddlewareChainConfigurationError",
@@ -223,6 +230,19 @@ class OrchestrationContext:
         )
         self._sub_queries[sub_orig_id] = record
         self._middleware._register_sub_query(sub_orig_id, self._parent_id)
+        # Lifecycle: orchestration coroutine spawned a sub-query.
+        # parent cid is on the bind chain via the parent's
+        # subscribe; surface sub_orig + name explicitly.
+        self._middleware._log.info(
+            Event.ORCHESTRATION_SPAWN,
+            cid=self._parent_id,
+            sub_orig=sub_orig_id,
+            orch_name=self._middleware.name,
+            msg=(
+                f"orchestration[{self._middleware.name}] spawn "
+                f"sub={sub_orig_id} parent={self._parent_id}"
+            ),
+        )
         try:
             await self._caps.submit_query(sub_orig_id, query)
             while True:
@@ -319,11 +339,15 @@ class OrchestrationContext:
         ):
             try:
                 self._original_queue.get_nowait()
-                logger.warning(
-                    f"orchestration[{self._parent_id}]: original_stream "
-                    f"buffer overflow ({cfg.ORCHESTRATION_BUFFER_MAX}); "
-                    f"dropped oldest. The coroutine should iterate "
-                    f"ctx.original_stream() or call ctx.discard_originals()."
+                _log.warning(
+                    Event.DIAGNOSTIC,
+                    cid=self._parent_id,
+                    msg=(
+                        f"orchestration[{self._parent_id}]: original_stream "
+                        f"buffer overflow ({cfg.ORCHESTRATION_BUFFER_MAX}); "
+                        f"dropped oldest. The coroutine should iterate "
+                        f"ctx.original_stream() or call ctx.discard_originals()."
+                    ),
                 )
             except asyncio.QueueEmpty:
                 pass
@@ -337,9 +361,13 @@ class OrchestrationContext:
         """Route a sub-query response to its spawn iterator."""
         record = self._sub_queries.get(sub_orig_id)
         if record is None:
-            logger.info(
-                f"orchestration[{self._parent_id}]: stray response for "
-                f"sub_orig_id={sub_orig_id!r}; coroutine no longer iterating"
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=self._parent_id, sub_orig=sub_orig_id,
+                msg=(
+                    f"orchestration[{self._parent_id}]: stray response for "
+                    f"sub_orig_id={sub_orig_id!r}; coroutine no longer iterating"
+                ),
             )
             return
         is_final = self._is_final(response)
@@ -382,11 +410,15 @@ class OrchestrationMiddleware(SessionMiddleware):
         self._tasks: dict[str, asyncio.Task] = {}
         # sub_orig_id → parent_id  (for response routing)
         self._sub_to_parent: dict[str, str] = {}
+        # Structured-logging adapter; refined in on_session_start.
+        self._log: Any = get_proxy_logger("kataproxy.middleware.orchestration")
 
     # ---------------- Lifecycle ----------------
 
     def on_session_start(self, caps: SessionCapabilities) -> None:
         self._caps = caps
+        if caps.proxy_log is not None:
+            self._log = caps.proxy_log
 
     def on_session_end(self) -> None:
         # Cancel all live orchestration tasks; their finally blocks run
@@ -411,15 +443,23 @@ class OrchestrationMiddleware(SessionMiddleware):
         method is only ever called for client-originated parents.
         """
         if self._caps is None:
-            logger.error(
-                f"orchestration[{self.name}]: on_query before "
-                f"on_session_start; ignoring orig_id={orig_id!r}"
+            self._log.error(
+                Event.DIAGNOSTIC,
+                cid=orig_id, orig=orig_id,
+                msg=(
+                    f"orchestration[{self.name}]: on_query before "
+                    f"on_session_start; ignoring orig_id={orig_id!r}"
+                ),
             )
             return
         if orig_id in self._contexts:
-            logger.warning(
-                f"orchestration[{self.name}]: duplicate on_query for "
-                f"orig_id={orig_id!r}; cancelling prior context"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                cid=orig_id, orig=orig_id,
+                msg=(
+                    f"orchestration[{self.name}]: duplicate on_query for "
+                    f"orig_id={orig_id!r}; cancelling prior context"
+                ),
             )
             old_task = self._tasks.pop(orig_id, None)
             if old_task is not None and not old_task.done():
@@ -458,35 +498,52 @@ class OrchestrationMiddleware(SessionMiddleware):
         cancelled. The finally block runs in either case to clean up
         in-flight sub-queries and remove registry entries.
         """
+        outcome = "normal"
         try:
             async for resp in coro:
                 await ctx._output_queue.put((parent_id, resp))
         except asyncio.CancelledError:
-            logger.info(
-                f"orchestration[{self.name}]: coroutine cancelled for "
-                f"parent_id={parent_id!r}"
-            )
+            outcome = "cancelled"
             raise
         except Exception as e:
-            logger.exception(
-                f"orchestration[{self.name}]: coroutine raised for "
-                f"parent_id={parent_id!r}: {e}"
+            outcome = "error"
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                cid=parent_id,
+                msg=(
+                    f"orchestration[{self.name}]: coroutine raised for "
+                    f"parent_id={parent_id!r}: {e}"
+                ),
             )
             err_response = MetadataResponse(opaque={
                 "error": f"orchestration error in {self.name}: {e}",
             })
             await ctx._output_queue.put((parent_id, err_response))
         finally:
+            # Lifecycle: orchestration coroutine completed (one of
+            # three outcomes). Logged once per parent query at INFO
+            # level — operators tracing one cid through the orch
+            # framework see the spawn at the start, the done at the
+            # end, with the outcome surfaced.
+            self._log.info(
+                Event.ORCHESTRATION_DONE,
+                cid=parent_id, orch_name=self.name, outcome=outcome,
+                msg=f"orchestration[{self.name}] {outcome} for {parent_id}",
+            )
             # Cancel any still-in-flight sub-queries.
             for sub_orig_id in list(ctx._sub_queries.keys()):
                 try:
                     if self._caps is not None:
                         await self._caps.terminate_query(sub_orig_id)
                 except Exception:
-                    logger.debug(
-                        f"orchestration[{self.name}]: cleanup terminate "
-                        f"of sub_orig_id={sub_orig_id!r} failed (likely "
-                        f"already cleaned up)"
+                    self._log.debug(
+                        Event.DIAGNOSTIC,
+                        cid=parent_id, sub_orig=sub_orig_id,
+                        msg=(
+                            f"orchestration[{self.name}]: cleanup terminate "
+                            f"of sub_orig_id={sub_orig_id!r} failed (likely "
+                            f"already cleaned up)"
+                        ),
                     )
             # Signal handle_response that the coroutine is done.
             await ctx._output_queue.put(_SENTINEL)
@@ -532,10 +589,14 @@ class OrchestrationMiddleware(SessionMiddleware):
                 # _sub_to_parent registration and this response
                 # arrival. Drop silently (the framework's cleanup
                 # path has already cancelled the sub-query).
-                logger.debug(
-                    f"orchestration[{self.name}]: sub-query response for "
-                    f"orig_id={orig_id!r} arrived after parent "
-                    f"{parent_id!r} cleaned up; dropping"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=parent_id, sub_orig=orig_id,
+                    msg=(
+                        f"orchestration[{self.name}]: sub-query response for "
+                        f"orig_id={orig_id!r} arrived after parent "
+                        f"{parent_id!r} cleaned up; dropping"
+                    ),
                 )
                 return
             await ctx._push_sub_response(orig_id, response)

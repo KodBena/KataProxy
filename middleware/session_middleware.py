@@ -45,8 +45,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncGenerator, Awaitable, Callable
-from typing import AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from katago import KataGoQuery, KataGoResponse
 
@@ -97,9 +96,20 @@ class SessionCapabilities:
     so middleware can stash references for use from session-scoped tasks.
     Frozen to make the contract clear: middleware cannot mutate or extend
     the capability surface.
+
+    The ``proxy_log`` field is the session-bound structured-logging
+    adapter (ProxyLogger). Middleware that emits structured records
+    stashes it from on_session_start and refines via .bind() as
+    needed. ``None`` is permitted for tests / harnesses that haven't
+    threaded a proxy_log through; middleware is responsible for
+    falling back to a no-bind module-level logger in that case.
+    Typed as ``Any`` to avoid a runtime import dependency on
+    proxy_logging from this module (would create a fragile import
+    cycle at module load).
     """
     submit_query: SubmitQuery
     terminate_query: TerminateQuery
+    proxy_log: Any = None
 
 
 # ---------------------------------------------------------------------------

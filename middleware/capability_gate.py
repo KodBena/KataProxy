@@ -52,7 +52,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 from katago import KataGoQuery, KataGoResponse
 from middleware.session_middleware import (
@@ -61,6 +61,7 @@ from middleware.session_middleware import (
     SessionMiddleware,
     SubmitQuery,
 )
+from proxy_logging import Event, get_proxy_logger
 
 
 class CapabilityGatedMiddleware(SessionMiddleware):
@@ -77,12 +78,17 @@ class CapabilityGatedMiddleware(SessionMiddleware):
         # orig_id → per-query metadata for this capability (or empty
         # dict for legacy auto-engage / opt-in-with-defaults).
         self._engaged: Dict[str, dict] = {}
+        # Structured-logging adapter; refined in on_session_start
+        # to bind the session-scoped context.
+        self._log: Any = get_proxy_logger("kataproxy.middleware.capability_gate")
 
     # ------------------------------------------------------------------
     # Lifecycle delegation
     # ------------------------------------------------------------------
 
     def on_session_start(self, caps: SessionCapabilities) -> None:
+        if caps.proxy_log is not None:
+            self._log = caps.proxy_log
         self._wrapped.on_session_start(caps)
 
     def on_session_end(self) -> None:
@@ -99,15 +105,38 @@ class CapabilityGatedMiddleware(SessionMiddleware):
             # Legacy auto-engage.
             self._engaged[orig_id] = {}
             self._wrapped.on_query(orig_id, query)
+            self._log.debug(
+                Event.MIDDLEWARE_ENGAGE,
+                cid=orig_id, orig=orig_id,
+                middleware_name=type(self._wrapped).__name__,
+                capability=self._capability,
+                cause="legacy_auto_engage",
+                msg=f"engage {self._capability} (legacy auto-engage)",
+            )
             return
         if isinstance(opaque_caps, dict) and self._capability in opaque_caps:
             md = opaque_caps[self._capability]
             self._engaged[orig_id] = md if isinstance(md, dict) else {}
             self._wrapped.on_query(orig_id, query)
+            self._log.debug(
+                Event.MIDDLEWARE_ENGAGE,
+                cid=orig_id, orig=orig_id,
+                middleware_name=type(self._wrapped).__name__,
+                capability=self._capability,
+                cause="opt_in",
+                msg=f"engage {self._capability} (per-query opt-in)",
+            )
             return
         # Explicit opt-out: capabilities present but does not name this
         # capability. Do not register the query with the wrapped
         # middleware; handle_response will pass responses through.
+        self._log.debug(
+            Event.MIDDLEWARE_SKIP,
+            cid=orig_id, orig=orig_id,
+            middleware_name=type(self._wrapped).__name__,
+            cause="opt_out",
+            msg=f"skip {self._capability} (per-query opt-out)",
+        )
 
     # ------------------------------------------------------------------
     # Response side: gate engagement on the recording

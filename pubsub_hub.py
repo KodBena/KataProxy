@@ -68,9 +68,12 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
+from proxy_logging import Event, get_proxy_logger, lifecycle
+
 from katago import KataGoAction, KataGoQuery
 
 logger = logging.getLogger("kataproxy." + __name__)
+_log = get_proxy_logger(__name__)
 
 __all__ = [
     "CoalescingPolicy",
@@ -142,7 +145,10 @@ class LRUCacheStore:
         self._store[key] = value
         if self._maxsize > 0 and len(self._store) > self._maxsize:
             evicted_key, _ = self._store.popitem(last=False)
-            logger.debug(f"LRU evicted cache_key={evicted_key[:24]}…")
+            _log.debug(
+                Event.DIAGNOSTIC,
+                msg=f"LRU evicted cache_key={evicted_key[:24]}…",
+            )
 
     def __len__(self) -> int:
         return len(self._store)
@@ -223,7 +229,10 @@ class CoalescingPolicy:
 
         payload = json.dumps(fields, sort_keys=True, default=str)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
-        logger.debug(f"payload={payload} digest={digest}")
+        _log.debug(
+            Event.DIAGNOSTIC,
+            msg=f"payload={payload} digest={digest}",
+        )
         return digest
 
 
@@ -300,8 +309,9 @@ class PubSubHub:
         try:
             return self._cache_store[cache_key]
         except Exception as exc:
-            logger.warning(
-                f"[PubSubHub._get_record] cache lookup failed for key={cache_key[:24]}: {exc}"
+            _log.warning(
+                Event.DIAGNOSTIC,
+                msg=f"[PubSubHub._get_record] cache lookup failed for key={cache_key[:24]}: {exc}",
             )
             return None
 
@@ -314,8 +324,9 @@ class PubSubHub:
             # InFlightEntry list (no mutability leaks).
             self._cache_store[cache_key] = deepcopy(record)
         except Exception as exc:
-            logger.warning(
-                f"[PubSubHub._save_record] failed to save key={cache_key[:24]}: {exc}"
+            _log.warning(
+                Event.DIAGNOSTIC,
+                msg=f"[PubSubHub._save_record] failed to save key={cache_key[:24]}: {exc}",
             )
 
     # -----------------------------------------------------------------------
@@ -344,7 +355,10 @@ class PubSubHub:
         # Stable JSON (sort_keys guarantees same hash for semantically equal queries)
         payload = json.dumps(data, sort_keys=True)
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
-        logger.debug(f"full-cache-key={digest[:12]}… action={query.action.name}")
+        _log.debug(
+            Event.DIAGNOSTIC,
+            msg=f"full-cache-key={digest[:12]}… action={query.action.name}",
+        )
         return digest
 
     # -----------------------------------------------------------------------
@@ -364,9 +378,12 @@ class PubSubHub:
         response path would experience, so Layer 1 Transformers still
         execute exactly as they would on fresh backend data.
         """
-        logger.debug(
-            f"starting replay for {subscriber_internal_id!r} "
-            f"({len(cached_record)} messages)"
+        _log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"starting replay for {subscriber_internal_id!r} "
+                f"({len(cached_record)} messages)"
+            ),
         )
 
         for wire in cached_record:
@@ -377,15 +394,19 @@ class PubSubHub:
             relabelled = deepcopy(wire)
             relabelled["id"] = subscriber_internal_id
 
-            logger.debug(
-                f"→ queue for {subscriber_internal_id!r} "
-                f"(qsize={subscriber_queue.qsize()})"
+            _log.debug(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"→ queue for {subscriber_internal_id!r} "
+                    f"(qsize={subscriber_queue.qsize()})"
+                ),
             )
             await subscriber_queue.put(relabelled)
             await asyncio.sleep(0)  # yield to event loop
 
-        logger.debug(
-            f"completed replay for {subscriber_internal_id!r}"
+        _log.debug(
+            Event.DIAGNOSTIC,
+            msg=f"completed replay for {subscriber_internal_id!r}",
         )
 
     # -----------------------------------------------------------------------
@@ -397,20 +418,32 @@ class PubSubHub:
         query: KataGoQuery,
         subscriber_internal_id: str,
         subscriber_queue: asyncio.Queue[WireDict],
+        proxy_log: Optional[Any] = None,
+        orig_id: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Register a subscriber for this query.
 
         Returns (is_new_query, canonical_id).
 
         is_new_query=True  → caller must dispatch the query to the backend
-                             using canonical_id.
+                             using canonical_id. Emits SUBSCRIBE event
+                             when proxy_log is supplied.
         is_new_query=False → an identical backend query is already in flight
-                             OR a cache replay was started.
-                             Caller should NOT send anything to the backend.
+                             (emits COALESCE) OR a cache replay was
+                             started (emits CACHE_HIT). Caller should
+                             NOT send anything to the backend.
 
         Action queries bypass coalescing unconditionally.
         Cache-control flags are stripped before hashing so they never affect
         coalescing semantics.
+
+        ``proxy_log`` and ``orig_id`` are the structured-logging
+        adapter and the client's orig_id. When supplied (the
+        production path from ClientSession._handle_query), the hub
+        emits the discriminated subscribe / coalesce / cache_hit
+        event with the right cid + orig + action attached. None is
+        accepted for callers / tests that don't care about
+        structured emission; the hub stays silent in that case.
         """
         # -------------------------------------------------------------------
         # 1. Extract + strip client cache flags (must happen before any hash)
@@ -426,9 +459,12 @@ class PubSubHub:
 
         if query.action != KataGoAction.ANALYZE:
             content_hash = f"{content_hash}:{secrets.token_hex(8)}"
-            logger.debug(
-                f"action query {query.action.name} — "
-                f"unique hash {content_hash[:32]}"
+            _log.debug(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"action query {query.action.name} — "
+                    f"unique hash {content_hash[:32]}"
+                ),
             )
 
         # -------------------------------------------------------------------
@@ -468,11 +504,21 @@ class PubSubHub:
         if lookup_cache_flag and query.action == KataGoAction.ANALYZE:
             cached_record = self._get_record(cache_key)
             if cached_record is not None:
-                logger.debug(
-                    f"CACHE HIT (analysis-level) for {subscriber_internal_id!r} "
-                    f"key={cache_key[:24]}"
-                )
                 dummy_canonical_id = f"replay_{secrets.token_hex(8)}"
+                if proxy_log is not None and orig_id is not None:
+                    lifecycle.cache_hit(
+                        proxy_log,
+                        cid=dummy_canonical_id, orig=orig_id,
+                        action=query.action.name, cache_key=cache_key,
+                    )
+                else:
+                    _log.debug(
+                        Event.DIAGNOSTIC,
+                        msg=(
+                            f"CACHE HIT (analysis-level) for {subscriber_internal_id!r} "
+                            f"key={cache_key[:24]}"
+                        ),
+                    )
                 asyncio.create_task(
                     self._replay_task(
                         subscriber_internal_id=subscriber_internal_id,
@@ -494,11 +540,23 @@ class PubSubHub:
         if content_hash in self._by_hash:
             entry = self._by_hash[content_hash]
             entry.subscribers.append(sub)
-            logger.debug(
-                f"COALESCED {subscriber_internal_id!r} "
-                f"onto canonical={entry.canonical_id!r} "
-                f"(now {len(entry.subscribers)} subscriber(s))"
-            )
+            if proxy_log is not None and orig_id is not None:
+                lifecycle.coalesce(
+                    proxy_log,
+                    cid=entry.canonical_id, orig=orig_id,
+                    action=query.action.name,
+                    subscriber_count=len(entry.subscribers),
+                )
+            else:
+                _log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=entry.canonical_id,
+                    msg=(
+                        f"COALESCED {subscriber_internal_id!r} "
+                        f"onto canonical={entry.canonical_id!r} "
+                        f"(now {len(entry.subscribers)} subscriber(s))"
+                    ),
+                )
             return False, entry.canonical_id
 
         # New slot – record whether THIS run should be cached
@@ -512,10 +570,21 @@ class PubSubHub:
         )
         self._by_hash[content_hash] = entry
         self._by_canonical[canonical_id] = entry
-        logger.debug(
-            f"NEW slot canonical={canonical_id!r} "
-            f"hash={content_hash[:24]} cache_key={cache_key[:24]} for {subscriber_internal_id!r}"
-        )
+        if proxy_log is not None and orig_id is not None:
+            lifecycle.subscribe(
+                proxy_log,
+                cid=canonical_id, orig=orig_id,
+                action=query.action.name,
+            )
+        else:
+            _log.debug(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"NEW slot canonical={canonical_id!r} "
+                    f"hash={content_hash[:24]} cache_key={cache_key[:24]} for {subscriber_internal_id!r}"
+                ),
+            )
         return True, canonical_id
 
     # -----------------------------------------------------------------------
@@ -534,7 +603,11 @@ class PubSubHub:
         """
         entry = self._by_canonical.get(canonical_id)
         if entry is None:
-            logger.info(f"no entry for canonical={canonical_id!r}")
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=f"no entry for canonical={canonical_id!r}",
+            )
             return False
 
         before = len(entry.subscribers)
@@ -552,10 +625,14 @@ class PubSubHub:
             if self._by_hash[entry.content_hash].canonical_id == canonical_id:
                 self._by_hash.pop(entry.content_hash)
 
-        logger.debug(
-            f"canonical={canonical_id!r} "
-            f"{before} → {len(entry.subscribers)} subscriber(s). "
-            f"Hash {entry.content_hash[:24]} removed from coalescing pool."
+        _log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=(
+                f"canonical={canonical_id!r} "
+                f"{before} → {len(entry.subscribers)} subscriber(s). "
+                f"Hash {entry.content_hash[:24]} removed from coalescing pool."
+            ),
         )
 
         return len(entry.subscribers) == 0
@@ -573,7 +650,11 @@ class PubSubHub:
         """
         entry = self._by_canonical.get(canonical_id)
         if entry is None:
-            logger.info(f"no entry for canonical={canonical_id!r} — discarding")
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=f"no entry for canonical={canonical_id!r} — discarding",
+            )
             return
 
         # Record raw backend response if this query was marked for caching.
@@ -582,17 +663,25 @@ class PubSubHub:
         if entry.record_cache:
             entry.response_record.append(deepcopy(wire))
 
-        logger.debug(
-            f"canonical={canonical_id!r} "
-            f"→ {len(entry.subscribers)} subscriber(s)"
+        _log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=(
+                f"canonical={canonical_id!r} "
+                f"→ {len(entry.subscribers)} subscriber(s)"
+            ),
         )
 
         for sub in list(entry.subscribers):
             relabelled: WireDict = dict(wire)
             relabelled["id"] = sub.subscriber_internal_id
-            logger.debug(
-                f"→ queue for {sub.subscriber_internal_id!r} "
-                f"(qsize={sub.queue.qsize()})"
+            _log.debug(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"→ queue for {sub.subscriber_internal_id!r} "
+                    f"(qsize={sub.queue.qsize()})"
+                ),
             )
             await sub.queue.put(relabelled)
 
@@ -604,15 +693,23 @@ class PubSubHub:
         """
         entry = self._by_canonical.pop(canonical_id, None)
         if entry is None:
-            logger.info(f"no entry for canonical={canonical_id!r} (already cleaned?)")
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=f"no entry for canonical={canonical_id!r} (already cleaned?)",
+            )
             return
 
         # Commit recording to the external cache (if any)
         if entry.record_cache and entry.response_record and entry.cache_key:
             self._save_record(entry.cache_key, entry.response_record)
-            logger.info(
-                f"cached {len(entry.response_record)} responses "
-                f"for cache_key={entry.cache_key[:24]}"
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"cached {len(entry.response_record)} responses "
+                    f"for cache_key={entry.cache_key[:24]}"
+                ),
             )
 
         # Only pop if it's the exact same entry to prevent race conditions
@@ -621,9 +718,13 @@ class PubSubHub:
             if self._by_hash[entry.content_hash].canonical_id == canonical_id:
                 self._by_hash.pop(entry.content_hash)
 
-        logger.info(
-            f"cleaned up canonical={canonical_id!r} "
-            f"hash={entry.content_hash[:24]}"
+        _log.info(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=(
+                f"cleaned up canonical={canonical_id!r} "
+                f"hash={entry.content_hash[:24]}"
+            ),
         )
 
 

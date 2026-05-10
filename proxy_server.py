@@ -49,6 +49,7 @@ import logging
 import math
 import uuid
 from collections import OrderedDict
+from time import monotonic
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -56,14 +57,27 @@ import websockets
 from sortedcontainers import SortedList
 from websockets.exceptions import ConnectionClosed
 
-from logging_config import filter_dict, get_logger, log_safe
+from logging_config import filter_dict, get_logger, log_safe  # noqa: E402
 logger = get_logger("kataproxy")
+
+from proxy_logging import (
+    Direction,
+    Event,
+    Role,
+    get_proxy_logger,
+    lifecycle,
+)
+
+_log = get_proxy_logger(__name__)
 
 
 import sproxy_config as cfg
 from katago import (
+    AnalyzeResponse,
     KataGoAction,
     KataGoQuery,
+    KataGoResponse,
+    MetadataResponse,
     make_katago_link,
     parse_query_from_wire,
     parse_response_from_wire,
@@ -109,6 +123,46 @@ def global_extended_encoder(self, obj):
     return original_default(self, obj)
 
 json.JSONEncoder.default = global_extended_encoder
+
+
+# ---------------------------------------------------------------------------
+# Role resolution for the structured logger
+# ---------------------------------------------------------------------------
+
+def _resolve_role() -> Role:
+    """Map cfg.ROLE (env var) to the Role enum.
+
+    Defaults to LEAF when the env var is missing or unrecognised —
+    LEAF is the most permissive bind in the structured-logging
+    contract (no upstream / label fields required) and the most
+    common deployment shape. REDIRECT / DELEGATE roles route via
+    RedirectSession, not ClientSession, so this helper is only
+    consulted by ClientSession-side code paths.
+    """
+    try:
+        return Role(cfg.ROLE.upper())
+    except ValueError:
+        return Role.LEAF
+
+
+# ---------------------------------------------------------------------------
+# Response-kind classifier (for lifecycle.forward emission)
+# ---------------------------------------------------------------------------
+
+def _classify_response_kind(resp: KataGoResponse) -> str:
+    """Classify a KataGo response for the structured ``forward`` event.
+
+    The kind drives the level inside ``lifecycle.forward``: partials are
+    DEBUG (high-volume mid-search updates), authoritative responses are
+    INFO (one per turn, or one per non-analyze query). Errors are
+    distinguished from regular metadata so operators can spot them at
+    INFO without having to filter on opaque payload contents.
+    """
+    if isinstance(resp, MetadataResponse):
+        if resp.opaque.get("error") is not None:
+            return "error"
+        return "metadata"
+    return "partial" if resp.is_during_search else "final"
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +257,24 @@ class ClientSession:
         transformer_factory: Optional[TransformerFactory] = None,
         middleware: Optional[SessionMiddleware] = None,
         rate_limit: Optional[_PerIpRateLimit] = None,
+        proxy_log=None,
     ):
         self._ws = ws
         self._peer = peer
+        # Structured-logging adapter: bound to role + session for
+        # every record this ClientSession emits. Production callers
+        # (ProxyServer._handle_connection) pass an already-bound
+        # adapter so connect/disconnect emit through the same
+        # instance; tests / diagnose scripts construct ClientSession
+        # directly and let it bind its own.
+        if proxy_log is None:
+            proxy_log = get_proxy_logger("kataproxy.proxy_server").bind(
+                role=_resolve_role(), session=peer,
+            )
+        self._log = proxy_log
+        # Per-query start-time tracking for the `complete` event's
+        # duration_ms field. Keyed by orig_id.
+        self._query_started_at: dict[str, float] = {}
         # Extract IP for the per-IP rate limiter. ws.remote_address is a
         # (host, port) tuple from the websockets library; falls back to the
         # full peer string if the tuple shape isn't available.
@@ -243,10 +312,13 @@ class ClientSession:
         # Maps orig_id → (subscriber_internal_id, canonical_id) for cleanup.
         self._active_queries: Dict[str, tuple] = {}
 
-        logger.debug(
-            f"peer={peer} "
-            f"transformer={effective_transformer.name!r} "
-            f"middleware={type(self._middleware).__name__!r}"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"peer={peer} "
+                f"transformer={effective_transformer.name!r} "
+                f"middleware={type(self._middleware).__name__!r}"
+            ),
         )
 
         # Lifecycle hook: middleware sees the capability bundle once,
@@ -254,9 +326,13 @@ class ClientSession:
         # spawn session-scoped tasks (e.g., the keep-alive watchdog) inside
         # the running event loop. ClientSession is always constructed within
         # _handle_connection (an async coroutine), so an event loop exists.
+        # proxy_log is the session-bound structured-logging adapter;
+        # middleware that emits structured records refines via .bind()
+        # for sub-contexts (e.g., per-orig_id orchestration coroutines).
         caps = SessionCapabilities(
             submit_query=self._handle_query,
             terminate_query=self._terminate_query,
+            proxy_log=self._log,
         )
         self._middleware.on_session_start(caps)
 
@@ -265,7 +341,10 @@ class ClientSession:
     # -----------------------------------------------------------------------
 
     async def run(self) -> None:
-        logger.debug(f"peer={self._peer} connection accepted")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=f"peer={self._peer} connection accepted",
+        )
 
         recv_task = asyncio.create_task(
             self._receive_loop(), name=f"recv:{self._peer}"
@@ -279,9 +358,12 @@ class ClientSession:
                 [recv_task, send_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            logger.debug(
-                f"peer={self._peer} "
-                f"one loop finished; cancelling sibling"
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"peer={self._peer} "
+                    f"one loop finished; cancelling sibling"
+                ),
             )
             for task in pending:
                 task.cancel()
@@ -290,7 +372,10 @@ class ClientSession:
                 except asyncio.CancelledError:
                     pass
         except Exception:
-            logger.exception(f"peer={self._peer} unexpected error in run loop")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} unexpected error in run loop",
+            )
         finally:
             await self._cleanup()
 
@@ -299,7 +384,10 @@ class ClientSession:
     # -----------------------------------------------------------------------
 
     async def _receive_loop(self) -> None:
-        logger.info(f"peer={self._peer} started")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=f"peer={self._peer} started",
+        )
         try:
             async for raw_msg in self._ws:
                 # log_safe defends against (a) log injection — a peer
@@ -307,33 +395,46 @@ class ClientSession:
                 # the formatted record — and (b) unbounded log-line growth
                 # for multi-megabyte messages. Default truncation is 256
                 # chars, configurable via PROXY_LOG_TRUNCATE.
-                logger.debug(
-                    f"peer={self._peer} raw={log_safe(raw_msg)}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=f"peer={self._peer} raw={log_safe(raw_msg)}",
                 )
                 await self._handle_incoming(raw_msg)
         except ConnectionClosed as e:
-            logger.info(f"peer={self._peer} closed: {e}")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} closed: {e}",
+            )
         except Exception:
-            logger.exception(f"peer={self._peer} error in receive loop")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} error in receive loop",
+            )
 
     async def _handle_incoming(self, raw_msg: str) -> None:
         # Per-IP rate limit. Off when the limiter is disabled (the default),
         # so this is a single attribute read on the hot path otherwise.
         if self._rate_limit is not None and not self._rate_limit.allow(self._peer_ip):
-            logger.warning(
-                f"peer={self._peer_ip} rate limit exceeded; dropping message"
+            self._log.warning(
+                Event.RATE_LIMITED,
+                peer_ip=self._peer_ip,
+                msg=f"rate limit exceeded for peer={self._peer_ip}",
             )
             return
 
         try:
             outer = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
         except JsonDepthExceededError as e:
-            logger.error(
-                f"peer={self._peer} refused depth-bombed payload: {e} "
-                f"raw={log_safe(raw_msg)}"
+            self._log.error(
+                Event.PARSE_ERROR,
+                error_kind="depth_bomb",
+                raw_excerpt=log_safe(raw_msg),
+                msg=f"refused depth-bombed payload: {e}",
             )
             return
         except json.JSONDecodeError:
+            # Silently drop alien JSON to keep the bot-noise floor low;
+            # the malformed-but-near-valid case below is the louder one.
             return
 
         result = self._dispatcher.match(outer)
@@ -344,18 +445,22 @@ class ClientSession:
             # ADR-0002's loudness hierarchy; the message specificity is
             # what changes.
             if isinstance(outer, dict) and ("action" in outer or "id" in outer):
-                logger.error(
-                    f"peer={self._peer} malformed protocol message "
-                    f"(looks like a query but no prism matched): "
-                    f"keys={sorted(outer.keys())} "
-                    f"action={log_safe(outer.get('action'))} "
-                    f"id_present={'id' in outer} "
-                    f"raw={log_safe(raw_msg)}"
+                self._log.error(
+                    Event.PARSE_ERROR,
+                    error_kind="malformed_protocol",
+                    raw_excerpt=log_safe(raw_msg),
+                    keys=sorted(outer.keys()),
+                    msg=(
+                        f"malformed protocol message "
+                        f"(looks like a query but no prism matched)"
+                    ),
                 )
             else:
-                logger.error(
-                    f"peer={self._peer} unknown protocol branch: "
-                    f"raw={log_safe(raw_msg)}"
+                self._log.error(
+                    Event.PARSE_ERROR,
+                    error_kind="unknown_protocol",
+                    raw_excerpt=log_safe(raw_msg),
+                    msg="unknown protocol branch",
                 )
             return
 
@@ -378,11 +483,19 @@ class ClientSession:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
-            logger.error(f"translation error: {e}")
+            self._log.error(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=f"translation error: {e}",
+            )
             return
 
         if env is None:
-            logger.debug(f"transformer suppressed query {orig_id!r}")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=f"transformer suppressed query {orig_id!r}",
+            )
             return
 
         subscriber_internal_id: str = env.id
@@ -394,12 +507,25 @@ class ClientSession:
             query=translated_query,
             subscriber_internal_id=subscriber_internal_id,
             subscriber_queue=self._send_queue,
+            proxy_log=self._log,
+            orig_id=orig_id,
         )
 
         self._active_queries[orig_id] = (subscriber_internal_id, canonical_id)
-        logger.debug(
-            f"orig={orig_id!r} internal={subscriber_internal_id!r} "
-            f"canonical={canonical_id!r} is_new={is_new}"
+        # The hub emits the discriminated subscribe / coalesce /
+        # cache_hit event itself (Phase 3 migration; was emitted
+        # unconditionally as `subscribe` from this site in Phase 2).
+        # Per-orig_id timing is still tracked here because the
+        # complete event fires from _deliver_upstream and reads back
+        # this map.
+        self._query_started_at[orig_id] = monotonic()
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, orig=orig_id,
+            msg=(
+                f"orig={orig_id!r} internal={subscriber_internal_id!r} "
+                f"canonical={canonical_id!r} is_new={is_new}"
+            ),
         )
 
         if is_new:
@@ -416,9 +542,13 @@ class ClientSession:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
-            logger.warn(
-                f"cannot translate terminateId: {e} "
-                f"(query may have already completed)"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=(
+                    f"cannot translate terminateId: {e} "
+                    f"(query may have already completed)"
+                ),
             )
             return
 
@@ -430,16 +560,30 @@ class ClientSession:
         target_internal_id = translated_query.terminate_id
 
         if target_internal_id is None:
-            logger.error(f"terminate missing terminateId after translation")
+            self._log.error(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg="terminate missing terminateId after translation",
+            )
             return
 
         canonical_id = self._internal_to_canonical(target_internal_id)
         if canonical_id is None:
-            logger.warn(
-                f"no canonical_id for "
-                f"internal={target_internal_id!r}; query may have already completed"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=(
+                    f"no canonical_id for "
+                    f"internal={target_internal_id!r}; query may have already completed"
+                ),
             )
             return
+
+        # Lifecycle emission: terminate received. cid points at the
+        # target query's canonical; orig is the terminate request's
+        # own id (same convention as subscribe/dispatch — the "what
+        # message is being processed right now" identifier).
+        lifecycle.terminate_recv(self._log, cid=canonical_id, orig=orig_id)
 
         was_last = self._hub.unsubscribe(target_internal_id, canonical_id)
         self._active_queries = {
@@ -455,22 +599,35 @@ class ClientSession:
         if was_last:
             # Sole subscriber on this canonical: terminate at the LEAF and
             # forward the real KataGo ack via relabelling. Existing flow.
+            self._log.info(
+                Event.TERMINATE_DISPATCH,
+                cid=canonical_id, orig=orig_id,
+                direction=Direction.PROXY_TO_UPSTREAM,
+                msg=f"terminate → upstream (canonical={canonical_id})",
+            )
 
             async def on_terminate_response(wire_id: str, wire: dict) -> None:
                 relabelled = dict(wire)
                 relabelled["id"] = terminate_internal_id
                 if relabelled.get("terminateId") == canonical_id:
                     relabelled["terminateId"] = target_internal_id
-                logger.debug(
-                    f"on_terminate_response "
-                    f"wire_id={wire_id!r} → terminate_internal={terminate_internal_id!r}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id, orig=orig_id,
+                    msg=(
+                        f"on_terminate_response "
+                        f"wire_id={wire_id!r} → terminate_internal={terminate_internal_id!r}"
+                    ),
                 )
                 await send_queue.put(relabelled)
 
             async def on_terminate_complete(wire_id: str) -> None:
-                logger.debug(
-                    f"on_terminate_complete "
-                    f"wire_id={wire_id!r}"
+                # Lifecycle: terminate ack received from upstream and
+                # delivered to the client. Fires once per terminate
+                # round-trip; coalesced with the wire_id-keyed
+                # callback shape.
+                lifecycle.terminate_complete(
+                    self._log, cid=canonical_id, orig=orig_id,
                 )
 
             await self._router.terminate(
@@ -478,9 +635,13 @@ class ClientSession:
                 on_response=on_terminate_response,
                 on_complete=on_terminate_complete,
             )
-            logger.debug(
-                f"canonical={canonical_id!r} "
-                f"dispatched for peer={self._peer}"
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, orig=orig_id,
+                msg=(
+                    f"canonical={canonical_id!r} "
+                    f"dispatched for peer={self._peer}"
+                ),
             )
         else:
             # Other subscribers remain on this canonical. Terminating the
@@ -498,10 +659,8 @@ class ClientSession:
                 "action": "terminate",
                 "terminateId": target_internal_id,
             }
-            logger.debug(
-                f"coalescing-transparent terminate: canonical={canonical_id!r} "
-                f"retained other subscriber(s); synthesizing ack for "
-                f"orig={orig_id!r}"
+            lifecycle.terminate_synthesized(
+                self._log, cid=canonical_id, orig=orig_id, cause="coalesced",
             )
             await send_queue.put(synthesized_ack)
 
@@ -539,22 +698,37 @@ class ClientSession:
     # -----------------------------------------------------------------------
 
     async def _send_loop(self) -> None:
-        logger.info(f"peer={self._peer} started")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=f"peer={self._peer} started",
+        )
         try:
             while True:
                 wire = await self._send_queue.get()
-                logger.debug(
-                    f"peer={self._peer} "
-                    f"dequeued id={wire.get('id')!r}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=(
+                        f"peer={self._peer} "
+                        f"dequeued id={wire.get('id')!r}"
+                    ),
                 )
                 await self._deliver_upstream(wire)
         except asyncio.CancelledError:
-            logger.debug(f"peer={self._peer} cancelled")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} cancelled",
+            )
             raise
         except ConnectionClosed as e:
-            logger.info(f"peer={self._peer} ws closed: {e}")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} ws closed: {e}",
+            )
         except Exception:
-            logger.exception(f"peer={self._peer} error in send loop")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} error in send loop",
+            )
 
     async def _deliver_upstream(self, wire: dict) -> None:
         """Translate one relabelled response to client namespace and send.
@@ -570,30 +744,49 @@ class ClientSession:
           4. One WebSocket send per (orig_id, response) pair yielded.
         """
         subscriber_internal_id = wire.get("id")
-        logger.debug(
-            f"peer={self._peer} "
-            f"internal_id={subscriber_internal_id!r}"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"peer={self._peer} "
+                f"internal_id={subscriber_internal_id!r}"
+            ),
         )
 
         try:
             _, response = parse_response_from_wire(wire)
         except Exception as e:
-            logger.error(f"parse error: {e}")
+            self._log.error(
+                Event.DIAGNOSTIC,
+                msg=f"parse error: {e}",
+            )
             return
 
         try:
             env = Envelope(id=subscriber_internal_id, payload=response)
             translated_env = self._chain.translate_upstream(env)
         except TranslationError as e:
-            logger.error(
-                f"translate_upstream failed: {e} "
-                f"(already cleaned up, or duplicate delivery?)"
+            self._log.error(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"translate_upstream failed: {e} "
+                    f"(already cleaned up, or duplicate delivery?)"
+                ),
             )
             return
 
         if translated_env is None:
-            logger.debug(f"transformer suppressed response")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg="transformer suppressed response",
+            )
             return
+
+        # Capture cid (canonical_id) before the pop below; lifecycle.forward
+        # emissions inside the middleware loop need it after _active_queries
+        # has been cleared on the terminal response.
+        parent_orig_id = translated_env.id
+        parent_active = self._active_queries.get(parent_orig_id)
+        parent_cid = parent_active[1] if parent_active is not None else parent_orig_id
 
         # Drop the per-session _active_queries entry as soon as the
         # underlying ProxyLink considers the query done. The link's
@@ -606,7 +799,26 @@ class ClientSession:
         # delivery (audit M-4).
         completed_orig_id = translated_env.id
         if self._link.mapping.forward(completed_orig_id) is None:
-            self._active_queries.pop(completed_orig_id, None)
+            active_entry = self._active_queries.pop(completed_orig_id, None)
+            # Lifecycle emission: query lifecycle ended cleanly.
+            # Duration is the gap from subscribe to completion (the
+            # `_query_started_at` ts was set in _handle_query). For
+            # injected sub-queries (orchestration's spawn path) that
+            # bypass _handle_query the ts is absent and we omit
+            # duration_ms.
+            started_at = self._query_started_at.pop(completed_orig_id, None)
+            duration_ms = (
+                int((monotonic() - started_at) * 1000.0)
+                if started_at is not None
+                else None
+            )
+            if active_entry is not None:
+                cid = active_entry[1]
+                lifecycle.complete(
+                    self._log,
+                    cid=cid, orig=completed_orig_id,
+                    duration_ms=duration_ms,
+                )
 
         # Pass through the middleware.  It yields zero or more (orig_id, response)
         # pairs; each becomes one WebSocket frame.
@@ -618,23 +830,41 @@ class ClientSession:
             ):
                 out_wire = translate_response_to_wire(out_resp, out_id)
                 out_json = json.dumps(out_wire)
-                logger.debug(
-                    f"peer={self._peer} "
-                    f"sending orig_id={out_id!r} "
-                    f"out={json.dumps(filter_dict(out_wire))}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=parent_cid, orig=out_id,
+                    msg=(
+                        f"peer={self._peer} "
+                        f"sending orig_id={out_id!r} "
+                        f"out={json.dumps(filter_dict(out_wire))}"
+                    ),
+                )
+                # Lifecycle emission: demand-edge timestamp. Kind drives
+                # the level (partial → DEBUG, final/metadata/error → INFO)
+                # inside lifecycle.forward; see the helper for rationale.
+                lifecycle.forward(
+                    self._log,
+                    cid=parent_cid, orig=out_id,
+                    kind=_classify_response_kind(out_resp),
                 )
                 await self._ws.send(out_json)
         except Exception:
-            logger.exception(f"peer={self._peer} middleware error in deliver_upstream")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} middleware error in deliver_upstream",
+            )
 
     # -----------------------------------------------------------------------
     # Cleanup
     # -----------------------------------------------------------------------
 
     async def _cleanup(self) -> None:
-        logger.debug(
-            f"peer={self._peer} "
-            f"unsubscribing {len(self._active_queries)} active query(ies)"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"peer={self._peer} "
+                f"unsubscribing {len(self._active_queries)} active query(ies)"
+            ),
         )
 
         async def _drop_response(_wid: str, _wire: dict) -> None:
@@ -658,8 +888,10 @@ class ClientSession:
                         on_complete=_drop_complete,
                     )
                 except Exception:
-                    logger.exception(
-                        f"orphan terminate failed: canonical={cid!r}"
+                    self._log.exception(
+                        Event.DIAGNOSTIC,
+                        cid=cid,
+                        msg=f"orphan terminate failed: canonical={cid!r}"
                     )
         self._active_queries.clear()
 
@@ -697,9 +929,12 @@ class RedirectSession:
     async def run(self) -> None:
 
         if not self._urls:
-            logger.info(
-                f"no UPSTREAM_URLS configured; "
-                f"closing {self._peer}"
+            _log.info(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"no UPSTREAM_URLS configured; "
+                    f"closing {self._peer}"
+                ),
             )
             await self._ws.close(1011, "no upstream configured")
             return
@@ -711,7 +946,10 @@ class RedirectSession:
         redirect_msg = json.dumps({
             "proxy_meta": {"type": "redirect", "url": target}
         })
-        logger.info(f"redirecting {self._peer} → {target} (idx={idx})")
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=f"redirecting {self._peer} → {target} (idx={idx})",
+        )
         await self._ws.send(redirect_msg)
         await self._ws.close(1000, "redirect issued")
 
@@ -757,12 +995,18 @@ class ProxyServer:
                 load_metric=InFlightQueryLoad(),
             )
             await self._router.start()
-            logger.info(f"router started for role={role}")
+            _log.info(
+                Event.DIAGNOSTIC,
+                msg=f"router started for role={role}",
+            )
 
-        logger.info(
-            f"listening on ws://{cfg.HOST}:{cfg.PORT} role={role} "
-            f"max_size={cfg.MAX_MESSAGE_SIZE} max_sessions={cfg.MAX_SESSIONS} "
-            f"ratelimit_per_ip={cfg.RATELIMIT_PER_IP}"
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"listening on ws://{cfg.HOST}:{cfg.PORT} role={role} "
+                f"max_size={cfg.MAX_MESSAGE_SIZE} max_sessions={cfg.MAX_SESSIONS} "
+                f"ratelimit_per_ip={cfg.RATELIMIT_PER_IP}"
+            ),
         )
         async with websockets.serve(
             self._handle_connection,
@@ -774,19 +1018,39 @@ class ProxyServer:
 
     async def _handle_connection(self, ws) -> None:
         peer = str(ws.remote_address)
+        peer_ip = (
+            ws.remote_address[0]
+            if isinstance(getattr(ws, "remote_address", None), tuple)
+            else peer
+        )
+
+        # Session-scoped structured-log adapter. Bound to role + session
+        # at the connection boundary so connect / connect_refused /
+        # disconnect emit through the same instance, and the same
+        # adapter is forwarded into ClientSession (for in-session
+        # events like parse_error / subscribe / dispatch / terminate /
+        # complete) so everything in one connection's stream shares
+        # the same context.
+        conn_log = get_proxy_logger("kataproxy.proxy_server").bind(
+            role=_resolve_role(), session=peer,
+        )
 
         # Concurrent-session cap (audit M-1). Refused connections close with
         # WebSocket code 1013 ("try again later"), which the websockets
         # library translates appropriately for the client.
         if cfg.MAX_SESSIONS > 0 and self._active_sessions >= cfg.MAX_SESSIONS:
-            logger.warning(
-                f"refusing {peer}: session cap reached "
-                f"({self._active_sessions} >= {cfg.MAX_SESSIONS})"
+            conn_log.warning(
+                Event.CONNECT_REFUSED,
+                peer_ip=peer_ip, cause="max_sessions",
+                msg=(
+                    f"refused {peer}: session cap reached "
+                    f"({self._active_sessions} >= {cfg.MAX_SESSIONS})"
+                ),
             )
             await ws.close(code=1013, reason="server too busy")
             return
 
-        logger.info(f"accepted {peer}")
+        lifecycle.connect(conn_log, peer_ip=peer_ip)
         self._active_sessions += 1
         try:
             role = cfg.ROLE.upper()
@@ -811,17 +1075,21 @@ class ProxyServer:
                     transformer_factory=self._transformer_factory,
                     middleware=middleware,
                     rate_limit=self._rate_limit,
+                    proxy_log=conn_log,
                 )
 
             await session.run()
-            logger.info(f"{peer} disconnected")
+            lifecycle.disconnect(conn_log)
         finally:
             self._active_sessions -= 1
 
     async def stop(self) -> None:
         if self._router is not None:
             await self._router.stop()
-        logger.info(f"done")
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg="done",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1177,20 @@ def _build_advertised_capabilities() -> dict[str, dict]:
 
 
 async def _main() -> None:
+    # Install the structured-logging handler at startup so the
+    # ProxyLogger emissions from ClientSession / routers / etc. land
+    # on the chosen formatter (console by default when stderr is a
+    # tty; logfmt otherwise). Idempotent — calling twice is a no-op.
+    # See proxy_logging.formatters.configure_logging_from_env() and
+    # proxy/docs/logging-design.md §6 / §8 for the env-var matrix.
+    from proxy_logging import configure_logging_from_env, set_process_role
+    configure_logging_from_env()
+    # Bind the process role onto every module-level get_proxy_logger
+    # call. ClientSession's per-session log refines further; bare
+    # module-level loggers (transformers, hub, etc.) inherit role
+    # from this single set point.
+    set_process_role(_resolve_role())
+
     # Per-query capability gating is always wired — legacy clients (no
     # capabilities field on the query) trigger auto-engage on the gate
     # side, so all transformers/middleware run as in v1.0.13. The
@@ -923,18 +1205,24 @@ async def _main() -> None:
     )
     if cfg.ADVERTISE_CAPABILITIES:
         advertised_caps = _build_advertised_capabilities()
-        logger.info(
-            f"advertising capabilities: {sorted(advertised_caps.keys())} "
-            f"(PROXY_ADVERTISE_CAPABILITIES enabled)"
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"advertising capabilities: {sorted(advertised_caps.keys())} "
+                f"(PROXY_ADVERTISE_CAPABILITIES enabled)"
+            ),
         )
         chain = chain.then(capabilities_advertiser(advertised_caps))
     else:
-        logger.info(
-            "PROXY_ADVERTISE_CAPABILITIES is disabled (default); "
-            "query_version responses pass through unchanged. Set "
-            "PROXY_ADVERTISE_CAPABILITIES=true to advertise per-query "
-            "capabilities to capability-aware clients. Per-query gating "
-            "remains active on the proxy side regardless."
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                "PROXY_ADVERTISE_CAPABILITIES is disabled (default); "
+                "query_version responses pass through unchanged. Set "
+                "PROXY_ADVERTISE_CAPABILITIES=true to advertise per-query "
+                "capabilities to capability-aware clients. Per-query gating "
+                "remains active on the proxy side regardless."
+            ),
         )
 
     server = ProxyServer(
@@ -947,7 +1235,10 @@ async def _main() -> None:
     try:
         await server.start()
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"shutting down")
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg="shutting down",
+        )
     finally:
         await server.stop()
 

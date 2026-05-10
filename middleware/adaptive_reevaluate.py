@@ -4,31 +4,51 @@ orchestration coroutine.
 
 (Refactored in v1.0.16 from the manual-state-machine SessionMiddleware
 shape to an orchestration coroutine using the framework primitives in
-middleware/orchestration.py. Behaviour is preserved exactly; the file
-shrinks because the per-orig_id state machine is owned by the
-framework now, not re-implemented here.)
+middleware/orchestration.py. Subsequently refactored in v1.0.20 to
+stream original finals as previews — see Design below.)
 
 Design
 ──────
-The coroutine expresses the original adaptive_reevaluate logic as
-sequential async/await code:
+The coroutine expresses adaptive re-evaluation as sequential async/await
+code:
 
-  1. Forward partials immediately; buffer the original finals.
+  1. Forward partials immediately. For each original final that arrives,
+     buffer it for the worst-quantile decision AND emit it immediately
+     with is_during_search=True patched (a "preview"), so the SPA can
+     render the turn's data without waiting for the entire range to
+     drain.
   2. When all originals have arrived, identify the worst-quantile
      turns by mean policy delta.
-  3. If any turns warrant deepening, emit the original finals with
-     is_during_search=True patched on the turns we'll deepen
-     (signalling "not done yet" to the client) and is_during_search
-     unchanged on the rest.
+  3. Promote previews to authoritative: emit the buffered final with
+     is_during_search=False for every turn NOT in the deepen set.
+     Deepened turns get their authoritative emission from Stage 4.
   4. Spawn a single deeper-analysis sub-query targeting the worst
      turns at original_max_visits + extra_visits; yield its
      responses (which the framework auto-relabels onto the parent's
-     orig_id).
+     orig_id). The deeper query's authoritative is_during_search=False
+     responses replace the previews for the deepened turns.
 
 The framework owns: parent-query lifetime, sub-query parent-pointer
 tracking, response routing into the spawn iterator, cancellation
 propagation, cleanup. This middleware owns: when to deepen, what to
 spawn, how to label.
+
+Streaming-previews rationale (v1.0.20)
+──────────────────────────────────────
+The pre-v1.0.20 shape buffered every original final on the demand edge
+until original_stream exhausted, then released them all in Stage 3
+with `is_during_search=True` patched on deepening turns and unchanged
+on the rest. On range queries with auto-engage adaptive, this held
+each turn's authoritative-quality data on the proxy for up to several
+seconds (the gap from KataGo emitting turn 0's final to the last
+turn's QUERY_COMPLETE), with no observable signal on the wire — the
+operator-visible symptom was "ranges feel batchy". The v1.0.20 shape
+streams each final immediately as `is_during_search=True`, then
+emits the authoritative `is_during_search=False` (or relays the
+deeper query's, for deepened turns) once the worst-quantile decision
+is in. Wire bandwidth doubles for non-deepened turns (one preview +
+one authoritative); the SPA's existing partial→final transition
+handles the promotion idempotently.
 
 Per-query metadata schema
 ─────────────────────────
@@ -67,8 +87,10 @@ from middleware.orchestration import (
     OrchestrationMiddleware,
     orchestration_middleware,
 )
+from proxy_logging import Event, get_proxy_logger
 
 logger = logging.getLogger("kataproxy." + __name__)
+_log = get_proxy_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +234,15 @@ def adaptive_reevaluate(
         q_quantile = cap_meta.get("worst_quantile", worst_quantile)
         q_extra = cap_meta.get("extra_visits", extra_visits)
 
-        # Stage 1: collect originals; forward partials immediately,
-        # buffer finals, forward metadata unchanged. The framework
-        # signals end-of-stream via original_stream() exhaustion when
-        # all expected finals have arrived.
+        # Stage 1: forward partials and metadata immediately. For each
+        # original final that arrives, buffer it for Stage 2's worst-
+        # quantile decision AND emit it immediately as a preview
+        # (is_during_search=True). The preview lets the SPA render the
+        # turn's data the moment KataGo finishes it; the authoritative
+        # is_during_search=False follows in Stage 3 (non-deepened turns)
+        # or Stage 4 (deepened turns, via the spawn sub-query).
+        # The framework signals end-of-stream via original_stream()
+        # exhaustion once all expected finals have arrived.
         finals: List[AnalyzeResponse] = []
         async for resp in ctx.original_stream():
             if isinstance(resp, MetadataResponse):
@@ -228,6 +255,7 @@ def adaptive_reevaluate(
                 yield resp
                 continue
             finals.append(resp)
+            yield replace(resp, is_during_search=True)
 
         if not finals:
             return
@@ -238,24 +266,29 @@ def adaptive_reevaluate(
         deepen = _expand_window(worst, all_turns, window_size)
 
         if not deepen:
-            # No adaptation warranted; emit originals unchanged.
+            # No adaptation warranted; promote each preview to the
+            # authoritative final (is_during_search=False).
             for f in finals:
                 yield f
             return
 
-        logger.info(
-            f"adaptive: orig_id={ctx.parent_id!r} "
-            f"deepening turns={sorted(deepen)} "
-            f"quantile={q_quantile} extra_visits={q_extra}"
+        _log.info(
+            Event.DIAGNOSTIC,
+            cid=ctx.parent_id,
+            msg=(
+                f"adaptive: orig_id={ctx.parent_id!r} "
+                f"deepening turns={sorted(deepen)} "
+                f"quantile={q_quantile} extra_visits={q_extra}"
+            ),
         )
 
-        # Stage 3: emit originals with is_during_search patched on
-        # turns that will be re-analyzed (so the client knows the
-        # turn isn't definitively done).
+        # Stage 3: promote previews to authoritative for non-deepened
+        # turns only. Deepened turns already streamed as previews in
+        # Stage 1; their authoritative is_during_search=False arrives
+        # via the spawn sub-query (Stage 4), relabelled onto the
+        # parent's orig_id by the orchestration framework.
         for f in finals:
-            if f.turn_number in deepen:
-                yield replace(f, is_during_search=True)
-            else:
+            if f.turn_number not in deepen:
                 yield f
 
         # Stage 4: spawn the deeper analysis; yield its responses.

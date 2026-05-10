@@ -681,6 +681,253 @@ class TestAdaptiveReevaluateMetadata:
 
 
 # ===========================================================================
+# adaptive_reevaluate streaming-previews invariants (v1.0.20)
+# ===========================================================================
+
+
+class TestAdaptiveStreamingPreviews:
+    """Validation that Stage 1 streams every original final immediately
+    as a preview (is_during_search=True), and Stage 3 emits the
+    authoritative is_during_search=False only for turns NOT in the
+    deepen set.
+
+    Pre-v1.0.20 shape buffered every original final on the demand edge
+    until original_stream exhausted, then released them all at once
+    with is_during_search patched. On range queries with auto-engage
+    adaptive, this held each turn's authoritative-quality data for as
+    long as the slowest turn in the range; the operator-visible
+    symptom was "ranges feel batchy". v1.0.20 streams each final the
+    moment KataGo emits it.
+
+    These tests pin the streaming invariants so the regression cannot
+    silently sneak back in.
+    """
+
+    @staticmethod
+    def _make_middleware(window_size: int = 1):
+        from middleware.adaptive_reevaluate import adaptive_reevaluate
+        return adaptive_reevaluate(
+            worst_quantile=0.25,
+            extra_visits=800,
+            window_size=window_size,
+        )()
+
+    @staticmethod
+    def _make_caps():
+        class _Caps:
+            submitted: list = []
+            terminated: list = []
+
+            async def submit(self, oid, q):
+                self.submitted.append((oid, q))
+
+            async def terminate(self, oid):
+                self.terminated.append(oid)
+
+        c = _Caps()
+        c.submitted = []
+        c.terminated = []
+        from middleware.session_middleware import SessionCapabilities
+        return c, SessionCapabilities(
+            submit_query=c.submit, terminate_query=c.terminate,
+        )
+
+    @staticmethod
+    def _bad_final(turn: int, delta: float = -1.0) -> AnalyzeResponse:
+        """Final response carrying a strong-negative delta — guaranteed
+        to land inside the worst-quantile threshold."""
+        return AnalyzeResponse(
+            is_during_search=False,
+            turn_number=turn,
+            opaque={
+                "moveInfos": [],
+                "extra": {
+                    "black": {"deltas": {str(turn): delta}},
+                    "white": {"deltas": {str(turn): delta}},
+                },
+            },
+        )
+
+    @staticmethod
+    def _neutral_final(turn: int) -> AnalyzeResponse:
+        """Final response without extra.deltas — invisible to
+        _find_worst_turns, so contributes no entries to the worst set."""
+        return AnalyzeResponse(
+            is_during_search=False,
+            turn_number=turn,
+            opaque={"moveInfos": []},
+        )
+
+    @staticmethod
+    async def _drive_response(m, orig_id, response):
+        out = []
+        async for oid, resp in m.handle_response(orig_id, response, None):
+            out.append((oid, resp))
+        return out
+
+    @staticmethod
+    async def _wait_for_spawn(caps, timeout_s: float = 1.0):
+        import asyncio
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            if caps.submitted:
+                return True
+            await asyncio.sleep(0.005)
+        return False
+
+    @pytest.mark.asyncio
+    async def test_each_original_final_streams_a_preview_immediately(
+        self,
+    ) -> None:
+        """Driving a single original final yields a preview emission
+        (is_during_search=True) for that turn within the same
+        handle_response cycle — the proxy does not buffer it until
+        the rest of the range completes."""
+        c, caps = self._make_caps()
+        m = self._make_middleware()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+            },
+        )
+        m.on_query("eid-1", q)
+
+        # First final → preview emission immediately. The second turn
+        # has not yet arrived; pre-v1.0.20 would have buffered turn 0
+        # silently here.
+        out0 = await self._drive_response(m, "eid-1", self._bad_final(0))
+        previews_for_turn_0 = [
+            r for _, r in out0
+            if isinstance(r, AnalyzeResponse)
+            and r.is_during_search
+            and r.turn_number == 0
+        ]
+        assert previews_for_turn_0, (
+            f"first final did not stream a preview; out0={out0}"
+        )
+
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_no_deepen_promotes_each_preview_to_authoritative(
+        self,
+    ) -> None:
+        """When no deepening is warranted (no extra.deltas → empty
+        worst → empty deepen), Stage 3 emits each buffered final as
+        authoritative is_during_search=False, and no spawn fires."""
+        c, caps = self._make_caps()
+        m = self._make_middleware()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+            },
+        )
+        m.on_query("eid-1", q)
+
+        all_yields: list = []
+        all_yields += await self._drive_response(m, "eid-1", self._neutral_final(0))
+        all_yields += await self._drive_response(m, "eid-1", self._neutral_final(1))
+
+        previews = sorted(
+            r.turn_number for _, r in all_yields
+            if isinstance(r, AnalyzeResponse) and r.is_during_search
+        )
+        authoritatives = sorted(
+            r.turn_number for _, r in all_yields
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        )
+        assert previews == [0, 1], (
+            f"expected one preview per turn; got previews={previews}"
+        )
+        assert authoritatives == [0, 1], (
+            f"expected one authoritative per turn (no-deepen path); "
+            f"got authoritatives={authoritatives}"
+        )
+        assert not c.submitted, "no-deepen path must not spawn"
+
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_deepened_turns_have_no_stage_3_authoritative(
+        self,
+    ) -> None:
+        """Stage 3 emits authoritative is_during_search=False only for
+        turns NOT in the deepen set. Deepened turns rely on the
+        spawn sub-query (Stage 4) for their authoritative emission,
+        which the orchestration framework relabels onto the parent's
+        orig_id.
+
+        Construction: 6-turn range with a single bad-delta turn at
+        index 0. _find_worst_turns produces worst={0,1,2}; with
+        window_size=1 (no expansion) deepen={0,1,2}, leaving turns
+        3, 4, 5 as the non-deepened set."""
+        c, caps = self._make_caps()
+        m = self._make_middleware(window_size=1)
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1, 2, 3, 4, 5],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+            },
+        )
+        m.on_query("eid-1", q)
+
+        all_yields: list = []
+        for turn in range(6):
+            resp = self._bad_final(0) if turn == 0 else self._neutral_final(turn)
+            all_yields += await self._drive_response(m, "eid-1", resp)
+
+        # Every turn produced a preview during Stage 1.
+        preview_turns = sorted(
+            r.turn_number for _, r in all_yields
+            if isinstance(r, AnalyzeResponse) and r.is_during_search
+        )
+        assert preview_turns == [0, 1, 2, 3, 4, 5], (
+            f"expected one preview per turn; got {preview_turns}"
+        )
+
+        # Stage 3 authoritatives are ONLY for non-deepened turns.
+        auth_turns = sorted(
+            r.turn_number for _, r in all_yields
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        )
+        assert auth_turns == [3, 4, 5], (
+            f"Stage 3 should emit authoritatives only for non-deepened "
+            f"turns; got auth_turns={auth_turns} "
+            f"(deepened turns {{0, 1, 2}} should rely on the spawn)"
+        )
+
+        # Spawn fires for the deepened turn set.
+        assert await self._wait_for_spawn(c), "deeper sub-query did not spawn"
+        _spawn_oid, spawn_q = c.submitted[0]
+        assert sorted(spawn_q.analyze_turns) == [0, 1, 2], (
+            f"spawn should target the deepened turn set; "
+            f"got analyze_turns={spawn_q.analyze_turns}"
+        )
+
+        m.on_session_end()
+
+
+# ===========================================================================
 # capabilities_advertiser
 # ===========================================================================
 
