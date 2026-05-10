@@ -211,8 +211,23 @@ def forward(
     orig: str,
     kind: str,
 ) -> None:
-    """Forwarded to client. DEBUG level."""
-    logger.debug(
+    """Forwarded to client.
+
+    Kind-aware level split:
+
+      - ``partial`` → DEBUG (volume: O(reportDuringSearchEvery × turns))
+      - ``final`` / ``metadata`` / ``error`` → INFO (one per turn or per
+        non-analyze query; cheap to keep visible at the default level)
+
+    The split exists because the demand-edge is the operator's primary
+    timing signal — when did the SPA actually receive each turn? — and
+    that's only useful at INFO if it isn't drowned by per-partial noise.
+    Partials remain available under ``LOG_LEVEL=DEBUG``.
+    """
+    import logging as _logging
+    level = _logging.DEBUG if kind == "partial" else _logging.INFO
+    logger.log(
+        level,
         Event.FORWARD,
         cid=cid, orig=orig, kind=kind,
         direction=Direction.FORWARD,

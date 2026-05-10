@@ -251,7 +251,7 @@ unless DEBUG is on.
 | event              | level   | required fields beyond root                                                          | semantics                            |
 |--------------------|---------|--------------------------------------------------------------------------------------|--------------------------------------|
 | `respond`          | DEBUG   | `cid`, `orig`, `kind=partial|final|metadata|error`, `direction=upstream→proxy`        | Response received from upstream.     |
-| `forward`          | DEBUG   | `cid`, `orig`, `kind`, `direction=proxy→client`                                       | Forwarded to client.                 |
+| `forward`          | DEBUG\* | `cid`, `orig`, `kind`, `direction=proxy→client`                                       | Forwarded to client. \*Kind-aware: `partial` → DEBUG, `final`/`metadata`/`error` → INFO; the demand-edge timing for authoritative responses stays visible at the default level without per-partial flooding. |
 | `respond_dropped`  | DEBUG   | `cid`, `orig`, `cause=stale|broadcast_followup`                                      | Subsequent broadcast response dropped. |
 | `complete`         | INFO    | `cid`, `orig`, `total_responses`, `duration_ms`                                      | Query lifecycle ended.               |
 
@@ -725,6 +725,21 @@ and main absorbs the branch.
   (a follow-up commit, not in the original four-phase plan) can
   sweep these mechanically; the value is consistency rather than
   added structure.
+
+  **Phase 3.5 addendum — `forward` emission in `_deliver_upstream`.**
+  The `lifecycle.forward(...)` call on every middleware-loop yield
+  in `proxy_server.py:_deliver_upstream` (just before
+  `await self._ws.send(...)`) is a structured-logging addition,
+  not an f-string sweep. It closes the demand-edge gap: the
+  Phase 2/3 events show what reaches the proxy from upstream
+  (`respond`, `complete`), but pre-3.5 there was no structured
+  event between adaptive's release and the WebSocket send. The
+  helper does kind-aware level splitting (DEBUG for partial, INFO
+  for `final`/`metadata`/`error`) so authoritative-response
+  timing is visible at the default level without per-partial
+  flooding. This emission is what made the v1.0.20
+  adaptive_reevaluate streaming refactor's behaviour change
+  observable in the log; both ship in the same branch.
 
   **One commit on the feature branch.**
 

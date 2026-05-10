@@ -71,8 +71,11 @@ from proxy_logging import (
 
 import sproxy_config as cfg
 from katago import (
+    AnalyzeResponse,
     KataGoAction,
     KataGoQuery,
+    KataGoResponse,
+    MetadataResponse,
     make_katago_link,
     parse_query_from_wire,
     parse_response_from_wire,
@@ -138,6 +141,26 @@ def _resolve_role() -> Role:
         return Role(cfg.ROLE.upper())
     except ValueError:
         return Role.LEAF
+
+
+# ---------------------------------------------------------------------------
+# Response-kind classifier (for lifecycle.forward emission)
+# ---------------------------------------------------------------------------
+
+def _classify_response_kind(resp: KataGoResponse) -> str:
+    """Classify a KataGo response for the structured ``forward`` event.
+
+    The kind drives the level inside ``lifecycle.forward``: partials are
+    DEBUG (high-volume mid-search updates), authoritative responses are
+    INFO (one per turn, or one per non-analyze query). Errors are
+    distinguished from regular metadata so operators can spot them at
+    INFO without having to filter on opaque payload contents.
+    """
+    if isinstance(resp, MetadataResponse):
+        if resp.opaque.get("error") is not None:
+            return "error"
+        return "metadata"
+    return "partial" if resp.is_during_search else "final"
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +698,13 @@ class ClientSession:
             logger.debug(f"transformer suppressed response")
             return
 
+        # Capture cid (canonical_id) before the pop below; lifecycle.forward
+        # emissions inside the middleware loop need it after _active_queries
+        # has been cleared on the terminal response.
+        parent_orig_id = translated_env.id
+        parent_active = self._active_queries.get(parent_orig_id)
+        parent_cid = parent_active[1] if parent_active is not None else parent_orig_id
+
         # Drop the per-session _active_queries entry as soon as the
         # underlying ProxyLink considers the query done. The link's
         # response policy purges the mapping on the QUERY_COMPLETE final,
@@ -721,6 +751,14 @@ class ClientSession:
                     f"peer={self._peer} "
                     f"sending orig_id={out_id!r} "
                     f"out={json.dumps(filter_dict(out_wire))}"
+                )
+                # Lifecycle emission: demand-edge timestamp. Kind drives
+                # the level (partial → DEBUG, final/metadata/error → INFO)
+                # inside lifecycle.forward; see the helper for rationale.
+                lifecycle.forward(
+                    self._log,
+                    cid=parent_cid, orig=out_id,
+                    kind=_classify_response_kind(out_resp),
                 )
                 await self._ws.send(out_json)
         except Exception:
