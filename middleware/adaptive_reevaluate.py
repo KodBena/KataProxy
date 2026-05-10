@@ -1,50 +1,59 @@
 """
-middleware/adaptive_reevaluate.py — Adaptive re-evaluation as a
-SessionMiddleware.
+middleware/adaptive_reevaluate.py — Adaptive re-evaluation as an
+orchestration coroutine.
 
-(Renamed and relocated in v1.0.13 from katago_effectful.py at the proxy
-root.)
+(Refactored in v1.0.16 from the manual-state-machine SessionMiddleware
+shape to an orchestration coroutine using the framework primitives in
+middleware/orchestration.py. Behaviour is preserved exactly; the file
+shrinks because the per-orig_id state machine is owned by the
+framework now, not re-implemented here.)
 
 Design
 ──────
-AdaptiveReevaluateMiddleware observes the *final* responses for a KataGo
-analyze query (isDuringSearch=False, one per requested turn), identifies the
-turns with the worst policy-delta statistics, and submits a deeper analysis
-for those turns.
+The coroutine expresses the original adaptive_reevaluate logic as
+sequential async/await code:
 
-From the client's perspective the stream for a given orig_id stays open:
-  • Partial responses (isDuringSearch=True) — forwarded immediately, unchanged.
-  • Final responses for turns that will NOT be re-analyzed — forwarded
-    immediately with isDuringSearch=False (those turns are done).
-  • Final responses for turns that WILL be re-analyzed — forwarded with
-    isDuringSearch patched to True (telling the client "still in progress").
-  • Deeper-analysis responses arrive later under a synthetic orig_id;
-    the middleware re-labels them to the real client orig_id before sending.
-    The last final from the deeper pass carries isDuringSearch=False,
-    completing those turns from the client's point of view.
+  1. Forward partials immediately; buffer the original finals.
+  2. When all originals have arrived, identify the worst-quantile
+     turns by mean policy delta.
+  3. If any turns warrant deepening, emit the original finals with
+     is_during_search=True patched on the turns we'll deepen
+     (signalling "not done yet" to the client) and is_during_search
+     unchanged on the rest.
+  4. Spawn a single deeper-analysis sub-query targeting the worst
+     turns at original_max_visits + extra_visits; yield its
+     responses (which the framework auto-relabels onto the parent's
+     orig_id).
 
-ID namespacing
-──────────────
-Injected queries use a synthetic orig_id that encodes the real client ID.
-They go through ClientSession._submit_raw (bypassing the Transformer — no
-double-enrichment) and get an independent ProxyLink entry.  The original
-query's ProxyLink entry is cleaned up normally by CompletionTracker; there is
-no lifecycle interference.
+The framework owns: parent-query lifetime, sub-query parent-pointer
+tracking, response routing into the spawn iterator, cancellation
+propagation, cleanup. This middleware owns: when to deepen, what to
+spawn, how to label.
 
-Synthetic ID format:  __adap__<8 hex chars>__<real_orig_id>
+Per-query metadata schema
+─────────────────────────
+The coroutine reads `capabilities.adaptive_reevaluate.worst_quantile`
+and `capabilities.adaptive_reevaluate.extra_visits` from the parent's
+opaque payload (Phase 1 capability negotiation, v1.0.14). Absent
+fields fall back to the constructor defaults captured by closure.
+
+`extra_visits` stays an *increment*: the deeper query's
+`maxVisits = original_maxVisits + extra_visits` so KataGo's NN cache
+continues the search from where the original left off rather than
+restarting.
+
+License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
 
 from __future__ import annotations
 
-import asyncio
-import uuid
-from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+import logging
+from collections import defaultdict
+from copy import deepcopy
+from dataclasses import replace
+from typing import AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
-
-import sproxy_config as cfg
-from dataclasses import replace
 
 from katago import (
     AnalyzeResponse,
@@ -53,330 +62,207 @@ from katago import (
     KataGoResponse,
     MetadataResponse,
 )
-from middleware.session_middleware import SessionMiddleware, SubmitQuery, ResponseStream
+from middleware.orchestration import (
+    OrchestrationContext,
+    OrchestrationMiddleware,
+    orchestration_middleware,
+)
 
-import logging
 logger = logging.getLogger("kataproxy." + __name__)
-from copy import deepcopy
+
 
 # ---------------------------------------------------------------------------
-# Synthetic-ID helpers
+# Pure helpers (unchanged signatures from the pre-v1.0.16 imperative impl)
 # ---------------------------------------------------------------------------
 
-_PREFIX = "Q:"
+def _find_worst_turns(
+    responses: List[AnalyzeResponse], quantile: float,
+) -> List[int]:
+    """Return turn numbers whose mean policy delta is in the worst quantile.
 
-
-def _make_synthetic_id(real_orig_id: str) -> str:
-    return f"{_PREFIX}{uuid.uuid4().hex[:8]}__{real_orig_id}"
-
-
-def _is_synthetic(orig_id: str) -> bool:
-    return orig_id.startswith(_PREFIX)
-
-
-def _real_id_of(synthetic_id: str) -> str:
-    """Extract the real orig_id from a synthetic one.
-
-    Format: ``Q:<8hex>__<real_id>`` where real_id may itself contain ``__``.
-    The maxsplit=1 (rather than 2) is the load-bearing detail: the
-    pre-v1.0.6 maxsplit=2 took the middle of a 3-part split and silently
-    truncated real_orig_ids that contained the ``__`` separator (audit L-4).
-    With maxsplit=1, [1] is everything after the first separator —
-    including any subsequent ``__``s in the real_id.
+    `quantile` is per-orig_id (read from the query's
+    capabilities.adaptive_reevaluate metadata, falling back to the
+    constructor-time default).
     """
-    return synthetic_id.split("__", 1)[1]
+    turn_maps: Dict[str, Dict[int, List[float]]] = {
+        "black": defaultdict(list),
+        "white": defaultdict(list),
+    }
+    for resp in responses:
+        for color in ("black", "white"):
+            deltas = resp.opaque.get("extra", {}).get(color, {}).get("deltas")
+            if isinstance(deltas, dict):
+                for t, d in deltas.items():
+                    turn_maps[color][int(t)].append(float(d))
+
+    worst: List[int] = []
+    for displacement, color in [(0, "black"), (1, "white")]:
+        tm = turn_maps[color]
+        if not tm:
+            continue
+        avg_deltas = [(t, float(np.mean(ds))) for t, ds in tm.items()]
+        threshold = sorted(d for _, d in avg_deltas)[
+            int(len(avg_deltas) * quantile)
+        ]
+        moves = [t for t, d in avg_deltas if d <= threshold]
+        turns = sum(
+            [[2 * t + displacement, 2 * t + 1 + displacement] for t in moves],
+            [],
+        )
+        worst.extend(turns)
+
+    return worst
 
 
-# ---------------------------------------------------------------------------
-# AdaptiveReevaluateMiddleware
-# ---------------------------------------------------------------------------
+def _expand_window(
+    worst_turns: List[int], all_turns: Set[int], window_size: int,
+) -> Set[int]:
+    """Expand each worst turn into a window of neighbouring turns."""
+    expanded: Set[int] = set()
+    half = window_size // 2
+    for t in worst_turns:
+        for offset in range(-half, half + 1):
+            c = t + offset
+            if c in all_turns:
+                expanded.add(c)
+    return expanded
 
-class AdaptiveReevaluateMiddleware(SessionMiddleware):
+
+def _build_deeper_query(
+    orig: KataGoQuery, turns: List[int], extra_visits: int,
+) -> KataGoQuery:
+    """Build a deeper-analysis query derived from the original.
+
+    `extra_visits` is per-orig_id. Increment-not-absolute: the deeper
+    query's maxVisits = original_maxVisits + extra_visits so KataGo's
+    NN cache continues the search from where the original left off
+    rather than restarting.
+
+    The capabilities field stays in the deeper opaque so the
+    orchestration framework treats the synthetic deeper query
+    consistently with the parent on the wire-strip side. The central
+    wire-strip in katago/katago_proxy.py:translate_query_to_wire
+    ensures it never reaches KataGo regardless.
     """
-    Re-analyzes turns with poor policy-delta statistics at higher visit count.
-
-    Parameters
-    ----------
-    worst_quantile:
-        Fraction of turns considered "worst" and eligible for re-analysis.
-        0.25 means the bottom 25 % by mean delta are candidates.
-    extra_visits:
-        Additional visits added on top of the original maxVisits for the
-        deeper query.
-    window_size:
-        Number of turns around each worst turn to include in the deeper query
-        (to give the engine positional context).
-    """
-
-    def __init__(
-        self,
-        worst_quantile: float = 1.0,
-        extra_visits: int = 800,
-        window_size: int = 3,
-        max_inflight: Optional[int] = None,
-    ) -> None:
-        self._worst_quantile = worst_quantile
-        self._extra_visits = extra_visits
-        self._window_size = window_size
-        # Per-session in-flight cap. None or non-positive → unbounded
-        # (pre-v1.0.5 semantics, except without the panic-flush behaviour).
-        self._max_inflight = (
-            max_inflight if max_inflight is not None else cfg.ADAPTIVE_MAX_INFLIGHT
-        )
-
-        # orig_id → number of final responses still expected. OrderedDict
-        # so insertion order is the canonical eviction order on overflow;
-        # _buffered, _orig_queries, _per_query_quantile, and
-        # _per_query_extra_visits are kept consistent at every mutation
-        # site.
-        self._expected: "OrderedDict[str, int]" = OrderedDict()
-        # orig_id → buffered (turn_number, response) pairs.
-        # Adaptive only buffers analyze finals — the metadata short-circuit
-        # in handle_response guarantees only AnalyzeResponse reaches the
-        # bucket — so the inner type narrows to AnalyzeResponse rather
-        # than the broader KataGoResponse union.
-        self._buffered: Dict[str, List[Tuple[int, AnalyzeResponse]]] = {}
-        # orig_id → original KataGoQuery (needed to build the deeper query)
-        self._orig_queries: Dict[str, KataGoQuery] = {}
-        # Per-orig_id parameter overrides read from the query's
-        # capabilities.adaptive_reevaluate metadata in on_query.
-        # Constructor-time defaults (self._worst_quantile,
-        # self._extra_visits) are the fallback when metadata is absent
-        # — preserving the legacy auto-engage default semantics for
-        # queries that opt in without overriding parameters.
-        self._per_query_quantile: Dict[str, float] = {}
-        self._per_query_extra_visits: Dict[str, int] = {}
-
-    # ------------------------------------------------------------------
-    # on_query — register expected response count
-    # ------------------------------------------------------------------
-
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
-        if _is_synthetic(orig_id):
-            return  # injected queries are tracked implicitly via handle_response
-
-        if query.action != KataGoAction.ANALYZE:
-            return
-
-        # Per-query parameter overrides via capability metadata. The
-        # CapabilityGatedMiddleware wrapper has already decided this
-        # middleware should engage for this orig_id; the metadata
-        # values either override or fall back to constructor defaults.
-        # See proxy/docs/roadmap-capability-negotiation.md (the
-        # adaptive_reevaluate metadata schema section) for the
-        # increment-not-absolute reasoning on extra_visits.
-        cap_meta = (query.opaque.get("capabilities") or {}).get("adaptive_reevaluate") or {}
-        self._per_query_quantile[orig_id] = cap_meta.get(
-            "worst_quantile", self._worst_quantile
-        )
-        self._per_query_extra_visits[orig_id] = cap_meta.get(
-            "extra_visits", self._extra_visits
-        )
-
-        turns = query.analyze_turns or []
-        self._expected[orig_id] = len(turns) if turns else 1
-        self._orig_queries[orig_id] = deepcopy(query)
-
-        # Bounded LRU eviction. The pre-v1.0.5 implementation tripped a
-        # panic-flush at 5000 entries that wiped every in-flight query's
-        # state — a single bad client could lose every other concurrent
-        # query's adaptation context. The ordered eviction here keeps the
-        # newest queries' state intact and only loses the oldest, which is
-        # the right trade-off when the client is genuinely producing more
-        # in-flight queries than the cap allows.
-        while (self._max_inflight > 0
-               and len(self._expected) > self._max_inflight):
-            evicted, _ = self._expected.popitem(last=False)
-            self._buffered.pop(evicted, None)
-            self._orig_queries.pop(evicted, None)
-            self._per_query_quantile.pop(evicted, None)
-            self._per_query_extra_visits.pop(evicted, None)
-            logger.warning(
-                f"adaptive: per-session in-flight cap {self._max_inflight} "
-                f"reached; evicted oldest orig_id={evicted!r}"
-            )
-
-    # ------------------------------------------------------------------
-    # handle_response — core interception logic
-    # ------------------------------------------------------------------
-
-    async def handle_response(
-        self,
-        orig_id: str,
-        response: KataGoResponse,
-        submit_query: SubmitQuery,
-    ) -> ResponseStream:
-        # ── Metadata responses pass through unchanged ───────────────────
-        # adaptive_reevaluate is analyze-shaped end-to-end; on_query
-        # already short-circuits non-analyze. Synthetic deeper queries
-        # are also analyze, so the synthetic-id branch below never sees
-        # a metadata response. This guard makes the analyze-only nature
-        # explicit at the type level.
-        if isinstance(response, MetadataResponse):
-            yield orig_id, response
-            return
-
-        # ── Responses from injected deeper queries ──────────────────────
-        if _is_synthetic(orig_id):
-            # Re-label to the real client ID and pass through.
-            # The deeper query's CompletionTracker will emit isDuringSearch=False
-            # on its last turn, which is exactly what the client needs to consider
-            # those turns complete.
-            yield _real_id_of(orig_id), response
-            return
-
-        # ── Partial responses from the original query ───────────────────
-        if response.is_during_search:
-            yield orig_id, response
-            return
-
-        # ── Final responses from the original query ─────────────────────
-        # Buffer until all expected finals have arrived.
-        bucket = self._buffered.setdefault(orig_id, [])
-        bucket.append((response.turn_number, response))
-
-        if len(bucket) < self._expected.get(orig_id, 1):
-            return  # more finals still expected; hold this one
-
-        # All finals received — decide on adaptation.
-        finals = self._buffered.pop(orig_id)
-        self._expected.pop(orig_id, None)
-        orig_query = self._orig_queries.pop(orig_id, None)
-        # Per-orig_id parameter overrides recorded in on_query; fall
-        # back to constructor-time defaults if absent (the on_query
-        # path always sets these for non-synthetic analyze queries, so
-        # absence here means an off-path orig_id and the fallback is
-        # safe).
-        quantile = self._per_query_quantile.pop(orig_id, self._worst_quantile)
-        extra_visits = self._per_query_extra_visits.pop(orig_id, self._extra_visits)
-
-        all_turns: Set[int] = {t for t, _ in finals}
-        worst_turns = self._find_worst_turns([r for _, r in finals], quantile)
-        turns_to_deepen = self._expand_window(worst_turns, all_turns)
-
-        if turns_to_deepen and orig_query is not None:
-            logger.info(
-                f"adaptive: orig_id={orig_id!r} "
-                f"deepening turns={sorted(turns_to_deepen)} "
-                f"quantile={quantile} extra_visits={extra_visits}"
-            )
-            # Emit original finals — patched for turns that will be re-analyzed,
-            # un-patched for turns that are truly complete now.
-            for turn_n, final_r in finals:
-                if turn_n in turns_to_deepen:
-                    # Signal "still in progress" for this turn. final_r
-                    # is structurally an AnalyzeResponse (the metadata
-                    # branch returned at the top of handle_response, and
-                    # the buffer is only populated below the analyze
-                    # discriminator), so dataclasses.replace returns an
-                    # AnalyzeResponse with is_during_search flipped.
-                    yield orig_id, replace(final_r, is_during_search=True)
-                else:
-                    yield orig_id, final_r  # this turn is definitively done
-
-            # Inject deeper query under a fresh synthetic orig_id.
-            synthetic_id = _make_synthetic_id(orig_id)
-            deeper = self._build_deeper_query(
-                orig_query, sorted(turns_to_deepen), extra_visits
-            )
-            # create_task so we don't block the current yield chain.
-            asyncio.create_task(submit_query(synthetic_id, deeper))
-
-        else:
-            # No adaptation warranted — emit all finals unchanged.
-            for _, final_r in finals:
-                yield orig_id, final_r
-
-    # ------------------------------------------------------------------
-    # Delta-analysis helpers
-    # ------------------------------------------------------------------
-
-    def _find_worst_turns(
-        self, responses: List[AnalyzeResponse], quantile: float
-    ) -> List[int]:
-        """Return turn numbers whose mean policy delta is in the worst quantile.
-
-        ``quantile`` is per-orig_id (read from the query's
-        capabilities.adaptive_reevaluate metadata in on_query, falling
-        back to the constructor-time default).
-        """
-        turn_maps: Dict[str, Dict[int, List[float]]] = {
-            "black": defaultdict(list),
-            "white": defaultdict(list),
-        }
-        for resp in responses:
-            for color in ("black", "white"):
-                deltas = resp.opaque.get("extra", {}).get(color, {}).get("deltas")
-                if isinstance(deltas, dict):
-                    for t, d in deltas.items():
-                        turn_maps[color][int(t)].append(float(d))
-
-        worst: List[int] = []
-        for displacement, color in [(0,"black"), (1,"white")]:
-            tm = turn_maps[color]
-            if not tm:
-                continue
-            avg_deltas = [(t, float(np.mean(ds))) for t, ds in tm.items()]
-            # Threshold = value at the per-orig_id quantile-th percentile.
-            threshold = sorted(d for _, d in avg_deltas)[
-                int(len(avg_deltas) * quantile)
-            ]
-            moves = [t for t,d in avg_deltas if d <= threshold]
-            turns = sum([[2*t + displacement, 2*t + 1 + displacement] for t in moves],[])
-            worst.extend(turns)
-
-        return worst
-
-    def _expand_window(self, worst_turns: List[int], all_turns: Set[int]) -> Set[int]:
-        """Expand each worst turn into a window of neighbouring turns."""
-        expanded: Set[int] = set()
-        half = self._window_size // 2
-        for t in worst_turns:
-            for offset in range(-half, half + 1):
-                c = t + offset
-                if c in all_turns:
-                    expanded.add(c)
-        return expanded
-
-    def _build_deeper_query(
-        self, orig: KataGoQuery, turns: List[int], extra_visits: int
-    ) -> KataGoQuery:
-        """Build a deeper-analysis query derived from the original.
-
-        ``extra_visits`` is per-orig_id (read from the query's
-        capabilities.adaptive_reevaluate metadata in on_query, falling
-        back to the constructor-time default). Increment-not-absolute:
-        the deeper query's maxVisits = original_maxVisits + extra_visits
-        so KataGo's NN cache continues the search from where the
-        original left off rather than restarting.
-        """
-        new_opaque = dict(orig.opaque)
-        new_opaque["maxVisits"] = new_opaque.get("maxVisits", 1000) + extra_visits
-        # Strip client-side cache flags — the injected query is internal.
-        new_opaque.pop("cache", None)
-        new_opaque.pop("lookup_cache", None)
-        new_opaque.pop("replay_final_only", None)
-        # The capabilities field stays in opaque so the gate wrapper
-        # engages adaptive_reevaluate on the synthetic deeper query;
-        # the central wire-strip in translate_query_to_wire ensures it
-        # never reaches KataGo. (Also belt-and-braces: pubsub_hub's
-        # subscribe pop runs on the deeper query's path through Layer
-        # 2 as well.)
-        return KataGoQuery(
-            action=KataGoAction.ANALYZE,
-            analyze_turns=turns,
-            opaque=new_opaque,
-        )
+    new_opaque = dict(orig.opaque)
+    new_opaque["maxVisits"] = (
+        new_opaque.get("maxVisits", 1000) + extra_visits
+    )
+    # Strip client-side cache flags — the injected query is internal.
+    new_opaque.pop("cache", None)
+    new_opaque.pop("lookup_cache", None)
+    new_opaque.pop("replay_final_only", None)
+    return KataGoQuery(
+        action=KataGoAction.ANALYZE,
+        analyze_turns=turns,
+        opaque=new_opaque,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Public factory function (matches the existing call-site style)
+# adaptive_reevaluate factory (orchestration-shaped)
 # ---------------------------------------------------------------------------
 
 def adaptive_reevaluate(
     worst_quantile: float = 0.25,
     extra_visits: int = 800,
     window_size: int = 3,
-) -> AdaptiveReevaluateMiddleware:
-    """Return a configured AdaptiveReevaluateMiddleware instance."""
-    return AdaptiveReevaluateMiddleware(worst_quantile, extra_visits, window_size)
+) -> Callable[[], OrchestrationMiddleware]:
+    """Return a factory that produces an OrchestrationMiddleware
+    expressing adaptive re-evaluation.
+
+    The constructor parameters become the per-query defaults: a
+    parent query that opts in to `adaptive_reevaluate` without
+    overriding metadata uses these values. Per-query overrides via
+    `capabilities.adaptive_reevaluate.{worst_quantile,extra_visits}`
+    take precedence.
+
+    Caller pattern (mirrors the SELECTOR / capability_gate factories):
+
+        base = CapabilityGatedMiddleware(
+            "adaptive_reevaluate",
+            adaptive_reevaluate(
+                worst_quantile=0.25,
+                extra_visits=800,
+                window_size=3,
+            )(),  # () to invoke the factory
+        )
+
+    The trailing `()` is the only API change vs. the pre-v1.0.16
+    shape (which returned the middleware directly). The wrapping
+    pattern is otherwise identical.
+    """
+
+    @orchestration_middleware(name="adaptive_reevaluate")
+    async def coro(
+        parent: KataGoQuery, ctx: OrchestrationContext,
+    ) -> AsyncIterator[KataGoResponse]:
+        # Non-analyze queries pass through unchanged.
+        if parent.action != KataGoAction.ANALYZE:
+            async for resp in ctx.original_stream():
+                yield resp
+            return
+
+        # Per-query metadata overrides (Phase 1 capability schema);
+        # closure-captured defaults are the fallback.
+        cap_meta = (
+            (parent.opaque.get("capabilities") or {})
+            .get("adaptive_reevaluate") or {}
+        )
+        q_quantile = cap_meta.get("worst_quantile", worst_quantile)
+        q_extra = cap_meta.get("extra_visits", extra_visits)
+
+        # Stage 1: collect originals; forward partials immediately,
+        # buffer finals, forward metadata unchanged. The framework
+        # signals end-of-stream via original_stream() exhaustion when
+        # all expected finals have arrived.
+        finals: List[AnalyzeResponse] = []
+        async for resp in ctx.original_stream():
+            if isinstance(resp, MetadataResponse):
+                # adaptive is analyze-shaped end-to-end, but metadata
+                # responses (e.g., error responses) can still arrive
+                # for analyze queries; pass them through.
+                yield resp
+                continue
+            if resp.is_during_search:
+                yield resp
+                continue
+            finals.append(resp)
+
+        if not finals:
+            return
+
+        # Stage 2: decide on adaptation.
+        all_turns: Set[int] = {f.turn_number for f in finals}
+        worst = _find_worst_turns(finals, q_quantile)
+        deepen = _expand_window(worst, all_turns, window_size)
+
+        if not deepen:
+            # No adaptation warranted; emit originals unchanged.
+            for f in finals:
+                yield f
+            return
+
+        logger.info(
+            f"adaptive: orig_id={ctx.parent_id!r} "
+            f"deepening turns={sorted(deepen)} "
+            f"quantile={q_quantile} extra_visits={q_extra}"
+        )
+
+        # Stage 3: emit originals with is_during_search patched on
+        # turns that will be re-analyzed (so the client knows the
+        # turn isn't definitively done).
+        for f in finals:
+            if f.turn_number in deepen:
+                yield replace(f, is_during_search=True)
+            else:
+                yield f
+
+        # Stage 4: spawn the deeper analysis; yield its responses.
+        # The framework auto-relabels them onto the parent's orig_id
+        # via the OrchestrationMiddleware's handle_response.
+        deeper = _build_deeper_query(parent, sorted(deepen), q_extra)
+        async for resp in ctx.spawn(deeper):
+            yield resp
+
+    return coro

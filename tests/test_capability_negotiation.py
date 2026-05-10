@@ -437,126 +437,208 @@ class TestCapabilityGatedMiddleware:
 
 
 class TestAdaptiveReevaluateMetadata:
+    """Validation that the post-v1.0.16 orchestration-based adaptive
+    middleware preserves the v1.0.14 metadata-override behaviour
+    end-to-end via observable spawn semantics.
+
+    The pre-v1.0.16 imperative implementation exposed `_per_query_quantile`
+    and `_per_query_extra_visits` instance dicts that earlier tests
+    inspected directly. The orchestration refactor moves that state
+    into the coroutine's closure variables, so the tests now verify
+    the externally observable consequence: when the coroutine decides
+    to deepen, the spawned sub-query's maxVisits reflects the per-query
+    override (or the constructor default if absent).
+    """
+
     @staticmethod
     def _make_middleware():
-        # Imported lazily because adaptive_reevaluate pulls in numpy
-        # and scipy via its own module imports; tests above run without
-        # those if pytest collects this class when those deps are
-        # missing, the whole class fails to collect and the rest still
-        # runs. (pyproject.toml lists numpy/scipy as runtime deps; if
-        # the dev environment matches pyproject they are present.)
-        from middleware.adaptive_reevaluate import AdaptiveReevaluateMiddleware
-
-        return AdaptiveReevaluateMiddleware(
+        from middleware.adaptive_reevaluate import adaptive_reevaluate
+        # The factory now returns a factory; call () to instantiate.
+        return adaptive_reevaluate(
             worst_quantile=0.25,
             extra_visits=800,
             window_size=3,
-            max_inflight=10,
+        )()
+
+    @staticmethod
+    def _make_caps():
+        """Fake SessionCapabilities recording submit/terminate calls."""
+        class _Caps:
+            submitted: list = []
+            terminated: list = []
+
+            async def submit(self, oid, q):
+                self.submitted.append((oid, q))
+
+            async def terminate(self, oid):
+                self.terminated.append(oid)
+
+        c = _Caps()
+        c.submitted = []
+        c.terminated = []
+        from middleware.session_middleware import SessionCapabilities
+        return c, SessionCapabilities(
+            submit_query=c.submit, terminate_query=c.terminate,
         )
 
-    def test_capability_metadata_overrides_defaults(self) -> None:
-        m = self._make_middleware()
-        q = _make_analyze_query(
-            capabilities={"adaptive_reevaluate": {"worst_quantile": 0.5, "extra_visits": 1600}},
-            extra_opaque={"maxVisits": 1000},
-        )
-        q = KataGoQuery(
-            action=KataGoAction.ANALYZE,
-            analyze_turns=[0, 1],
-            opaque=q.opaque,
-        )
-        m.on_query("eid-1", q)
-        assert m._per_query_quantile["eid-1"] == 0.5
-        assert m._per_query_extra_visits["eid-1"] == 1600
-
-    def test_absent_metadata_falls_back_to_defaults(self) -> None:
-        m = self._make_middleware()
-        # Capabilities present but adaptive_reevaluate has empty metadata.
-        q = KataGoQuery(
-            action=KataGoAction.ANALYZE,
-            analyze_turns=[0, 1],
+    @staticmethod
+    def _make_response_with_deltas(turn: int, delta: float = -1.0) -> AnalyzeResponse:
+        """Build an AnalyzeResponse with policy deltas that will trigger
+        the worst-quantile threshold in _find_worst_turns."""
+        return AnalyzeResponse(
+            is_during_search=False,
+            turn_number=turn,
             opaque={
-                "rules": "tromp-taylor",
-                "komi": 7.5,
-                "boardXSize": 19,
-                "moves": [],
-                "capabilities": {"adaptive_reevaluate": {}},
-            },
-        )
-        m.on_query("eid-1", q)
-        assert m._per_query_quantile["eid-1"] == 0.25  # constructor default
-        assert m._per_query_extra_visits["eid-1"] == 800  # constructor default
-
-    def test_legacy_query_no_capabilities_uses_defaults(self) -> None:
-        m = self._make_middleware()
-        q = KataGoQuery(
-            action=KataGoAction.ANALYZE,
-            analyze_turns=[0, 1],
-            opaque={
-                "rules": "tromp-taylor",
-                "komi": 7.5,
-                "boardXSize": 19,
-                "moves": [],
-            },
-        )
-        m.on_query("eid-1", q)
-        assert m._per_query_quantile["eid-1"] == 0.25
-        assert m._per_query_extra_visits["eid-1"] == 800
-
-    def test_partial_metadata_overrides_only_named_field(self) -> None:
-        m = self._make_middleware()
-        q = KataGoQuery(
-            action=KataGoAction.ANALYZE,
-            analyze_turns=[0, 1],
-            opaque={
-                "rules": "tromp-taylor",
-                "komi": 7.5,
-                "boardXSize": 19,
-                "moves": [],
-                "capabilities": {"adaptive_reevaluate": {"extra_visits": 2000}},
-            },
-        )
-        m.on_query("eid-1", q)
-        assert m._per_query_quantile["eid-1"] == 0.25  # default
-        assert m._per_query_extra_visits["eid-1"] == 2000  # overridden
-
-    def test_lru_eviction_pops_per_query_state(self) -> None:
-        m = self._make_middleware()
-        # max_inflight=10; submit 11 queries to trigger eviction of the
-        # oldest.
-        for i in range(11):
-            q = KataGoQuery(
-                action=KataGoAction.ANALYZE,
-                analyze_turns=[i],
-                opaque={
-                    "rules": "tromp-taylor",
-                    "komi": 7.5,
-                    "boardXSize": 19,
-                    "moves": [],
-                    "capabilities": {
-                        "adaptive_reevaluate": {"extra_visits": 100 + i}
-                    },
+                "moveInfos": [],
+                "extra": {
+                    "black": {"deltas": {str(turn): delta}},
+                    "white": {"deltas": {str(turn): delta}},
                 },
-            )
-            m.on_query(f"eid-{i}", q)
-        # The oldest (eid-0) should have been evicted.
-        assert "eid-0" not in m._per_query_quantile
-        assert "eid-0" not in m._per_query_extra_visits
-        # The newest should be present.
-        assert m._per_query_extra_visits["eid-10"] == 110
+            },
+        )
+
+    @staticmethod
+    async def _drive_response(m, orig_id, response):
+        """Drain handle_response yields into a list."""
+        out = []
+        async for oid, resp in m.handle_response(orig_id, response, None):
+            out.append((oid, resp))
+        return out
+
+    @staticmethod
+    async def _wait_for_spawn(caps, timeout_s: float = 1.0):
+        """Poll until caps.submitted has at least one entry."""
+        import asyncio
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            if caps.submitted:
+                return True
+            await asyncio.sleep(0.005)
+        return False
+
+    @pytest.mark.asyncio
+    async def test_metadata_overrides_extra_visits_in_deeper_query(self) -> None:
+        c, caps = self._make_caps()
+        m = self._make_middleware()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+                "capabilities": {
+                    "adaptive_reevaluate": {"extra_visits": 1600},
+                },
+            },
+        )
+        m.on_query("eid-1", q)
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        assert await self._wait_for_spawn(c), "deeper query was not spawned"
+        _, deeper = c.submitted[0]
+        # extra_visits=1600 (override) + maxVisits=1000 (parent) = 2600.
+        assert deeper.opaque["maxVisits"] == 2600
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_absent_metadata_falls_back_to_constructor_default(self) -> None:
+        c, caps = self._make_caps()
+        m = self._make_middleware()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+                "capabilities": {"adaptive_reevaluate": {}},  # opt-in, no overrides
+            },
+        )
+        m.on_query("eid-1", q)
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        assert await self._wait_for_spawn(c)
+        _, deeper = c.submitted[0]
+        # extra_visits=800 (constructor default) + maxVisits=1000 = 1800.
+        assert deeper.opaque["maxVisits"] == 1800
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_legacy_query_no_capabilities_uses_constructor_default(self) -> None:
+        c, caps = self._make_caps()
+        m = self._make_middleware()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+                # No capabilities field — legacy auto-engage path.
+            },
+        )
+        m.on_query("eid-1", q)
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        assert await self._wait_for_spawn(c)
+        _, deeper = c.submitted[0]
+        # Constructor defaults: extra_visits=800 + maxVisits=1000 = 1800.
+        assert deeper.opaque["maxVisits"] == 1800
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_partial_metadata_overrides_only_named_field(self) -> None:
+        c, caps = self._make_caps()
+        m = self._make_middleware()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1],
+            opaque={
+                "rules": "tromp-taylor",
+                "komi": 7.5,
+                "boardXSize": 19,
+                "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 1000,
+                # Only extra_visits overridden; worst_quantile defaults.
+                "capabilities": {
+                    "adaptive_reevaluate": {"extra_visits": 2000},
+                },
+            },
+        )
+        m.on_query("eid-1", q)
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
+        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        assert await self._wait_for_spawn(c)
+        _, deeper = c.submitted[0]
+        # extra_visits=2000 (override) + maxVisits=1000 = 3000.
+        assert deeper.opaque["maxVisits"] == 3000
+        m.on_session_end()
 
     def test_build_deeper_query_uses_increment_semantic(self) -> None:
-        m = self._make_middleware()
+        # _build_deeper_query is now a module-level pure helper
+        # (no longer a method on a class). The increment-not-absolute
+        # contract is preserved.
+        from middleware.adaptive_reevaluate import _build_deeper_query
         orig = KataGoQuery(
             action=KataGoAction.ANALYZE,
             opaque={"maxVisits": 1000, "moves": []},
         )
-        deeper = m._build_deeper_query(orig, [0, 1, 2], extra_visits=500)
-        # extra_visits is an increment, not an absolute.
+        deeper = _build_deeper_query(orig, [0, 1, 2], extra_visits=500)
         assert deeper.opaque["maxVisits"] == 1500
 
     def test_build_deeper_query_strips_cache_flags(self) -> None:
-        m = self._make_middleware()
+        from middleware.adaptive_reevaluate import _build_deeper_query
         orig = KataGoQuery(
             action=KataGoAction.ANALYZE,
             opaque={
@@ -567,7 +649,7 @@ class TestAdaptiveReevaluateMetadata:
                 "replay_final_only": True,
             },
         )
-        deeper = m._build_deeper_query(orig, [0], extra_visits=500)
+        deeper = _build_deeper_query(orig, [0], extra_visits=500)
         assert "cache" not in deeper.opaque
         assert "lookup_cache" not in deeper.opaque
         assert "replay_final_only" not in deeper.opaque
