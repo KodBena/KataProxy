@@ -57,7 +57,7 @@ import websockets
 from sortedcontainers import SortedList
 from websockets.exceptions import ConnectionClosed
 
-from logging_config import filter_dict, get_logger, log_safe
+from logging_config import filter_dict, get_logger, log_safe  # noqa: E402
 logger = get_logger("kataproxy")
 
 from proxy_logging import (
@@ -67,6 +67,8 @@ from proxy_logging import (
     get_proxy_logger,
     lifecycle,
 )
+
+_log = get_proxy_logger(__name__)
 
 
 import sproxy_config as cfg
@@ -310,10 +312,13 @@ class ClientSession:
         # Maps orig_id → (subscriber_internal_id, canonical_id) for cleanup.
         self._active_queries: Dict[str, tuple] = {}
 
-        logger.debug(
-            f"peer={peer} "
-            f"transformer={effective_transformer.name!r} "
-            f"middleware={type(self._middleware).__name__!r}"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"peer={peer} "
+                f"transformer={effective_transformer.name!r} "
+                f"middleware={type(self._middleware).__name__!r}"
+            ),
         )
 
         # Lifecycle hook: middleware sees the capability bundle once,
@@ -336,7 +341,10 @@ class ClientSession:
     # -----------------------------------------------------------------------
 
     async def run(self) -> None:
-        logger.debug(f"peer={self._peer} connection accepted")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=f"peer={self._peer} connection accepted",
+        )
 
         recv_task = asyncio.create_task(
             self._receive_loop(), name=f"recv:{self._peer}"
@@ -350,9 +358,12 @@ class ClientSession:
                 [recv_task, send_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            logger.debug(
-                f"peer={self._peer} "
-                f"one loop finished; cancelling sibling"
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"peer={self._peer} "
+                    f"one loop finished; cancelling sibling"
+                ),
             )
             for task in pending:
                 task.cancel()
@@ -361,7 +372,10 @@ class ClientSession:
                 except asyncio.CancelledError:
                     pass
         except Exception:
-            logger.exception(f"peer={self._peer} unexpected error in run loop")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} unexpected error in run loop",
+            )
         finally:
             await self._cleanup()
 
@@ -370,7 +384,10 @@ class ClientSession:
     # -----------------------------------------------------------------------
 
     async def _receive_loop(self) -> None:
-        logger.info(f"peer={self._peer} started")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=f"peer={self._peer} started",
+        )
         try:
             async for raw_msg in self._ws:
                 # log_safe defends against (a) log injection — a peer
@@ -378,14 +395,21 @@ class ClientSession:
                 # the formatted record — and (b) unbounded log-line growth
                 # for multi-megabyte messages. Default truncation is 256
                 # chars, configurable via PROXY_LOG_TRUNCATE.
-                logger.debug(
-                    f"peer={self._peer} raw={log_safe(raw_msg)}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=f"peer={self._peer} raw={log_safe(raw_msg)}",
                 )
                 await self._handle_incoming(raw_msg)
         except ConnectionClosed as e:
-            logger.info(f"peer={self._peer} closed: {e}")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} closed: {e}",
+            )
         except Exception:
-            logger.exception(f"peer={self._peer} error in receive loop")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} error in receive loop",
+            )
 
     async def _handle_incoming(self, raw_msg: str) -> None:
         # Per-IP rate limit. Off when the limiter is disabled (the default),
@@ -459,11 +483,19 @@ class ClientSession:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
-            logger.error(f"translation error: {e}")
+            self._log.error(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=f"translation error: {e}",
+            )
             return
 
         if env is None:
-            logger.debug(f"transformer suppressed query {orig_id!r}")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=f"transformer suppressed query {orig_id!r}",
+            )
             return
 
         subscriber_internal_id: str = env.id
@@ -487,9 +519,13 @@ class ClientSession:
         # complete event fires from _deliver_upstream and reads back
         # this map.
         self._query_started_at[orig_id] = monotonic()
-        logger.debug(
-            f"orig={orig_id!r} internal={subscriber_internal_id!r} "
-            f"canonical={canonical_id!r} is_new={is_new}"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, orig=orig_id,
+            msg=(
+                f"orig={orig_id!r} internal={subscriber_internal_id!r} "
+                f"canonical={canonical_id!r} is_new={is_new}"
+            ),
         )
 
         if is_new:
@@ -506,9 +542,13 @@ class ClientSession:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
-            logger.warning(
-                f"cannot translate terminateId: {e} "
-                f"(query may have already completed)"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=(
+                    f"cannot translate terminateId: {e} "
+                    f"(query may have already completed)"
+                ),
             )
             return
 
@@ -520,14 +560,22 @@ class ClientSession:
         target_internal_id = translated_query.terminate_id
 
         if target_internal_id is None:
-            logger.error(f"terminate missing terminateId after translation")
+            self._log.error(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg="terminate missing terminateId after translation",
+            )
             return
 
         canonical_id = self._internal_to_canonical(target_internal_id)
         if canonical_id is None:
-            logger.warning(
-                f"no canonical_id for "
-                f"internal={target_internal_id!r}; query may have already completed"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                orig=orig_id,
+                msg=(
+                    f"no canonical_id for "
+                    f"internal={target_internal_id!r}; query may have already completed"
+                ),
             )
             return
 
@@ -563,9 +611,13 @@ class ClientSession:
                 relabelled["id"] = terminate_internal_id
                 if relabelled.get("terminateId") == canonical_id:
                     relabelled["terminateId"] = target_internal_id
-                logger.debug(
-                    f"on_terminate_response "
-                    f"wire_id={wire_id!r} → terminate_internal={terminate_internal_id!r}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id, orig=orig_id,
+                    msg=(
+                        f"on_terminate_response "
+                        f"wire_id={wire_id!r} → terminate_internal={terminate_internal_id!r}"
+                    ),
                 )
                 await send_queue.put(relabelled)
 
@@ -583,9 +635,13 @@ class ClientSession:
                 on_response=on_terminate_response,
                 on_complete=on_terminate_complete,
             )
-            logger.debug(
-                f"canonical={canonical_id!r} "
-                f"dispatched for peer={self._peer}"
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, orig=orig_id,
+                msg=(
+                    f"canonical={canonical_id!r} "
+                    f"dispatched for peer={self._peer}"
+                ),
             )
         else:
             # Other subscribers remain on this canonical. Terminating the
@@ -642,22 +698,37 @@ class ClientSession:
     # -----------------------------------------------------------------------
 
     async def _send_loop(self) -> None:
-        logger.info(f"peer={self._peer} started")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=f"peer={self._peer} started",
+        )
         try:
             while True:
                 wire = await self._send_queue.get()
-                logger.debug(
-                    f"peer={self._peer} "
-                    f"dequeued id={wire.get('id')!r}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=(
+                        f"peer={self._peer} "
+                        f"dequeued id={wire.get('id')!r}"
+                    ),
                 )
                 await self._deliver_upstream(wire)
         except asyncio.CancelledError:
-            logger.debug(f"peer={self._peer} cancelled")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} cancelled",
+            )
             raise
         except ConnectionClosed as e:
-            logger.info(f"peer={self._peer} ws closed: {e}")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} ws closed: {e}",
+            )
         except Exception:
-            logger.exception(f"peer={self._peer} error in send loop")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} error in send loop",
+            )
 
     async def _deliver_upstream(self, wire: dict) -> None:
         """Translate one relabelled response to client namespace and send.
@@ -673,29 +744,41 @@ class ClientSession:
           4. One WebSocket send per (orig_id, response) pair yielded.
         """
         subscriber_internal_id = wire.get("id")
-        logger.debug(
-            f"peer={self._peer} "
-            f"internal_id={subscriber_internal_id!r}"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"peer={self._peer} "
+                f"internal_id={subscriber_internal_id!r}"
+            ),
         )
 
         try:
             _, response = parse_response_from_wire(wire)
         except Exception as e:
-            logger.error(f"parse error: {e}")
+            self._log.error(
+                Event.DIAGNOSTIC,
+                msg=f"parse error: {e}",
+            )
             return
 
         try:
             env = Envelope(id=subscriber_internal_id, payload=response)
             translated_env = self._chain.translate_upstream(env)
         except TranslationError as e:
-            logger.error(
-                f"translate_upstream failed: {e} "
-                f"(already cleaned up, or duplicate delivery?)"
+            self._log.error(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"translate_upstream failed: {e} "
+                    f"(already cleaned up, or duplicate delivery?)"
+                ),
             )
             return
 
         if translated_env is None:
-            logger.debug(f"transformer suppressed response")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg="transformer suppressed response",
+            )
             return
 
         # Capture cid (canonical_id) before the pop below; lifecycle.forward
@@ -747,10 +830,14 @@ class ClientSession:
             ):
                 out_wire = translate_response_to_wire(out_resp, out_id)
                 out_json = json.dumps(out_wire)
-                logger.debug(
-                    f"peer={self._peer} "
-                    f"sending orig_id={out_id!r} "
-                    f"out={json.dumps(filter_dict(out_wire))}"
+                self._log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=parent_cid, orig=out_id,
+                    msg=(
+                        f"peer={self._peer} "
+                        f"sending orig_id={out_id!r} "
+                        f"out={json.dumps(filter_dict(out_wire))}"
+                    ),
                 )
                 # Lifecycle emission: demand-edge timestamp. Kind drives
                 # the level (partial → DEBUG, final/metadata/error → INFO)
@@ -762,16 +849,22 @@ class ClientSession:
                 )
                 await self._ws.send(out_json)
         except Exception:
-            logger.exception(f"peer={self._peer} middleware error in deliver_upstream")
+            self._log.exception(
+                Event.DIAGNOSTIC,
+                msg=f"peer={self._peer} middleware error in deliver_upstream",
+            )
 
     # -----------------------------------------------------------------------
     # Cleanup
     # -----------------------------------------------------------------------
 
     async def _cleanup(self) -> None:
-        logger.debug(
-            f"peer={self._peer} "
-            f"unsubscribing {len(self._active_queries)} active query(ies)"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"peer={self._peer} "
+                f"unsubscribing {len(self._active_queries)} active query(ies)"
+            ),
         )
 
         async def _drop_response(_wid: str, _wire: dict) -> None:
@@ -795,8 +888,10 @@ class ClientSession:
                         on_complete=_drop_complete,
                     )
                 except Exception:
-                    logger.exception(
-                        f"orphan terminate failed: canonical={cid!r}"
+                    self._log.exception(
+                        Event.DIAGNOSTIC,
+                        cid=cid,
+                        msg=f"orphan terminate failed: canonical={cid!r}"
                     )
         self._active_queries.clear()
 
@@ -834,9 +929,12 @@ class RedirectSession:
     async def run(self) -> None:
 
         if not self._urls:
-            logger.info(
-                f"no UPSTREAM_URLS configured; "
-                f"closing {self._peer}"
+            _log.info(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"no UPSTREAM_URLS configured; "
+                    f"closing {self._peer}"
+                ),
             )
             await self._ws.close(1011, "no upstream configured")
             return
@@ -848,7 +946,10 @@ class RedirectSession:
         redirect_msg = json.dumps({
             "proxy_meta": {"type": "redirect", "url": target}
         })
-        logger.info(f"redirecting {self._peer} → {target} (idx={idx})")
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=f"redirecting {self._peer} → {target} (idx={idx})",
+        )
         await self._ws.send(redirect_msg)
         await self._ws.close(1000, "redirect issued")
 
@@ -894,12 +995,18 @@ class ProxyServer:
                 load_metric=InFlightQueryLoad(),
             )
             await self._router.start()
-            logger.info(f"router started for role={role}")
+            _log.info(
+                Event.DIAGNOSTIC,
+                msg=f"router started for role={role}",
+            )
 
-        logger.info(
-            f"listening on ws://{cfg.HOST}:{cfg.PORT} role={role} "
-            f"max_size={cfg.MAX_MESSAGE_SIZE} max_sessions={cfg.MAX_SESSIONS} "
-            f"ratelimit_per_ip={cfg.RATELIMIT_PER_IP}"
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"listening on ws://{cfg.HOST}:{cfg.PORT} role={role} "
+                f"max_size={cfg.MAX_MESSAGE_SIZE} max_sessions={cfg.MAX_SESSIONS} "
+                f"ratelimit_per_ip={cfg.RATELIMIT_PER_IP}"
+            ),
         )
         async with websockets.serve(
             self._handle_connection,
@@ -979,7 +1086,10 @@ class ProxyServer:
     async def stop(self) -> None:
         if self._router is not None:
             await self._router.stop()
-        logger.info(f"done")
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg="done",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1095,18 +1205,24 @@ async def _main() -> None:
     )
     if cfg.ADVERTISE_CAPABILITIES:
         advertised_caps = _build_advertised_capabilities()
-        logger.info(
-            f"advertising capabilities: {sorted(advertised_caps.keys())} "
-            f"(PROXY_ADVERTISE_CAPABILITIES enabled)"
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"advertising capabilities: {sorted(advertised_caps.keys())} "
+                f"(PROXY_ADVERTISE_CAPABILITIES enabled)"
+            ),
         )
         chain = chain.then(capabilities_advertiser(advertised_caps))
     else:
-        logger.info(
-            "PROXY_ADVERTISE_CAPABILITIES is disabled (default); "
-            "query_version responses pass through unchanged. Set "
-            "PROXY_ADVERTISE_CAPABILITIES=true to advertise per-query "
-            "capabilities to capability-aware clients. Per-query gating "
-            "remains active on the proxy side regardless."
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                "PROXY_ADVERTISE_CAPABILITIES is disabled (default); "
+                "query_version responses pass through unchanged. Set "
+                "PROXY_ADVERTISE_CAPABILITIES=true to advertise per-query "
+                "capabilities to capability-aware clients. Per-query gating "
+                "remains active on the proxy side regardless."
+            ),
         )
 
     server = ProxyServer(
@@ -1119,7 +1235,10 @@ async def _main() -> None:
     try:
         await server.start()
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info(f"shutting down")
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg="shutting down",
+        )
     finally:
         await server.stop()
 

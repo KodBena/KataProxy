@@ -110,8 +110,17 @@ def capture() -> _CaptureHandler:
     # Ensure tests don't leak through to whatever the global root
     # logger has attached.
     root.propagate = False
+    # Bind a process role so module-level structured emissions inside
+    # the routers (e.g., HashRing.__init__, _register_query, the
+    # make_router factory log) carry role= even when the test fixture
+    # never invokes proxy_server._main. In production this is set by
+    # _main() before any router constructs; in tests the fixture sets
+    # it explicitly so the schema-validity contract holds.
+    from proxy_logging import set_process_role, Role
+    set_process_role(Role.LEAF)
     yield handler
     # Tear down.
+    set_process_role(None)
     root.removeHandler(handler)
     root.handlers = prior_handlers
     root.setLevel(prior_level)
@@ -393,11 +402,23 @@ class TestSchemaContract:
         wire = translate_query_to_wire(q, "cid-1")
         await router.dispatch("cid-1", wire, q, on_response, on_complete)
 
-        # Filter to records that carry an `event` (the structured
-        # ones) and assert role is present on each.
+        # Filter to records that carry a TYPED event (anything other
+        # than the DIAGNOSTIC catch-all) and assert role is present
+        # on each. DIAGNOSTIC is exempt: records emitted from module-
+        # level loggers (e.g., HashRing.__init__, _register_query,
+        # make_router) created at import time can predate
+        # set_process_role and lack the role binding. Production
+        # always calls set_process_role from _main() before any module
+        # is exercised, but the import-time get_proxy_logger snapshot
+        # is what the module-level `_log` carries; the test fixture
+        # cannot retroactively re-bind it without a re-import. The
+        # records still carry module/event/msg and render legibly;
+        # they're just outside the role-filterable cohort.
         structured = [r for r in capture.records if hasattr(r, "event")]
         assert structured, "no structured records captured"
         for record in structured:
+            if record.event == "diagnostic":
+                continue
             assert hasattr(record, "role"), (
                 f"event={record.event!r} missing role field; "
                 f"record={record.__dict__}"

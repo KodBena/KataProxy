@@ -63,6 +63,7 @@ from proxy_logging import (
 )
 
 logger = logging.getLogger("kataproxy.router")
+_log = get_proxy_logger(__name__)
 
 __all__ = [
     "WireDict",
@@ -144,9 +145,12 @@ def _register_query(
         tracker.register(qid, query.analyze_turns)
     else:
         tracker.register_count(qid, 1)
-    logger.debug(
-        f"qid={qid} action={query.action.name} "
-        f"turns={query.analyze_turns}"
+    _log.debug(
+        Event.DIAGNOSTIC,
+        msg=(
+            f"qid={qid} action={query.action.name} "
+            f"turns={query.analyze_turns}"
+        ),
     )
 
 
@@ -186,12 +190,20 @@ class InFlightQueryLoad(LoadMetric):
     def on_query_sent(self, url: str, canonical_id: str) -> None:
         self._counts[url] = self._counts.get(url, 0) + 1
         self._assignments[canonical_id] = url
-        logger.info(f"url={url} load={self._counts[url]}")
+        _log.info(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, upstream=url,
+            msg=f"url={url} load={self._counts[url]}",
+        )
 
     def on_query_complete(self, url: str, canonical_id: str) -> None:
         self._counts[url] = max(0, self._counts.get(url, 0) - 1)
         self._assignments.pop(canonical_id, None)
-        logger.info(f"url={url} load={self._counts[url]}")
+        _log.info(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, upstream=url,
+            msg=f"url={url} load={self._counts[url]}",
+        )
 
     def current_load(self, url: str) -> int:
         return self._counts.get(url, 0)
@@ -231,9 +243,12 @@ class HashRing:
             if node not in seen:
                 seen.add(node)
                 self._unique_nodes.append(node)
-        logger.info(
-            f"{len(self._unique_nodes)} node(s) × {replicas} replicas "
-            f"= {len(self._ring)} ring entries"
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"{len(self._unique_nodes)} node(s) × {replicas} replicas "
+                f"= {len(self._ring)} ring entries"
+            ),
         )
 
     def ordered_nodes_for(self, key: str) -> list[str]:
@@ -455,7 +470,10 @@ class LeafRouter(BackendRouter):
         bound to a specific Process object, so it must be replaced on
         every spawn.
         """
-        logger.info(f"launching: {self._cmd}")
+        self._kg_log.info(
+            Event.DIAGNOSTIC,
+            msg=f"launching: {self._cmd}",
+        )
         self._proc = await asyncio.create_subprocess_exec(
             *self._cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -509,11 +527,17 @@ class LeafRouter(BackendRouter):
                 if not line:
                     continue
                 self._stderr_tail.append(line)
-                logger.warning(f"katago[pid={proc.pid}]: {line}")
+                self._kg_log.warning(
+                    Event.DIAGNOSTIC,
+                    msg=f"katago[pid={proc.pid}]: {line}",
+                )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"stderr drainer for pid={proc.pid}: {e}")
+            self._kg_log.error(
+                Event.DIAGNOSTIC,
+                msg=f"stderr drainer for pid={proc.pid}: {e}",
+            )
 
     async def _await_startup_or_fail(self) -> None:
         """Send a probe and race against proc-exit and timeout.
@@ -650,7 +674,10 @@ class LeafRouter(BackendRouter):
         """Continuously read KataGo stdout; dispatch responses by canonical_id."""
         while self._running:
             if self._proc is None or self._proc.stdout is None:
-                logger.warning("no proc/stdout; waiting before retry")
+                self._kg_log.warning(
+                    Event.DIAGNOSTIC,
+                    msg="no proc/stdout; waiting before retry",
+                )
                 await asyncio.sleep(self._RESTART_DELAY_S)
                 continue
 
@@ -658,7 +685,10 @@ class LeafRouter(BackendRouter):
                 raw = await self._proc.stdout.readline()
             except asyncio.LimitOverrunError as e:
                 # Line exceeded reader buffer — log and discard, do NOT restart.
-                logger.debug(f"line too long ({e.consumed} bytes); discarding")
+                self._kg_log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=f"line too long ({e.consumed} bytes); discarding",
+                )
                 # Drain the remainder of the overlong line before continuing.
                 try:
                     await self._proc.stdout.readuntil(b"\n")
@@ -666,7 +696,10 @@ class LeafRouter(BackendRouter):
                     pass
                 continue
             except Exception as e:
-                logger.error(f"read error: {e}")
+                self._kg_log.error(
+                    Event.DIAGNOSTIC,
+                    msg=f"read error: {e}",
+                )
                 raw = b""
 
             if not raw:
@@ -679,17 +712,29 @@ class LeafRouter(BackendRouter):
             try:
                 wire: WireDict = loads_bounded(line, max_depth=cfg.JSON_MAX_DEPTH)
             except JsonDepthExceededError as e:
-                logger.error(f"refused depth-bombed line from KataGo: {e}")
+                self._kg_log.error(
+                    Event.DIAGNOSTIC,
+                    msg=f"refused depth-bombed line from KataGo: {e}",
+                )
                 continue
             except json.JSONDecodeError as e:
-                logger.error(f"JSON error: {e}  raw={log_safe(line)}")
+                self._kg_log.error(
+                    Event.DIAGNOSTIC,
+                    msg=f"JSON error: {e}  raw={log_safe(line)}",
+                )
                 continue
 
-            logger.debug(f"stdout: {json.dumps(filter_dict(wire))}")
+            self._kg_log.debug(
+                Event.DIAGNOSTIC,
+                msg=f"stdout: {json.dumps(filter_dict(wire))}",
+            )
 
             canonical_id = wire.get("id")
             if canonical_id is None:
-                logger.warning("response missing 'id', skipping")
+                self._kg_log.warning(
+                    Event.DIAGNOSTIC,
+                    msg="response missing 'id', skipping",
+                )
                 continue
 
             # Startup-probe short-circuit. Any response on the probe id
@@ -703,22 +748,34 @@ class LeafRouter(BackendRouter):
 
             cbs = self._callbacks.get(canonical_id)
             if cbs is None:
-                logger.info(f"no callback for canonical_id={canonical_id!r}")
+                self._kg_log.info(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=f"no callback for canonical_id={canonical_id!r}",
+                )
                 continue
             on_response, on_complete = cbs
 
             try:
                 _, response = parse_response_from_wire(wire)
             except Exception as e:
-                logger.error(f"parse error: {e}  wire={wire}")
+                self._kg_log.error(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=f"parse error: {e}  wire={wire}",
+                )
                 continue
 
             disc, is_partial = response_completion_signal(response)
             sig = self._tracker.signal(canonical_id, disc, is_partial)
-            logger.info(
-                f"canonical_id={canonical_id} "
-                f"turn={disc} during_search={is_partial} "
-                f"sig={sig.name}"
+            self._kg_log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"canonical_id={canonical_id} "
+                    f"turn={disc} during_search={is_partial} "
+                    f"sig={sig.name}"
+                ),
             )
 
             await on_response(canonical_id, wire)
@@ -743,9 +800,12 @@ class LeafRouter(BackendRouter):
             On respawn failure, transition to unhealthy and exit.
         """
         if not self._healthy:
-            logger.info(
-                "KataGo stdout EOF before startup gate cleared; "
-                "reader exiting (gate will raise)"
+            self._kg_log.info(
+                Event.DIAGNOSTIC,
+                msg=(
+                    "KataGo stdout EOF before startup gate cleared; "
+                    "reader exiting (gate will raise)"
+                ),
             )
             return False
         if not self._running:
@@ -823,9 +883,13 @@ class LeafRouter(BackendRouter):
                 await on_response(canonical_id, error_wire)
                 await on_complete(canonical_id)
             except Exception as e:
-                logger.error(
-                    f"failed to deliver engine-dead notice for "
-                    f"{canonical_id!r}: {e}"
+                self._kg_log.error(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=(
+                        f"failed to deliver engine-dead notice for "
+                        f"{canonical_id!r}: {e}"
+                    ),
                 )
 
     # -----------------------------------------------------------------------
@@ -886,8 +950,10 @@ class LeafRouter(BackendRouter):
         except (BrokenPipeError, ConnectionResetError) as e:
             # Lost the engine between the health check and the write.
             # Roll back local state and notify the caller loudly.
-            logger.error(
-                f"KataGo stdin write failed for {canonical_id!r}: {e}"
+            self._kg_log.error(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=f"KataGo stdin write failed for {canonical_id!r}: {e}",
             )
             self._tracker.cancel(canonical_id)
             self._callbacks.pop(canonical_id, None)
@@ -898,7 +964,11 @@ class LeafRouter(BackendRouter):
             await on_response(canonical_id, error_wire)
             await on_complete(canonical_id)
             return
-        logger.debug(f"wrote to stdin: {line}")
+        self._kg_log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=f"wrote to stdin: {line}",
+        )
 
     async def terminate(
         self,
@@ -906,7 +976,11 @@ class LeafRouter(BackendRouter):
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
-        logger.debug(f"canonical_id={canonical_id}")
+        self._kg_log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=f"canonical_id={canonical_id}",
+        )
         # Cancel the analyze query's tracking state and remove its callback.
         self._tracker.cancel(canonical_id)
         self._callbacks.pop(canonical_id, None)
@@ -926,9 +1000,13 @@ class LeafRouter(BackendRouter):
             or self._proc is None
             or self._proc.stdin is None
         ):
-            logger.warning(
-                f"KataGo unavailable (healthy={self._healthy}); "
-                f"synthesising terminate ack for {canonical_id!r}"
+            self._kg_log.warning(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"KataGo unavailable (healthy={self._healthy}); "
+                    f"synthesising terminate ack for {canonical_id!r}"
+                ),
             )
             await _send_synthetic_ack()
             return
@@ -949,21 +1027,32 @@ class LeafRouter(BackendRouter):
             self._proc.stdin.write((json.dumps(term_wire) + "\n").encode())
             await self._proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as e:
-            logger.warning(
-                f"KataGo stdin write failed for terminate of "
-                f"{canonical_id!r}: {e}"
+            self._kg_log.warning(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"KataGo stdin write failed for terminate of "
+                    f"{canonical_id!r}: {e}"
+                ),
             )
             self._tracker.cancel(term_wire_id)
             self._callbacks.pop(term_wire_id, None)
             await _send_synthetic_ack()
             return
-        logger.debug(f"sent {term_wire}")
+        self._kg_log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=f"sent {term_wire}",
+        )
 
     async def stop(self) -> None:
         self._running = False
         self._healthy = False
         await self._teardown_subprocess()
-        logger.info("done")
+        self._kg_log.info(
+            Event.DIAGNOSTIC,
+            msg="done",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +1127,10 @@ class RelayRouter(BackendRouter):
         self._callbacks: dict[str, tuple[OnResponse, OnComplete, str]] = {}
 
     async def start(self) -> None:
-        logger.info(f"connecting to {len(self._urls)} upstream(s)")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=f"connecting to {len(self._urls)} upstream(s)",
+        )
         await asyncio.gather(
             *(self._connect(url) for url in self._urls),
             return_exceptions=True,
@@ -1046,7 +1138,11 @@ class RelayRouter(BackendRouter):
 
     async def _connect(self, url: str) -> None:
         import websockets
-        logger.info(f"→ {url}")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            upstream=url,
+            msg=f"→ {url}",
+        )
         try:
             ws = await websockets.connect(url, max_size=_WS_MAX_SIZE)
             self._connections[url] = ws
@@ -1077,11 +1173,16 @@ class RelayRouter(BackendRouter):
                 await self._connect(url)
                 return
             except Exception as e:
-                logger.error(f"still failing {url}: {e}")
+                self._log.error(
+                    Event.DIAGNOSTIC,
+                    upstream=url,
+                    msg=f"still failing {url}: {e}",
+                )
                 delay = min(delay * 2.0, 60.0)
 
     async def _read_loop(self, url: str, ws: Any) -> None:
         """Read responses from one upstream; dispatch callbacks by canonical_id."""
+        upstream_log = self._log.bind(upstream=url)
         try:
             async for raw_msg in ws:
                 # Log the raw message via log_safe rather than re-parsing —
@@ -1089,45 +1190,72 @@ class RelayRouter(BackendRouter):
                 # message AND the (theoretical) RecursionError that would
                 # have fired here for a depth-bombed payload before the
                 # depth-bound check below could refuse it.
-                logger.debug(f"url={url} raw={log_safe(raw_msg)}")
+                upstream_log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=f"url={url} raw={log_safe(raw_msg)}",
+                )
                 try:
                     wire: WireDict = loads_bounded(raw_msg, max_depth=cfg.JSON_MAX_DEPTH)
                 except JsonDepthExceededError as e:
-                    logger.error(f"refused depth-bombed message from {url}: {e}")
+                    upstream_log.error(
+                        Event.DIAGNOSTIC,
+                        msg=f"refused depth-bombed message from {url}: {e}",
+                    )
                     continue
                 except json.JSONDecodeError as e:
-                    logger.error(f"JSON error from {url}: {e}")
+                    upstream_log.error(
+                        Event.DIAGNOSTIC,
+                        msg=f"JSON error from {url}: {e}",
+                    )
                     continue
 
                 # Upstream may send proxy_meta (e.g., another redirect).
                 # Log and ignore — relaying redirects is not supported.
                 if "proxy_meta" in wire:
-                    logger.info(f"proxy_meta from upstream {url}: {wire['proxy_meta']}")
+                    upstream_log.info(
+                        Event.DIAGNOSTIC,
+                        msg=f"proxy_meta from upstream {url}: {wire['proxy_meta']}",
+                    )
                     continue
 
                 canonical_id = wire.get("id")
                 if canonical_id is None:
-                    logger.warning(f"response missing 'id' from {url}")
+                    upstream_log.warning(
+                        Event.DIAGNOSTIC,
+                        msg=f"response missing 'id' from {url}",
+                    )
                     continue
 
                 cb = self._callbacks.get(canonical_id)
                 if cb is None:
-                    logger.warning(f"no callback for {canonical_id!r}")
+                    upstream_log.warning(
+                        Event.DIAGNOSTIC,
+                        cid=canonical_id,
+                        msg=f"no callback for {canonical_id!r}",
+                    )
                     continue
                 on_response, on_complete, assigned_url = cb
 
                 try:
                     _, response = parse_response_from_wire(wire)
                 except Exception as e:
-                    logger.error(f"parse error: {e}")
+                    upstream_log.error(
+                        Event.DIAGNOSTIC,
+                        cid=canonical_id,
+                        msg=f"parse error: {e}",
+                    )
                     continue
 
                 disc, is_partial = response_completion_signal(response)
                 sig = self._tracker.signal(canonical_id, disc, is_partial)
-                logger.debug(
-                    f"canonical_id={canonical_id} "
-                    f"turn={disc} during={is_partial} "
-                    f"sig={sig.name}"
+                upstream_log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=(
+                        f"canonical_id={canonical_id} "
+                        f"turn={disc} during={is_partial} "
+                        f"sig={sig.name}"
+                    ),
                 )
 
                 await on_response(canonical_id, wire)
@@ -1160,7 +1288,11 @@ class RelayRouter(BackendRouter):
 
     def _schedule_reconnect(self, url: str) -> None:
         """Spawn a reconnect-with-backoff task and track it for cancellation."""
-        logger.info(f"scheduling reconnect for {url}")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            upstream=url,
+            msg=f"scheduling reconnect for {url}",
+        )
         task = asyncio.create_task(
             self._reconnect_with_backoff(url),
             name=f"relay-reconnect:{url}",
@@ -1173,22 +1305,38 @@ class RelayRouter(BackendRouter):
     def _select_upstream(self, canonical_id: str) -> Optional[str]:
         """Walk the ring in preference order; return first under max_load."""
         candidates = self._ring.ordered_nodes_for(canonical_id)
-        logger.info(f"candidates for {canonical_id}: {candidates}")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=f"candidates for {canonical_id}: {candidates}",
+        )
 
         connected = [u for u in candidates if u in self._connections]
         if not connected:
-            logger.info("no connected upstreams")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg="no connected upstreams",
+            )
             return None
 
         for url in connected:
             load = self._load_metric.current_load(url)
-            logger.info(f"{url} load={load} max={self._max_load}")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, upstream=url,
+                msg=f"{url} load={load} max={self._max_load}",
+            )
             if load < self._max_load:
                 return url
 
         # All over limit — use least-loaded to avoid complete stall.
         best = min(connected, key=lambda u: self._load_metric.current_load(u))
-        logger.info(f"all over max_load; using least-loaded {best}")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, upstream=best,
+            msg=f"all over max_load; using least-loaded {best}",
+        )
         return best
 
     async def dispatch(
@@ -1230,7 +1378,11 @@ class RelayRouter(BackendRouter):
         self._load_metric.on_query_sent(url, canonical_id)
         ws = self._connections[url]
         await ws.send(json.dumps(wire_dict))
-        logger.debug(f"sent: {json.dumps(wire_dict)}")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, upstream=url,
+            msg=f"sent: {json.dumps(wire_dict)}",
+        )
 
     async def _broadcast(
         self,
@@ -1358,7 +1510,11 @@ class RelayRouter(BackendRouter):
             await on_complete(term_wire_id)
 
         if cb is None:
-            logger.info(f"no in-flight entry for {canonical_id!r}")
+            self._log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=f"no in-flight entry for {canonical_id!r}",
+            )
             await _send_synthetic_ack()
             return
 
@@ -1368,7 +1524,11 @@ class RelayRouter(BackendRouter):
 
         ws = self._connections.get(url)
         if ws is None:
-            logger.warning(f"upstream {url} disconnected; cannot send terminate")
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, upstream=url,
+                msg=f"upstream {url} disconnected; cannot send terminate",
+            )
             await _send_synthetic_ack()
             return
 
@@ -1382,7 +1542,11 @@ class RelayRouter(BackendRouter):
         self._tracker.register_count(term_wire_id, 1)
         self._callbacks[term_wire_id] = (on_response, on_complete, url)
 
-        logger.debug(f"→ {url}: {term_wire}")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, upstream=url,
+            msg=f"→ {url}: {term_wire}",
+        )
         await ws.send(json.dumps(term_wire))
 
     async def stop(self) -> None:
@@ -1398,7 +1562,10 @@ class RelayRouter(BackendRouter):
                 await ws.close()
             except Exception:
                 pass
-        logger.info("done")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg="done",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1558,8 +1725,9 @@ class SelectorRouter(BackendRouter):
             self._failure_budget[label] = self._max_connect_failures
 
         labels = list(self._url_for_label.keys())
-        logger.info(
-            f"connecting to {len(labels)} labelled upstream(s): {labels}"
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=f"connecting to {len(labels)} labelled upstream(s): {labels}",
         )
         await asyncio.gather(
             *(self._connect(label) for label in labels),
@@ -1579,9 +1747,12 @@ class SelectorRouter(BackendRouter):
                 healthy.append(label)
             else:
                 retrying.append(label)
-        logger.info(
-            f"SELECTOR ready: healthy={healthy} "
-            f"reconnecting={retrying} unhealthy={unhealthy}"
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"SELECTOR ready: healthy={healthy} "
+                f"reconnecting={retrying} unhealthy={unhealthy}"
+            ),
         )
 
     async def _connect(self, label: str) -> None:
@@ -1594,7 +1765,11 @@ class SelectorRouter(BackendRouter):
         """
         import websockets
         url = self._url_for_label[label]
-        logger.info(f"label={label!r} → {url}")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            label=label, upstream=url,
+            msg=f"label={label!r} → {url}",
+        )
         try:
             ws = await websockets.connect(url, max_size=_WS_MAX_SIZE)
         except Exception as e:
@@ -1621,7 +1796,11 @@ class SelectorRouter(BackendRouter):
         """
         if label in self._unhealthy_models:
             return
-        logger.info(f"scheduling reconnect for label={label!r}")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            label=label,
+            msg=f"scheduling reconnect for label={label!r}",
+        )
         task = asyncio.create_task(
             self._reconnect_with_backoff(label),
             name=f"selector-reconnect:{label}",
@@ -1671,10 +1850,14 @@ class SelectorRouter(BackendRouter):
                     )
                     self._unhealthy_models.add(label)
                     return
-                logger.warning(
-                    f"reconnect still failing for label={label!r}: {e}; "
-                    f"reconnect attempts remaining: "
-                    f"{self._failure_budget[label]}"
+                self._log.warning(
+                    Event.DIAGNOSTIC,
+                    label=label,
+                    msg=(
+                        f"reconnect still failing for label={label!r}: {e}; "
+                        f"reconnect attempts remaining: "
+                        f"{self._failure_budget[label]}"
+                    ),
                 )
                 delay = min(delay * 2.0, self._RECONNECT_MAX_DELAY_S)
                 continue
@@ -1699,39 +1882,51 @@ class SelectorRouter(BackendRouter):
         URL. On connection loss, the finally block schedules a
         reconnect (subject to the budget).
         """
+        label_log = self._log.bind(label=label)
         try:
             async for raw_msg in ws:
-                logger.debug(f"label={label!r} raw={log_safe(raw_msg)}")
+                label_log.debug(
+                    Event.DIAGNOSTIC,
+                    msg=f"label={label!r} raw={log_safe(raw_msg)}",
+                )
                 try:
                     wire: WireDict = loads_bounded(
                         raw_msg, max_depth=cfg.JSON_MAX_DEPTH
                     )
                 except JsonDepthExceededError as e:
-                    logger.error(
-                        f"refused depth-bombed message from label={label!r}: {e}"
+                    label_log.error(
+                        Event.DIAGNOSTIC,
+                        msg=f"refused depth-bombed message from label={label!r}: {e}",
                     )
                     continue
                 except json.JSONDecodeError as e:
-                    logger.error(f"JSON error from label={label!r}: {e}")
+                    label_log.error(
+                        Event.DIAGNOSTIC,
+                        msg=f"JSON error from label={label!r}: {e}",
+                    )
                     continue
 
                 if "proxy_meta" in wire:
-                    logger.info(
-                        f"proxy_meta from label={label!r}: {wire['proxy_meta']}"
+                    label_log.info(
+                        Event.DIAGNOSTIC,
+                        msg=f"proxy_meta from label={label!r}: {wire['proxy_meta']}",
                     )
                     continue
 
                 canonical_id = wire.get("id")
                 if canonical_id is None:
-                    logger.warning(
-                        f"response missing 'id' from label={label!r}"
+                    label_log.warning(
+                        Event.DIAGNOSTIC,
+                        msg=f"response missing 'id' from label={label!r}",
                     )
                     continue
 
                 cb = self._callbacks.get(canonical_id)
                 if cb is None:
-                    logger.info(
-                        f"no callback for {canonical_id!r} (already cleaned up?)"
+                    label_log.info(
+                        Event.DIAGNOSTIC,
+                        cid=canonical_id,
+                        msg=f"no callback for {canonical_id!r} (already cleaned up?)",
                     )
                     continue
                 on_response, on_complete, _assigned_label = cb
@@ -1739,14 +1934,22 @@ class SelectorRouter(BackendRouter):
                 try:
                     _, response = parse_response_from_wire(wire)
                 except Exception as e:
-                    logger.error(f"parse error from label={label!r}: {e}")
+                    label_log.error(
+                        Event.DIAGNOSTIC,
+                        cid=canonical_id,
+                        msg=f"parse error from label={label!r}: {e}",
+                    )
                     continue
 
                 disc, is_partial = response_completion_signal(response)
                 sig = self._tracker.signal(canonical_id, disc, is_partial)
-                logger.debug(
-                    f"canonical_id={canonical_id} "
-                    f"turn={disc} during={is_partial} sig={sig.name}"
+                label_log.debug(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=(
+                        f"canonical_id={canonical_id} "
+                        f"turn={disc} during={is_partial} sig={sig.name}"
+                    ),
                 )
 
                 await on_response(canonical_id, wire)
@@ -1837,8 +2040,10 @@ class SelectorRouter(BackendRouter):
         on_complete: OnComplete,
     ) -> None:
         action = query.action
-        logger.debug(
-            f"canonical_id={canonical_id} action={action.name}"
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=f"canonical_id={canonical_id} action={action.name}",
         )
 
         # QUERY_MODELS: synthesise the union of configured labels.
@@ -1867,9 +2072,13 @@ class SelectorRouter(BackendRouter):
         if action == KataGoAction.ANALYZE:
             requested = query.opaque.get("model")
             if requested is None:
-                logger.warning(
-                    f"ANALYZE without `model` field; failing loudly "
-                    f"({canonical_id})"
+                self._log.warning(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=(
+                        f"ANALYZE without `model` field; failing loudly "
+                        f"({canonical_id})"
+                    ),
                 )
                 await self._send_structured_error(
                     canonical_id,
@@ -1885,9 +2094,13 @@ class SelectorRouter(BackendRouter):
                     requested=requested,
                     available=available,
                 )
-                logger.warning(
-                    f"unknown model {requested!r} ({canonical_id}); "
-                    f"available: {available}"
+                self._log.warning(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id,
+                    msg=(
+                        f"unknown model {requested!r} ({canonical_id}); "
+                        f"available: {available}"
+                    ),
                 )
                 await self._send_structured_error(
                     canonical_id,
@@ -1901,9 +2114,13 @@ class SelectorRouter(BackendRouter):
                 err = self._UNHEALTHY_MODEL_ERROR_TEMPLATE.format(
                     label=requested
                 )
-                logger.warning(
-                    f"model {requested!r} unhealthy; failing loudly "
-                    f"({canonical_id})"
+                self._log.warning(
+                    Event.DIAGNOSTIC,
+                    cid=canonical_id, label=requested,
+                    msg=(
+                        f"model {requested!r} unhealthy; failing loudly "
+                        f"({canonical_id})"
+                    ),
                 )
                 await self._send_structured_error(
                     canonical_id, err, on_response, on_complete,
@@ -1935,10 +2152,14 @@ class SelectorRouter(BackendRouter):
         # TERMINATE is dispatched via the dedicated terminate() method,
         # not via dispatch(); landing here is a misuse upstream of
         # SELECTOR. Fail loudly so the misroute is visible.
-        logger.error(
-            f"unexpected action {action.name} in dispatch() "
-            f"({canonical_id}); SELECTOR routes terminate via the "
-            f"dedicated terminate() method"
+        self._log.error(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=(
+                f"unexpected action {action.name} in dispatch() "
+                f"({canonical_id}); SELECTOR routes terminate via the "
+                f"dedicated terminate() method"
+            ),
         )
         await self._send_structured_error(
             canonical_id,
@@ -1997,8 +2218,10 @@ class SelectorRouter(BackendRouter):
         try:
             await ws.send(json.dumps(wire_dict))
         except Exception as e:
-            logger.error(
-                f"send failed for label={label!r} ({canonical_id}): {e}"
+            self._log.error(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, label=label,
+                msg=f"send failed for label={label!r} ({canonical_id}): {e}",
             )
             self._tracker.cancel(canonical_id)
             self._callbacks.pop(canonical_id, None)
@@ -2010,7 +2233,11 @@ class SelectorRouter(BackendRouter):
                 field="model",
             )
             return
-        logger.debug(f"sent to label={label!r}: {json.dumps(wire_dict)}")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, label=label,
+            msg=f"sent to label={label!r}: {json.dumps(wire_dict)}",
+        )
 
     async def _broadcast(
         self,
@@ -2165,9 +2392,13 @@ class SelectorRouter(BackendRouter):
             await on_complete(term_wire_id)
 
         if cb is None:
-            logger.info(
-                f"no in-flight entry for {canonical_id!r}; "
-                f"synthesising terminate ack"
+            self._log.info(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"no in-flight entry for {canonical_id!r}; "
+                    f"synthesising terminate ack"
+                ),
             )
             await _send_synthetic_ack()
             return
@@ -2177,9 +2408,13 @@ class SelectorRouter(BackendRouter):
 
         ws = self._connections.get(label)
         if ws is None:
-            logger.warning(
-                f"label={label!r} disconnected; cannot send terminate "
-                f"for {canonical_id!r}; synthesising ack"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, label=label,
+                msg=(
+                    f"label={label!r} disconnected; cannot send terminate "
+                    f"for {canonical_id!r}; synthesising ack"
+                ),
             )
             await _send_synthetic_ack()
             return
@@ -2197,15 +2432,23 @@ class SelectorRouter(BackendRouter):
         try:
             await ws.send(json.dumps(term_wire))
         except Exception as e:
-            logger.warning(
-                f"send-terminate failed for label={label!r} "
-                f"({canonical_id!r}): {e}"
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                cid=canonical_id, label=label,
+                msg=(
+                    f"send-terminate failed for label={label!r} "
+                    f"({canonical_id!r}): {e}"
+                ),
             )
             self._tracker.cancel(term_wire_id)
             self._callbacks.pop(term_wire_id, None)
             await _send_synthetic_ack()
             return
-        logger.debug(f"→ label={label!r}: {term_wire}")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id, label=label,
+            msg=f"→ label={label!r}: {term_wire}",
+        )
 
     async def stop(self) -> None:
         """Cancel reader/reconnect tasks and close all upstream connections."""
@@ -2218,7 +2461,10 @@ class SelectorRouter(BackendRouter):
                 await ws.close()
             except Exception:
                 pass
-        logger.info("done")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg="done",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2237,7 +2483,10 @@ class EchoRouter(BackendRouter):
         self._log = get_proxy_logger("kataproxy.router").bind(role=Role.ECHO)
 
     async def start(self) -> None:
-        logger.info("echo mode active")
+        self._log.info(
+            Event.DIAGNOSTIC,
+            msg="echo mode active",
+        )
 
     async def dispatch(
         self,
@@ -2260,7 +2509,11 @@ class EchoRouter(BackendRouter):
                 "moveInfos": [],
                 "rootInfo": {"scoreLead": 0.0, "visits": 1},
             }
-            logger.debug(f"emitting synthetic response turn={turn}")
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=f"emitting synthetic response turn={turn}",
+            )
             await on_response(canonical_id, synthetic)
         await on_complete(canonical_id)
 
@@ -2276,7 +2529,11 @@ class EchoRouter(BackendRouter):
             "turnNumber": 0,
             "action": "terminate",
         }
-        logger.debug(f"synthetic ack for canonical_id={canonical_id}")
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=canonical_id,
+            msg=f"synthetic ack for canonical_id={canonical_id}",
+        )
         await on_response(canonical_id, synthetic)
         await on_complete(canonical_id)
 
@@ -2295,7 +2552,10 @@ def make_router(
 ) -> BackendRouter:
     """Construct the appropriate BackendRouter for the given ROLE."""
     role_upper = role.upper()
-    logger.info(f"role={role_upper} upstream_urls={upstream_urls}")
+    _log.info(
+        Event.DIAGNOSTIC,
+        msg=f"role={role_upper} upstream_urls={upstream_urls}",
+    )
 
     if role_upper == "LEAF":
         return LeafRouter(
