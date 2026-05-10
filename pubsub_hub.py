@@ -68,6 +68,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
+from proxy_logging import Event, lifecycle
+
 from katago import KataGoAction, KataGoQuery
 
 logger = logging.getLogger("kataproxy." + __name__)
@@ -397,20 +399,32 @@ class PubSubHub:
         query: KataGoQuery,
         subscriber_internal_id: str,
         subscriber_queue: asyncio.Queue[WireDict],
+        proxy_log: Optional[Any] = None,
+        orig_id: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Register a subscriber for this query.
 
         Returns (is_new_query, canonical_id).
 
         is_new_query=True  → caller must dispatch the query to the backend
-                             using canonical_id.
+                             using canonical_id. Emits SUBSCRIBE event
+                             when proxy_log is supplied.
         is_new_query=False → an identical backend query is already in flight
-                             OR a cache replay was started.
-                             Caller should NOT send anything to the backend.
+                             (emits COALESCE) OR a cache replay was
+                             started (emits CACHE_HIT). Caller should
+                             NOT send anything to the backend.
 
         Action queries bypass coalescing unconditionally.
         Cache-control flags are stripped before hashing so they never affect
         coalescing semantics.
+
+        ``proxy_log`` and ``orig_id`` are the structured-logging
+        adapter and the client's orig_id. When supplied (the
+        production path from ClientSession._handle_query), the hub
+        emits the discriminated subscribe / coalesce / cache_hit
+        event with the right cid + orig + action attached. None is
+        accepted for callers / tests that don't care about
+        structured emission; the hub stays silent in that case.
         """
         # -------------------------------------------------------------------
         # 1. Extract + strip client cache flags (must happen before any hash)
@@ -468,11 +482,18 @@ class PubSubHub:
         if lookup_cache_flag and query.action == KataGoAction.ANALYZE:
             cached_record = self._get_record(cache_key)
             if cached_record is not None:
-                logger.debug(
-                    f"CACHE HIT (analysis-level) for {subscriber_internal_id!r} "
-                    f"key={cache_key[:24]}"
-                )
                 dummy_canonical_id = f"replay_{secrets.token_hex(8)}"
+                if proxy_log is not None and orig_id is not None:
+                    lifecycle.cache_hit(
+                        proxy_log,
+                        cid=dummy_canonical_id, orig=orig_id,
+                        action=query.action.name, cache_key=cache_key,
+                    )
+                else:
+                    logger.debug(
+                        f"CACHE HIT (analysis-level) for {subscriber_internal_id!r} "
+                        f"key={cache_key[:24]}"
+                    )
                 asyncio.create_task(
                     self._replay_task(
                         subscriber_internal_id=subscriber_internal_id,
@@ -494,11 +515,19 @@ class PubSubHub:
         if content_hash in self._by_hash:
             entry = self._by_hash[content_hash]
             entry.subscribers.append(sub)
-            logger.debug(
-                f"COALESCED {subscriber_internal_id!r} "
-                f"onto canonical={entry.canonical_id!r} "
-                f"(now {len(entry.subscribers)} subscriber(s))"
-            )
+            if proxy_log is not None and orig_id is not None:
+                lifecycle.coalesce(
+                    proxy_log,
+                    cid=entry.canonical_id, orig=orig_id,
+                    action=query.action.name,
+                    subscriber_count=len(entry.subscribers),
+                )
+            else:
+                logger.debug(
+                    f"COALESCED {subscriber_internal_id!r} "
+                    f"onto canonical={entry.canonical_id!r} "
+                    f"(now {len(entry.subscribers)} subscriber(s))"
+                )
             return False, entry.canonical_id
 
         # New slot – record whether THIS run should be cached
@@ -512,10 +541,17 @@ class PubSubHub:
         )
         self._by_hash[content_hash] = entry
         self._by_canonical[canonical_id] = entry
-        logger.debug(
-            f"NEW slot canonical={canonical_id!r} "
-            f"hash={content_hash[:24]} cache_key={cache_key[:24]} for {subscriber_internal_id!r}"
-        )
+        if proxy_log is not None and orig_id is not None:
+            lifecycle.subscribe(
+                proxy_log,
+                cid=canonical_id, orig=orig_id,
+                action=query.action.name,
+            )
+        else:
+            logger.debug(
+                f"NEW slot canonical={canonical_id!r} "
+                f"hash={content_hash[:24]} cache_key={cache_key[:24]} for {subscriber_internal_id!r}"
+            )
         return True, canonical_id
 
     # -----------------------------------------------------------------------

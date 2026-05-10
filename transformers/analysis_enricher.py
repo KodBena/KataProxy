@@ -33,7 +33,9 @@ from katago import (
 import numpy as np
 from copy import deepcopy
 import logging
+from proxy_logging import Event, get_proxy_logger
 logger = logging.getLogger("kataproxy." + __name__)
+_log = get_proxy_logger(__name__)
 
 def sliding_median(arr, window):
     return np.median(np.lib.stride_tricks.sliding_window_view(arr, (window,)), axis=1)
@@ -67,7 +69,10 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
             and q.opaque.get('moves')
             and len(q.opaque['moves']) > 1
         ):
-            logger.debug(f"analysis_config = {config}")
+            _log.debug(
+                Event.DIAGNOSTIC, orig=eid,
+                msg=f"analysis_config setup for eid={eid!r}",
+            )
             try:
                 env = RegistryInterpreter(config)
                 delta_fn = env.get_delta_fn()
@@ -97,9 +102,12 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
                 # procedure during a response. Those failures land in the
                 # on_response try/except below. The fully-structured wire
                 # error path is v1.0.4 H-3 work.
-                logger.warning(
-                    f"analysis_config setup failed for eid={eid!r}: {e}. "
-                    f"Query proceeds without enrichment."
+                _log.warning(
+                    Event.DIAGNOSTIC, orig=eid,
+                    msg=(
+                        f"analysis_config setup failed for eid={eid!r}: {e}. "
+                        f"Query proceeds without enrichment."
+                    ),
                 )
                 return q
             request_cache[eid] = analyzer
@@ -126,7 +134,10 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
                 # time, so a body that referenced a no-longer-exposed name
                 # (e.g. legacy `np.median(x)`) may compile cleanly in
                 # on_query and only fail here on the first real packet.
-                logger.exception("Enrichment failed")
+                _log.exception(
+                    Event.DIAGNOSTIC, orig=eid,
+                    msg=f"enrichment failed for eid={eid!r}",
+                )
 
         if link.mapping.forward(eid) is None:
             request_cache.pop(eid, None)

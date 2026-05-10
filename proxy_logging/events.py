@@ -123,6 +123,16 @@ class Event(str, enum.Enum):
     ORCHESTRATION_SPAWN = "orchestration_spawn"
     ORCHESTRATION_DONE = "orchestration_done"
 
+    # 4.11 Catch-all for diagnostic records that don't fit a specific
+    # lifecycle event. Use sparingly — preferred shape is a typed
+    # event + structured fields. DIAGNOSTIC exists for warnings /
+    # errors / one-off info that don't have a dedicated category
+    # (e.g., transformer-internal computational failures, hub
+    # cache-eviction notes). Records with this event still go
+    # through the structured envelope (ts/level/role/module/msg);
+    # the event is just a wildcard category.
+    DIAGNOSTIC = "diagnostic"
+
     def __str__(self) -> str:
         return self.value
 
@@ -206,6 +216,11 @@ EVENT_REQUIRED_FIELDS: dict[Event, frozenset[str]] = {
     Event.TRANSFORMER_DROP: frozenset({"cid", "orig", "transformer_name"}),
     Event.ORCHESTRATION_SPAWN: frozenset({"cid", "sub_orig", "name"}),
     Event.ORCHESTRATION_DONE: frozenset({"cid", "name", "outcome"}),
+    # 4.11 — DIAGNOSTIC is a catch-all; only the always-present
+    # fields (role/module/ts/level/msg) are required, none of the
+    # event-specific fields. Useful when a record needs the
+    # structured envelope but doesn't fit a domain event.
+    Event.DIAGNOSTIC: frozenset(),
 }
 
 

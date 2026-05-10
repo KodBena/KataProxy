@@ -58,7 +58,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
-from proxy_logging.adapter import ProxyLogger, get_proxy_logger
+from proxy_logging.adapter import ProxyLogger, get_proxy_logger, set_process_role
 from proxy_logging.enums import (
     Direction,
     LogContractError,
@@ -78,6 +78,7 @@ __all__ = [
     # Adapter and factory
     "ProxyLogger",
     "get_proxy_logger",
+    "set_process_role",
     # Enums
     "Direction",
     "Event",

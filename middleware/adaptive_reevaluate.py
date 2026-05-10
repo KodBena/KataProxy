@@ -67,8 +67,10 @@ from middleware.orchestration import (
     OrchestrationMiddleware,
     orchestration_middleware,
 )
+from proxy_logging import Event, get_proxy_logger
 
 logger = logging.getLogger("kataproxy." + __name__)
+_log = get_proxy_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +245,14 @@ def adaptive_reevaluate(
                 yield f
             return
 
-        logger.info(
-            f"adaptive: orig_id={ctx.parent_id!r} "
-            f"deepening turns={sorted(deepen)} "
-            f"quantile={q_quantile} extra_visits={q_extra}"
+        _log.info(
+            Event.DIAGNOSTIC,
+            cid=ctx.parent_id,
+            msg=(
+                f"adaptive: orig_id={ctx.parent_id!r} "
+                f"deepening turns={sorted(deepen)} "
+                f"quantile={q_quantile} extra_visits={q_extra}"
+            ),
         )
 
         # Stage 3: emit originals with is_during_search patched on

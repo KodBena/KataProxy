@@ -44,7 +44,9 @@ distribution notes.
 License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
 import logging
+from proxy_logging import Event, get_proxy_logger
 logger = logging.getLogger("kataproxy." + __name__)
+_log = get_proxy_logger(__name__)
 try:
     import go_transposition as _go_transposition  # type: ignore[import]
     _TRANSPOSITION_AVAILABLE = True
@@ -253,9 +255,12 @@ def transposition_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRe
             except ValueError as e:
                 # Refuse to cache; on_response will see no entry and skip
                 # enrichment. The query itself still goes through to KataGo.
-                logger.warning(
-                    f"transposition: request for eid={eid!r} fails validation; "
-                    f"skipping PV-partition enrichment: {e}"
+                _log.warning(
+                    Event.DIAGNOSTIC, orig=eid,
+                    msg=(
+                        f"transposition: request for eid={eid!r} fails "
+                        f"validation; skipping PV-partition enrichment: {e}"
+                    ),
                 )
                 return q
             request_cache[eid] = json.dumps(wire_dict)
@@ -273,15 +278,21 @@ def transposition_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRe
                 _, r = parse_response_from_wire(enriched_dict) # Update 'r'
             except ValueError as e:
                 # Validation refusal — operator-visible WARNING, no enrichment.
-                logger.warning(
-                    f"transposition: response for eid={eid!r} fails validation; "
-                    f"skipping PV-partition enrichment: {e}"
+                _log.warning(
+                    Event.DIAGNOSTIC, orig=eid,
+                    msg=(
+                        f"transposition: response for eid={eid!r} fails "
+                        f"validation; skipping PV-partition enrichment: {e}"
+                    ),
                 )
             except Exception as e:
                 # Native-side exception or unexpected failure — ERROR-level.
                 # The C++ extension's own bounds checks will land here too,
                 # backstopping anything the Python pre-validation missed.
-                logger.error(f"transposition enrichment failed: {e}")
+                _log.error(
+                    Event.DIAGNOSTIC, orig=eid,
+                    msg=f"transposition enrichment failed for eid={eid!r}: {e}",
+                )
 
         # 2. THE MULTI-TURN CLEANUP:
         # Check if the ProxyLink just removed this ID mapping.

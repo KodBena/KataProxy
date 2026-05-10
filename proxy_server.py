@@ -298,9 +298,13 @@ class ClientSession:
         # spawn session-scoped tasks (e.g., the keep-alive watchdog) inside
         # the running event loop. ClientSession is always constructed within
         # _handle_connection (an async coroutine), so an event loop exists.
+        # proxy_log is the session-bound structured-logging adapter;
+        # middleware that emits structured records refines via .bind()
+        # for sub-contexts (e.g., per-orig_id orchestration coroutines).
         caps = SessionCapabilities(
             submit_query=self._handle_query,
             terminate_query=self._terminate_query,
+            proxy_log=self._log,
         )
         self._middleware.on_session_start(caps)
 
@@ -448,21 +452,18 @@ class ClientSession:
             query=translated_query,
             subscriber_internal_id=subscriber_internal_id,
             subscriber_queue=self._send_queue,
+            proxy_log=self._log,
+            orig_id=orig_id,
         )
 
         self._active_queries[orig_id] = (subscriber_internal_id, canonical_id)
-        # Lifecycle emission per the structured-logging schema. The
-        # subscribe event fires unconditionally for every accepted
-        # query — operators tracing a cid back through its origin
-        # find the subscribe at the entry. Phase 3's deeper hub
-        # sweep splits this into discriminated subscribe/coalesce/
-        # cache_hit events using a richer subscribe() return; until
-        # then, all three sub-cases collapse to a single subscribe.
+        # The hub emits the discriminated subscribe / coalesce /
+        # cache_hit event itself (Phase 3 migration; was emitted
+        # unconditionally as `subscribe` from this site in Phase 2).
+        # Per-orig_id timing is still tracked here because the
+        # complete event fires from _deliver_upstream and reads back
+        # this map.
         self._query_started_at[orig_id] = monotonic()
-        lifecycle.subscribe(
-            self._log,
-            cid=canonical_id, orig=orig_id, action=query.action.name,
-        )
         logger.debug(
             f"orig={orig_id!r} internal={subscriber_internal_id!r} "
             f"canonical={canonical_id!r} is_new={is_new}"
@@ -1034,8 +1035,13 @@ async def _main() -> None:
     # tty; logfmt otherwise). Idempotent — calling twice is a no-op.
     # See proxy_logging.formatters.configure_logging_from_env() and
     # proxy/docs/logging-design.md §6 / §8 for the env-var matrix.
-    from proxy_logging import configure_logging_from_env
+    from proxy_logging import configure_logging_from_env, set_process_role
     configure_logging_from_env()
+    # Bind the process role onto every module-level get_proxy_logger
+    # call. ClientSession's per-session log refines further; bare
+    # module-level loggers (transformers, hub, etc.) inherit role
+    # from this single set point.
+    set_process_role(_resolve_role())
 
     # Per-query capability gating is always wired — legacy clients (no
     # capabilities field on the query) trigger auto-engage on the gate

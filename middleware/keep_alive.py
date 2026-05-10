@@ -66,6 +66,7 @@ from middleware.session_middleware import (
     SessionMiddleware,
     SubmitQuery,
 )
+from proxy_logging import Event, get_proxy_logger, lifecycle
 
 
 logger = logging.getLogger("kataproxy." + __name__)
@@ -108,6 +109,12 @@ class KeepAliveMiddleware(SessionMiddleware):
         self._in_flight: set[str] = set()
         self._caps: Optional[SessionCapabilities] = None
         self._task: Optional[asyncio.Task] = None
+        # Structured-logging adapter. Falls back to a module-bare
+        # ProxyLogger if the SessionCapabilities didn't carry one
+        # (test harnesses, diagnose scripts that bypass ClientSession).
+        # on_session_start refines via .bind() once the session_log is
+        # in hand.
+        self._log = get_proxy_logger("kataproxy.middleware.keep_alive")
 
     # ------------------------------------------------------------------
     # Lifecycle hooks
@@ -115,6 +122,13 @@ class KeepAliveMiddleware(SessionMiddleware):
 
     def on_session_start(self, caps: SessionCapabilities) -> None:
         self._caps = caps
+        # If the session passed a session-bound proxy_log, adopt it
+        # so heartbeat / watchdog records carry session context. The
+        # ClientSession.__init__ → SessionCapabilities path always
+        # supplies one in production; the fallback covers
+        # diagnose-script direct construction.
+        if caps.proxy_log is not None:
+            self._log = caps.proxy_log
         self._last_heartbeat = monotonic()
         self._task = asyncio.create_task(
             self._watchdog(), name="keep-alive-watchdog"
@@ -131,6 +145,24 @@ class KeepAliveMiddleware(SessionMiddleware):
     def on_query(self, orig_id: str, query: KataGoQuery) -> None:
         if self._is_heartbeat(query):
             self._last_heartbeat = monotonic()
+            # Lifecycle: heartbeat observed; timer reset. DEBUG-level
+            # because this is per-tick high-volume. session field
+            # comes from the bind chain on self._log.
+            try:
+                # Read session from the bound context if present so
+                # the schema's required field is satisfied; fall back
+                # to "?" for diagnose-script direct constructions
+                # that don't bind session.
+                session = self._log._bound.get("session", "?")
+                self._log.debug(
+                    Event.KEEPALIVE_RESET,
+                    session=session,
+                    msg="heartbeat",
+                )
+            except Exception:
+                # The lifecycle event is diagnostic-only; never let
+                # a logging failure interfere with the actual reset.
+                pass
             return
         if query.action == KataGoAction.ANALYZE:
             self._in_flight.add(orig_id)
@@ -171,17 +203,22 @@ class KeepAliveMiddleware(SessionMiddleware):
                     # genuinely-idle session that's not stranding compute.
                     self._last_heartbeat = monotonic()
                     continue
-                logger.warning(
-                    f"keep-alive timeout: idle={idle:.1f}s "
-                    f"terminating {len(stranded)} stranded query(ies)"
+                session = self._log._bound.get("session", "?")
+                lifecycle.keepalive_fired(
+                    self._log,
+                    session=session,
+                    idle_seconds=idle,
+                    terminated_cids=list(stranded),
+                    in_flight_count=len(stranded),
                 )
                 assert self._caps is not None  # set in on_session_start
                 for orig_id in stranded:
                     try:
                         await self._caps.terminate_query(orig_id)
                     except Exception:
-                        logger.exception(
-                            f"keep-alive terminate failed: orig_id={orig_id!r}"
+                        self._log.exception(
+                            Event.DIAGNOSTIC,
+                            msg=f"keep-alive terminate failed: orig_id={orig_id!r}",
                         )
                 self._in_flight.clear()
                 self._last_heartbeat = monotonic()

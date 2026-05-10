@@ -313,6 +313,25 @@ context only — it's a snapshot, not a stream.
 | `orchestration_spawn`  | INFO    | `cid` (parent), `sub_orig`, `name`                                         | Orchestration coroutine spawned sub-query. |
 | `orchestration_done`   | INFO    | `cid`, `name`, `outcome=normal|error|cancelled`                            | Orchestration coroutine completed.   |
 
+### 4.11 Diagnostic catch-all
+
+| event        | level    | required fields beyond root | semantics                                         |
+|--------------|----------|-----------------------------|---------------------------------------------------|
+| `diagnostic` | (any)    | (none)                      | Catch-all for records that need the structured envelope but don't fit a specific lifecycle event. |
+
+`diagnostic` is the wildcard category. It satisfies the
+"every record carries `event=`" property required by the
+schema (§3) without forcing every minor warning / debug
+trace into a domain-specific event. Use sparingly — when an
+event is operationally meaningful enough that an operator
+might filter on it, it deserves its own enum entry; only
+records that are pure-diagnostic (transformer-internal
+computation failures, hub buffer overflows, asteval
+raises) should use `diagnostic`. The same record at the
+INFO+ level surfaces under the "diagnostic" category in
+aggregator queries; operators who want precise lifecycle
+tracing filter on the typed events instead.
+
 The vocabulary is intentionally larger than minimal — institutional
 operators need to filter on specific event classes (e.g. "show me
 every `kg_crash` for the past hour") and the closed set lets them
@@ -679,13 +698,35 @@ and main absorbs the branch.
   SELECTOR / ECHO are written and pass against the migrated call
   sites. **One commit on the feature branch.**
 
-  **Phase 3 — sweep the remaining call sites.** Transformers
-  (`analysis_enricher`, `transposition_enricher`, `capability_gate`,
-  `capabilities_advertiser`), middleware (`adaptive_reevaluate`,
-  `keep_alive`, `capability_gate`, `orchestration`). At end of
-  phase, no f-string `logger.{debug,info,warning,error}` calls
-  remain in the proxy; everything goes through the structured
-  adapter. **One commit on the feature branch.**
+  **Phase 3 — sweep transformer / middleware call sites.**
+  Transformers (`analysis_enricher`, `transposition_enricher`,
+  `capability_gate`, `capabilities_advertiser`), middleware
+  (`adaptive_reevaluate`, `keep_alive`, `capability_gate`,
+  `orchestration`). Each migrates from stdlib `logger.…(f"…")`
+  to the structured adapter — domain-specific events where they
+  fit a lifecycle category (middleware_engage / middleware_skip /
+  orchestration_spawn / orchestration_done / keepalive_reset /
+  keepalive_fired), `Event.DIAGNOSTIC` for warnings and errors
+  that don't fit a typed category but should still emit through
+  the structured envelope. The deferred Phase 2
+  pubsub_hub work also lands here: the discriminated subscribe /
+  coalesce / cache_hit events emit from inside hub.subscribe()
+  (it gains optional `proxy_log` and `orig_id` parameters; the
+  Phase 2 unconditional `subscribe` emission from
+  `_handle_query` moves into the hub for proper discrimination).
+
+  **Out of scope for this phase:** the deep-DEBUG f-string calls
+  in `proxy_server.py`, `router.py`, and (the rest of)
+  `pubsub_hub.py` — wire-trace logs that emit raw payloads,
+  per-message bookkeeping, mapping internals. They render
+  legibly through the formatter's `[module] msg` fallback (still
+  routed through the kataproxy logger hierarchy and the chosen
+  formatter), so the operator's view stays coherent. Phase 3.5
+  (a follow-up commit, not in the original four-phase plan) can
+  sweep these mechanically; the value is consistency rather than
+  added structure.
+
+  **One commit on the feature branch.**
 
   **Phase 4 — documentation + operability hardening.**
   `proxy/docs/logging.md` (the operator-facing reference).

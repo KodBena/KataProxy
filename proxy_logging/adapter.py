@@ -122,6 +122,7 @@ class ProxyLogger:
         event: Event | str,
         *,
         msg: str | Callable[[], str] | None = None,
+        exc_info: bool = False,
         **fields: Any,
     ) -> None:
         """Emit a structured log record at the given level.
@@ -134,6 +135,11 @@ class ProxyLogger:
         renderer. Accepts either a string or a zero-argument
         callable; callables are invoked only if the level is
         enabled (lazy formatting).
+
+        ``exc_info`` mirrors the stdlib Logger flag: when True, the
+        current exception's traceback is captured and rendered.
+        Use via ``.exception(event, msg=...)`` (a convenience that
+        passes exc_info=True at ERROR level).
 
         ``**fields`` are the structured fields for this event.
         Merged with the bind chain; the merge result must include
@@ -172,7 +178,7 @@ class ProxyLogger:
                     f"LogRecord reserved attribute"
                 )
 
-        self._logger.log(level, rendered_msg, extra=extra)
+        self._logger.log(level, rendered_msg, extra=extra, exc_info=exc_info)
 
     def debug(self, event: Event | str, *, msg: Any = None, **fields: Any) -> None:
         """Emit at DEBUG level."""
@@ -186,13 +192,34 @@ class ProxyLogger:
         """Emit at WARNING level."""
         self.log(logging.WARNING, event, msg=msg, **fields)
 
-    def error(self, event: Event | str, *, msg: Any = None, **fields: Any) -> None:
-        """Emit at ERROR level."""
-        self.log(logging.ERROR, event, msg=msg, **fields)
+    def error(
+        self,
+        event: Event | str,
+        *,
+        msg: Any = None,
+        exc_info: bool = False,
+        **fields: Any,
+    ) -> None:
+        """Emit at ERROR level. Pass exc_info=True from inside an
+        except: clause to capture the traceback (or use .exception()
+        for the standard convenience)."""
+        self.log(logging.ERROR, event, msg=msg, exc_info=exc_info, **fields)
 
     def critical(self, event: Event | str, *, msg: Any = None, **fields: Any) -> None:
         """Emit at CRITICAL level."""
         self.log(logging.CRITICAL, event, msg=msg, **fields)
+
+    def exception(
+        self,
+        event: Event | str,
+        *,
+        msg: Any = None,
+        **fields: Any,
+    ) -> None:
+        """Emit at ERROR level with the current exception's traceback
+        captured. Mirrors stdlib Logger.exception. Use only inside
+        an except: clause."""
+        self.log(logging.ERROR, event, msg=msg, exc_info=True, **fields)
 
     # ------------------------------------------------------------------
     # Internals
@@ -242,12 +269,37 @@ class ProxyLogger:
             )
 
 
+# Process-wide role state. Set once at startup via set_process_role()
+# (called from proxy_server._main); read by get_proxy_logger() so
+# every module-level logger emits records carrying role= without
+# the per-module .bind(role=…) boilerplate. Per-session contexts
+# refine further (.bind(session=…)) on top of this.
+_PROCESS_ROLE: Any = None
+
+
+def set_process_role(role: Any) -> None:
+    """Set the process-wide role bound onto every get_proxy_logger.
+
+    Called once at startup (proxy_server._main) with the role
+    derived from cfg.ROLE. Idempotent at the value level: passing
+    the same role twice is harmless; passing a different role
+    overrides (so test harnesses can re-bind cleanly between cases).
+    Pre-startup callers (modules imported before _main runs) get a
+    role-less logger; the bind chain merges role at call-time
+    on top of whatever process-role the adapter sees at that
+    moment, so late-binding is fine.
+    """
+    global _PROCESS_ROLE
+    _PROCESS_ROLE = role
+
+
 def get_proxy_logger(name: str) -> ProxyLogger:
     """Module-level factory.
 
-    The returned logger has no bound context; call sites
-    (ClientSession constructors, router _connect methods) refine via
-    .bind() to add role / session / upstream / label as appropriate.
+    The returned logger has the process-wide role bound (when
+    set_process_role has been called). Call sites refine further
+    via .bind() to add session / cid / upstream / label as
+    appropriate.
 
     The underlying stdlib logger uses the standard kataproxy
     namespace ('kataproxy.<module>') so existing log-level
@@ -260,4 +312,7 @@ def get_proxy_logger(name: str) -> ProxyLogger:
         # used 'kataproxy' verbatim; here we accept any name and
         # prefix it for hierarchy if it isn't already prefixed.
         name = f"kataproxy.{name}"
-    return ProxyLogger(logging.getLogger(name))
+    base = ProxyLogger(logging.getLogger(name))
+    if _PROCESS_ROLE is not None:
+        return base.bind(role=_PROCESS_ROLE)
+    return base
