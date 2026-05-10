@@ -186,11 +186,56 @@ class MiddlewareChain(SessionMiddleware):
 
     Each (orig_id, response) pair yielded by inner is fed into outer.
     The final stream is everything outer yields, across all inner outputs.
+
+    Multi-orchestration guard: at most one OrchestrationMiddleware
+    (from middleware/orchestration.py) may be present anywhere in
+    the chain. Chained orchestration is implementable but not
+    algebraically composable under the coroutine substrate; lifting
+    the limit requires lifting the abstraction's algebraic floor
+    (a true effects system). Until then, the limit is the honest
+    scope of the abstraction. Violations raise
+    MiddlewareChainConfigurationError at construction. See
+    proxy/docs/roadmap-orchestration-middleware.md ("On chained
+    orchestration: an algebraic-laws note") for the full reasoning.
     """
 
     def __init__(self, inner: SessionMiddleware, outer: SessionMiddleware) -> None:
         self._inner = inner
         self._outer = outer
+        self._guard_orchestration_count(inner, outer)
+
+    @staticmethod
+    def _guard_orchestration_count(
+        inner: SessionMiddleware, outer: SessionMiddleware
+    ) -> None:
+        """Raise MiddlewareChainConfigurationError on multi-orchestration chains.
+
+        Counts OrchestrationMiddleware instances across both branches,
+        recursing into nested MiddlewareChains so the guard is robust
+        against multi-level composition.
+        """
+        # Lazy import: orchestration imports session_middleware, so a
+        # top-level import here would cycle. Imported on construction
+        # only (cheap; chain construction is rare).
+        from middleware.orchestration import (
+            MiddlewareChainConfigurationError,
+            OrchestrationMiddleware,
+        )
+
+        def count(m: SessionMiddleware) -> int:
+            if isinstance(m, MiddlewareChain):
+                return count(m._inner) + count(m._outer)
+            return 1 if isinstance(m, OrchestrationMiddleware) else 0
+
+        total = count(inner) + count(outer)
+        if total > 1:
+            raise MiddlewareChainConfigurationError(
+                f"MiddlewareChain contains {total} OrchestrationMiddleware "
+                f"instances; at most one is permitted per chain. Chained "
+                f"orchestration is not algebraically composable under the "
+                f"coroutine substrate (see roadmap-orchestration-middleware.md, "
+                f"\"On chained orchestration\")."
+            )
 
     def on_session_start(self, caps: SessionCapabilities) -> None:
         # Inner first, outer second — same convention as on_query.
