@@ -225,16 +225,40 @@ ADAPTIVE_MAX_INFLIGHT: int = int(
 # stops sending heartbeats without disconnecting), the proxy never observes
 # a disconnect and `_cleanup` never runs. The watchdog is the safety net.
 #
-# Default 25 seconds: 5x the frontend's existing 5000ms `query_version`
-# watchdog cadence. Generous enough to absorb network jitter and one missed
-# beat without false positives, tight enough to bound cost on a stranded
-# ponder.
+# Default 250 seconds. The original v1.0.10 default was 25s ("5x the
+# frontend's 5000ms `query_version` cadence"), shaped around the
+# heartbeat's nominal cadence rather than around realistic
+# analyze-query duration. In practice — surfaced when the frontend's
+# review-session and engine-match flows started exercising long
+# range analyses with adaptive_reevaluate engaged on multi-turn
+# windows — heartbeats can interleave with long analyses in ways
+# that don't keep last_heartbeat fresh enough for a 25s window:
+# legitimate range queries on strong networks at high visits
+# routinely exceed it, and the watchdog terminates the in-flight
+# analyze before it completes. The visible symptom is a SPA-side
+# 30-second timeout on what should have been a multi-minute
+# analysis.
 #
-# Set to 0 (or any non-positive value) to disable keep-alive entirely. The
-# middleware factory will then omit KeepAliveMiddleware from the chain.
+# 250s (~50x heartbeat cadence) is the empirically validated value
+# that lets multi-turn range queries on strong networks complete
+# without watchdog interference, while still bounding cost on a
+# genuinely stranded session to ~4-5 minutes of GPU. Operators with
+# unusually long analyses (deep training-quality runs) should bump
+# further; operators with very tight cost budgets can lower, with
+# the understanding that 25s is too aggressive for analyze-heavy
+# workloads.
+#
+# The watchdog's check_interval defaults to max(0.5, idle_timeout/5),
+# so this bump scales the polling interval to 50s — adequate
+# detection latency for HMR-orphaned singletons and similar stranded-
+# session cases the watchdog exists to catch.
+#
+# Set to 0 (or any non-positive value) to disable keep-alive entirely.
+# The middleware factory will then omit KeepAliveMiddleware from the
+# chain.
 
 KEEP_ALIVE_IDLE_TIMEOUT_SECONDS: float = float(
-    os.environ.get("KEEP_ALIVE_IDLE_TIMEOUT_SECONDS", "25.0")
+    os.environ.get("KEEP_ALIVE_IDLE_TIMEOUT_SECONDS", "250.0")
 )
 
 
