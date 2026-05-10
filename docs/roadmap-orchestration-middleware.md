@@ -107,11 +107,15 @@ documented as a peer of Transformer and SessionMiddleware.
   Its `__keepalive_term_<hex>` synthetic-id pattern stays — small,
   contained, and not a fork-join concern.
 - **No multi-orchestration chains.** v1.0.16 supports at most one
-  orchestration middleware in a `MiddlewareChain`. Chaining two
-  orchestration coroutines is structurally meaningful (outer sees
-  inner's yields as its parent's "originals") but adds composition
-  complexity that doesn't have a use case yet. Deferred; documented
-  as a known limit.
+  orchestration middleware in a `MiddlewareChain`. The reason is
+  algebraic, not operational. Chaining two orchestration coroutines
+  is *implementable* — ownership-aware routing in `MiddlewareChain`
+  plus per-middleware sub-query registries, ~150 lines of bounded
+  framework code. But implementability is not composability: the
+  abstraction lacks algebraic laws strong enough for chained
+  orchestration to be true composition rather than operational glue.
+  See *Risks and design decisions → On chained orchestration* below
+  for the full reasoning.
 - **No `Transformer` changes.** Orchestration is exclusively a
   middleware-side concept. Transformers are sync per-message; they
   don't need the lifecycle machinery orchestration provides.
@@ -747,14 +751,70 @@ prodigal. If a real use case wants more, raise the env var.
 ### Decision: only one orchestration middleware per chain (v1.0.16)
 
 **Chosen: enforce at construction; raise
-`MiddlewareChainConfigurationError`.** Avoids the composition
-question (does outer-orchestration see inner-orchestration's yields
-as its "originals"? semantically yes; mechanically requires
-orchestration-context routing through the chain composer).
+`MiddlewareChainConfigurationError`.** This is the *algebraic*
+position, not the MVP-focus position. See *On chained orchestration*
+below.
 
-The current `_make_middleware` chain has at most one orchestration
-candidate (`adaptive_reevaluate`). Multi-orchestration chains
-deferred until the first use case wants them.
+### On chained orchestration: an algebraic-laws note
+
+The original framing of this limit was operational ("no use case
+yet; defer the composition complexity"). On reflection that framing
+is weak — it's exactly the kind of utilitarian-evidence argument
+that Jacobi's principle ("Man muss immer generalisieren") calls
+out. The honest reason for the limit is algebraic.
+
+The orchestration coroutine has access to `ctx.parent_query`,
+`ctx.spawn(...)`, `ctx.original_stream()`, etc. — all of which
+presuppose a single, well-defined "parent query" with a single
+response stream. When two orchestration middlewares O1 and O2
+chain (O2 outer, O1 inner), the question becomes: what does O2's
+context refer to?
+
+- If `ctx.parent_query` for O2 is the *original* client query, then
+  `ctx.spawn(parent.with_model("strong"))` is a sub-query of the
+  *root* parent, not of O1's emissions. O1 would see this sub-query
+  flowing back through the chain, possibly try to claim it (it has
+  the parent's `model` field set, after all). The chain has to
+  decide ownership; the answer isn't compositional.
+- If `ctx.parent_query` for O2 is the conceptual "parent stream
+  coming in", that isn't a `KataGoQuery` at all — it's a stream of
+  responses. `with_model` doesn't apply; `spawn` has no template.
+  The abstraction's API doesn't admit this case.
+- Either way, O1's spawned sub-queries' responses arrive at the
+  chain. Whether O2 sees them is a per-pair decision: if O1 spawns
+  a deeper query for adaptive analysis and O2 is JSD-comparing,
+  should O2 process the deeper-query response (which is the same
+  position the parent asked about) as a parent response? Operational
+  routing can decide; algebra can't.
+
+Each of these resolutions is implementable. None of them composes
+in the laws-shaped sense. Two coroutines chained operate on each
+other's emissions through side-effects on the parent context that
+must be reasoned about per-pair — which is precisely the failure
+mode that suggests the abstraction is doing something other than
+what it advertises.
+
+The honest single-orchestration limit reflects what the abstraction
+actually provides: a coroutine over a single parent's lifecycle,
+which composes cleanly with non-orchestration middleware
+(Transformer, plain SessionMiddleware, CapabilityGatedMiddleware
+wrappers) but does not compose with itself the way functor
+composition would demand.
+
+A future migration to a true effects system (Option E from the
+design exploration: `docs/design-fork-join-orchestration.md`) would
+make orchestration composition laws-mechanical — handlers stack,
+effects compose, the laws hold by construction. Python lacks the
+substrate for that today; the closest available primitive
+(coroutines + context) gets us most of the ergonomics with none of
+the algebraic guarantees. The single-orchestration limit is an
+honest admission of where the abstraction's actual scope ends.
+
+The `MiddlewareChainConfigurationError` raised at construction
+names this explicitly so the next reader doesn't think the limit is
+accidental — it's structural, and lifting it without first lifting
+the abstraction's algebraic floor would be operational glue
+pretending to compose.
 
 ### Decision: factory-shape change for adaptive_reevaluate
 
