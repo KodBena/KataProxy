@@ -857,7 +857,9 @@ def _make_middleware() -> SessionMiddleware:
             worst_quantile=0.25,
             extra_visits=800,
             window_size=3,
-        ),
+        )(),  # () because adaptive_reevaluate now returns a factory
+              # (refactored to use the orchestration primitive in
+              # v1.0.16; see roadmap-orchestration-middleware.md).
     )
     if cfg.KEEP_ALIVE_IDLE_TIMEOUT_SECONDS <= 0:
         return base

@@ -330,3 +330,26 @@ def _parse_selector_models(raw: str) -> tuple[tuple[str, str], ...]:
 SELECTOR_MODELS: tuple[tuple[str, str], ...] = _parse_selector_models(
     os.environ.get("SELECTOR_MODELS", "")
 )
+
+
+# ---------------------------------------------------------------------------
+# Orchestration middleware (v1.0.16)
+# ---------------------------------------------------------------------------
+#
+# Maximum number of original responses buffered for an orchestration
+# coroutine that hasn't yet iterated its ctx.original_stream(). On overflow
+# the oldest are dropped with a WARNING — the coroutine is presumably
+# misbehaving (it should either iterate original_stream or call
+# ctx.discard_originals() to signal "I don't want them"). The bound
+# protects against memory growth in misconfigured orchestrations without
+# silently swallowing data; the WARNING surfaces the misbehaviour to
+# operators.
+#
+# 1024 is generous: typical orchestrations process responses promptly,
+# so the buffer rarely holds more than a handful at a time. Operators
+# with unusually long-pending coroutines may raise this; setting to 0
+# (or any non-positive integer) disables the bound entirely.
+
+ORCHESTRATION_BUFFER_MAX: int = int(
+    os.environ.get("PROXY_ORCHESTRATION_BUFFER_MAX", "1024")
+)
