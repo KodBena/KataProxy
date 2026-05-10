@@ -26,12 +26,26 @@ handle_response) delegates to the wrapped middleware on engagement
 and short-circuits to a single passthrough yield otherwise.
 
 Real-cost note: when a query opts out of `adaptive_reevaluate`, the
-wrapper bypasses the wrapped middleware entirely. on_query is not
-invoked; handle_response yields the response unchanged without
-observing it through the wrapped middleware. The wrapped middleware
-therefore never identifies positions to re-evaluate, never builds the
-deeper query, never calls submit_query. KataGo never receives the
-deeper-analysis request — real GPU savings, not compute-and-discard.
+wrapper bypasses the wrapped middleware's *on_query*. The wrapped
+middleware therefore never identifies positions to re-evaluate,
+never builds the deeper query, never calls submit_query. KataGo
+never receives the deeper-analysis request — real GPU savings,
+not compute-and-discard.
+
+Response side: handle_response unconditionally delegates to the
+wrapped middleware. The wrapped middleware decides what to do
+based on its own state (whether it has a context for this orig_id,
+whether the orig_id is a sub-query it spawned, etc.). For opt-out
+parents the wrapped's contract is to pass the response through
+unchanged; OrchestrationMiddleware's "Not orchestrated; pass
+through" branch satisfies this contract. The reason for
+unconditional delegation is the orchestration sub-query routing
+case: sub-query orig_ids are never registered in this wrapper's
+self._engaged dict (sub-queries bypass middleware.on_query at
+submit_query time), so a self._engaged-based gate would silently
+short-circuit sub-query responses past the wrapped's relabel code
+and they would reach the client carrying their synthetic
+sub_orig_id rather than the parent's orig_id.
 
 License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
@@ -105,10 +119,16 @@ class CapabilityGatedMiddleware(SessionMiddleware):
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:
-        if orig_id in self._engaged:
-            async for out_id, out_resp in self._wrapped.handle_response(
-                orig_id, response, submit_query
-            ):
-                yield out_id, out_resp
-        else:
-            yield orig_id, response
+        # Unconditionally delegate to the wrapped. The wrapped
+        # decides what to do based on its own state — engaged parents
+        # processed normally, sub-queries relabeled to parent_id,
+        # everything else passed through. self._engaged has no entry
+        # for sub-query orig_ids (sub-queries bypass middleware.on_query),
+        # so a gate based on self._engaged would silently drop sub-query
+        # responses past the wrapped's relabel code; the wrapped's own
+        # state-based check is the right gate. See the module docstring
+        # for the full reasoning.
+        async for out_id, out_resp in self._wrapped.handle_response(
+            orig_id, response, submit_query
+        ):
+            yield out_id, out_resp

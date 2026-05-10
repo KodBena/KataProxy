@@ -369,12 +369,35 @@ class TestCapabilityGatedMiddleware:
         gated.on_query("eid-1", q)
         assert rec.queries == []
 
-    async def test_response_passthrough_when_not_engaged(self) -> None:
+    async def test_response_unchanged_when_not_engaged(self) -> None:
+        """Output passes through unchanged for an opted-out parent.
+
+        Note: the wrapped middleware DOES observe the response — the
+        gate delegates unconditionally on the response side as of the
+        sub-query-routing fix. The wrapped's contract is to yield
+        unknown orig_ids unchanged; _RecordingMiddleware satisfies
+        that contract. The gate's response-side responsibility is
+        therefore output-shape-only ("response unchanged for opted-
+        out parents"), not observation-blocking.
+
+        The unconditional delegation is what lets the orchestration
+        framework relabel sub-query orig_ids to parent orig_ids when
+        wrapped behind this gate (the sub-query's parent IS engaged
+        but the sub-query's synthetic orig_id is never registered in
+        self._engaged because sub-queries bypass middleware.on_query).
+        See TestCompositionWithCapabilityGate.test_sub_query_response_relabels_through_gate
+        in tests/test_orchestration_middleware.py for the regression
+        coverage.
+        """
         rec = _RecordingMiddleware()
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query(capabilities={})
         gated.on_query("eid-1", q)
+        # The on_query gate stays — opt-out skips wrapped.on_query
+        # (the cost gate; the wrapped's setup is not paid for opted-
+        # out queries).
+        assert rec.queries == []
 
         async def submit_query(_id, _q): pass
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={})
@@ -382,10 +405,12 @@ class TestCapabilityGatedMiddleware:
         out = []
         async for oid, resp in gated.handle_response("eid-1", r, submit_query):
             out.append((oid, resp))
+        # Output unchanged — the user-visible contract.
         assert out == [("eid-1", r)]
-        assert rec.responses == [], (
-            "wrapped middleware should not observe response when not engaged"
-        )
+        # Wrapped observes — contract change as of the sub-query
+        # routing fix. _RecordingMiddleware just records and yields,
+        # so the output is unchanged.
+        assert rec.responses == [("eid-1", r)]
 
     async def test_response_engaged_when_query_opted_in(self) -> None:
         rec = _RecordingMiddleware()

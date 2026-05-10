@@ -538,8 +538,10 @@ class TestCompositionWithCapabilityGate:
                 capabilities={"other": {}}, analyze_turns=[0],
             ),
         )
-        # Send a response — gate should pass it through unchanged
-        # without involving orchestration.
+        # Send a response — gate delegates to orchestration, which
+        # has no context for "p1" (on_query was skipped by the gate's
+        # opt-out branch) and falls through to "Not orchestrated;
+        # pass through". Output is the original response unchanged.
         resp = _final_analyze(turn=0)
         out: list = []
         async for oid, r in gated.handle_response(
@@ -547,6 +549,100 @@ class TestCompositionWithCapabilityGate:
         ):
             out.append((oid, r))
         assert out == [("p1", resp)]
+        gated.on_session_end()
+
+    async def test_sub_query_response_relabels_through_gate(self) -> None:
+        """Regression: sub-query responses must be relabeled to the
+        parent's orig_id even when the orchestration middleware is
+        wrapped behind a CapabilityGatedMiddleware.
+
+        Bug shape (pre-fix): CapabilityGatedMiddleware short-circuited
+        on the response side for orig_ids it had not registered in
+        self._engaged. Only parent orig_ids land in self._engaged
+        (via on_query), but sub-queries spawned by the orchestration
+        framework carry synthetic orig_ids that bypass
+        middleware.on_query entirely (submit_query is the spawn path,
+        not the gated query path). The gate's short-circuit yielded
+        the sub-query response unchanged with the synthetic orig_id,
+        never reaching the wrapped orchestration's auto-relabel-to-
+        parent code. Downstream consumers (e.g., the SPA's WebSocket
+        subscriber map keyed by parent orig_id) silently dropped the
+        response.
+
+        Symptom in production: adaptive_reevaluate's deeper-analysis
+        responses arrived at the SPA carrying ``__orch__<hex>`` ids
+        and were dropped; the SPA's review session timed out at 30s
+        when adaptive engaged on legacy auto-engage queries
+        (PROXY_ADVERTISE_CAPABILITIES=false), because the original
+        responses were patched is_during_search=True for deepening
+        turns and the deeper's is_during_search=False responses never
+        reached the waitForAnalysis subscriber.
+
+        Fix: CapabilityGatedMiddleware.handle_response unconditionally
+        delegates to wrapped. The wrapped's state-based check
+        (self._contexts / self._sub_to_parent / pass-through) is the
+        right gate for orchestration's three-way response routing.
+        """
+        caps = _FakeSessionCapabilities()
+
+        # Coroutine that spawns one sub-query and yields its responses
+        # — mirrors adaptive_reevaluate's stage-4 shape (spawn +
+        # forward) without the buffering/decision logic.
+        @orchestration_middleware(name="forwarder")
+        async def forwarder(parent, ctx):
+            sub = _make_analyze_query(analyze_turns=[0])
+            async for resp in ctx.spawn(sub):
+                yield resp
+
+        m = forwarder()
+        gated = CapabilityGatedMiddleware("forwarder", m)
+        gated.on_session_start(caps.as_session_capabilities())
+
+        # Parent opts in to the gated capability — orchestration
+        # engages, coroutine starts, ctx.spawn fires.
+        gated.on_query("p1", _make_analyze_query(
+            capabilities={"forwarder": {}}, analyze_turns=[0],
+        ))
+        # Let the coroutine reach ctx.spawn → submit_query.
+        ok = await _wait_for(lambda: len(caps.submitted) >= 1)
+        assert ok, "spawn should have submitted a sub-query"
+        sub_orig_id, _sub_query = caps.submitted[0]
+        assert sub_orig_id.startswith("__orch__"), (
+            "sub-query orig_id should carry the orchestration's "
+            "synthetic prefix"
+        )
+
+        # Sub-query response arrives at the gate (this is the path
+        # that mimics deliver_upstream's middleware.handle_response
+        # call). The gate must delegate to wrapped so the wrapped's
+        # _sub_to_parent lookup re-routes the response under the
+        # parent's orig_id.
+        sub_response = _final_analyze(turn=0)
+        out: list[tuple[str, Any]] = []
+        async for oid, resp in gated.handle_response(
+            sub_orig_id, sub_response, caps.submit_query
+        ):
+            out.append((oid, resp))
+
+        # Critical: the response must be relabeled to "p1" (the
+        # parent's orig_id). The pre-fix bug had this output carrying
+        # the synthetic sub_orig_id, which the SPA's subscriber map
+        # would silently drop.
+        assert any(oid == "p1" for oid, _ in out), (
+            f"sub-query response did not reach the orchestration's "
+            f"auto-relabel; out={[(oid, type(r).__name__) for oid, r in out]}. "
+            f"Regression: CapabilityGatedMiddleware short-circuited "
+            f"the response without delegating to the wrapped "
+            f"OrchestrationMiddleware."
+        )
+        # Symmetric: the synthetic id must NOT leak through to the
+        # gate's output (wire-side leakage causes the SPA-side drop).
+        assert not any(oid == sub_orig_id for oid, _ in out), (
+            f"synthetic sub_orig_id leaked through to gate output; "
+            f"the SPA's subscriber map is keyed by parent orig_id, "
+            f"so this would cause silent response drops on the wire"
+        )
+
         gated.on_session_end()
 
 
