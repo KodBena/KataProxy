@@ -225,40 +225,35 @@ ADAPTIVE_MAX_INFLIGHT: int = int(
 # stops sending heartbeats without disconnecting), the proxy never observes
 # a disconnect and `_cleanup` never runs. The watchdog is the safety net.
 #
-# Default 250 seconds. The original v1.0.10 default was 25s ("5x the
-# frontend's 5000ms `query_version` cadence"), shaped around the
-# heartbeat's nominal cadence rather than around realistic
-# analyze-query duration. In practice — surfaced when the frontend's
-# review-session and engine-match flows started exercising long
-# range analyses with adaptive_reevaluate engaged on multi-turn
-# windows — heartbeats can interleave with long analyses in ways
-# that don't keep last_heartbeat fresh enough for a 25s window:
-# legitimate range queries on strong networks at high visits
-# routinely exceed it, and the watchdog terminates the in-flight
-# analyze before it completes. The visible symptom is a SPA-side
-# 30-second timeout on what should have been a multi-minute
-# analysis.
+# Default 25 seconds: 5x the frontend's 5000ms `query_version`
+# watchdog cadence. Generous enough to absorb network jitter and one
+# missed beat without false positives, tight enough to bound cost on
+# a genuinely stranded ponder.
 #
-# 250s (~50x heartbeat cadence) is the empirically validated value
-# that lets multi-turn range queries on strong networks complete
-# without watchdog interference, while still bounding cost on a
-# genuinely stranded session to ~4-5 minutes of GPU. Operators with
-# unusually long analyses (deep training-quality runs) should bump
-# further; operators with very tight cost budgets can lower, with
-# the understanding that 25s is too aggressive for analyze-heavy
-# workloads.
+# History — the v1.0.17 episode (don't repeat). Between v1.0.16 and
+# v1.0.18 this default was bumped from 25s to 250s under the
+# (incorrect) hypothesis that a 25s window was too tight relative to
+# the heartbeat cadence under realistic interleaving. The bump
+# masked a structural bug in `SelectorRouter.dispatch` — heartbeats
+# were routed to `_first_healthy_label()` only, while analyzes were
+# routed by `model`, so any LEAF carrying an analyze for a
+# non-first model never saw a heartbeat and fired its watchdog.
+# The structural fix shipped in v1.0.18 (broadcast QUERY_VERSION /
+# TERMINATE_ALL / CLEAR_CACHE to every healthy upstream); the 250s
+# band-aid is no longer needed and is reverted here. Full diagnosis
+# in the umbrella's docs/notes/postmortem-selector-watchdog-2026-05.md.
 #
 # The watchdog's check_interval defaults to max(0.5, idle_timeout/5),
-# so this bump scales the polling interval to 50s — adequate
-# detection latency for HMR-orphaned singletons and similar stranded-
-# session cases the watchdog exists to catch.
+# so this scales polling to 5s — adequate detection latency for the
+# HMR-orphaned singleton and similar stranded-session cases the
+# watchdog exists to catch.
 #
 # Set to 0 (or any non-positive value) to disable keep-alive entirely.
 # The middleware factory will then omit KeepAliveMiddleware from the
 # chain.
 
 KEEP_ALIVE_IDLE_TIMEOUT_SECONDS: float = float(
-    os.environ.get("KEEP_ALIVE_IDLE_TIMEOUT_SECONDS", "250.0")
+    os.environ.get("KEEP_ALIVE_IDLE_TIMEOUT_SECONDS", "25.0")
 )
 
 
