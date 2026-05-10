@@ -145,12 +145,48 @@ class ProxyLogger:
         Merged with the bind chain; the merge result must include
         every key in EVENT_REQUIRED_FIELDS[event] or LogContractError
         raises.
+
+        Validation order:
+
+          1. Reserved-name collision (call-site contract violation).
+             Always runs, regardless of level. A field name that
+             collides with a stdlib LogRecord attribute is a coding
+             bug that would corrupt the record at any level — better
+             a noisy raise at DEBUG-filtered call sites than a
+             silently-malformed record at one level and a raise at
+             another (the bug pattern that surfaced via
+             orchestration_spawn during Phase 3 testing).
+          2. Event recognition (closed-set membership). Always.
+          3. Level filter — skip remaining work when the record will
+             be discarded anyway.
+          4. Required-fields validation, msg resolution, dispatch.
         """
-        # Cheap level check first — skip everything else when filtered.
+        # Step 1: reserved-name collision check, runs at all levels.
+        # Both bound fields and call-site kwargs go through; a bind-
+        # time check exists in .bind() but kwargs supplied here
+        # bypass it.
+        for k in self._bound:
+            if k in _LOGRECORD_RESERVED:
+                raise LogContractError(
+                    f"log() refused bound field {k!r}: collides with "
+                    f"stdlib LogRecord reserved attribute"
+                )
+        for k in fields:
+            if k in _LOGRECORD_RESERVED:
+                raise LogContractError(
+                    f"log() refused field {k!r}: collides with stdlib "
+                    f"LogRecord reserved attribute"
+                )
+
+        # Step 2: event recognition.
+        normalised_event = self._normalise_event(event)
+
+        # Step 3: cheap level check — skip the remaining work when
+        # the record will be discarded anyway.
         if not self._logger.isEnabledFor(level):
             return
 
-        normalised_event = self._normalise_event(event)
+        # Step 4: required-fields validation, msg resolution, dispatch.
         merged = self._merge_fields(fields)
         self._validate(normalised_event, merged)
 
@@ -167,17 +203,6 @@ class ProxyLogger:
         # name. The `event` field is set explicitly so formatters
         # can branch on it.
         extra = {"event": normalised_event.value, **merged}
-
-        # Final reserved-name check (covers fields supplied at call
-        # time but not present at bind time; the bind-time check
-        # only sees the bind kwargs).
-        for k in extra:
-            if k in _LOGRECORD_RESERVED:
-                raise LogContractError(
-                    f"log() refused field {k!r}: collides with stdlib "
-                    f"LogRecord reserved attribute"
-                )
-
         self._logger.log(level, rendered_msg, extra=extra, exc_info=exc_info)
 
     def debug(self, event: Event | str, *, msg: Any = None, **fields: Any) -> None:

@@ -214,8 +214,8 @@ EVENT_REQUIRED_FIELDS: dict[Event, frozenset[str]] = {
         {"cid", "orig", "transformer_name", "direction"}
     ),
     Event.TRANSFORMER_DROP: frozenset({"cid", "orig", "transformer_name"}),
-    Event.ORCHESTRATION_SPAWN: frozenset({"cid", "sub_orig", "name"}),
-    Event.ORCHESTRATION_DONE: frozenset({"cid", "name", "outcome"}),
+    Event.ORCHESTRATION_SPAWN: frozenset({"cid", "sub_orig", "orch_name"}),
+    Event.ORCHESTRATION_DONE: frozenset({"cid", "orch_name", "outcome"}),
     # 4.11 — DIAGNOSTIC is a catch-all; only the always-present
     # fields (role/module/ts/level/msg) are required, none of the
     # event-specific fields. Useful when a record needs the

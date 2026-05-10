@@ -260,6 +260,35 @@ class TestValidation:
                 name="oops",  # reserved
             )
 
+    def test_reserved_field_raises_even_at_filtered_level(
+        self, memory_handler: _MemoryHandler
+    ) -> None:
+        # Per the validator's contract, a reserved-name collision is a
+        # call-site coding bug — it would corrupt the LogRecord at any
+        # level. The check must run regardless of isEnabledFor so the
+        # bug surfaces uniformly across DEBUG / INFO / WARNING /
+        # ERROR. Otherwise a record at a filtered-out level (e.g.,
+        # a DEBUG emission when the level is INFO) would silently
+        # accept an invalid call site and only fire when the level
+        # is later turned up — the orchestration_spawn = name= bug
+        # pattern from Phase 3.
+        logger = logging.getLogger("kataproxy.test")
+        logger.setLevel(logging.WARNING)  # filter out INFO + DEBUG
+        plog = get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
+        # Both the bound-side and the call-site kwargs are checked.
+        with pytest.raises(LogContractError, match="reserved attribute"):
+            plog.info(  # filtered-out level
+                Event.CONNECT,
+                session="peer", peer_ip="192.0.2.1",
+                name="oops",  # reserved; would corrupt record
+            )
+        with pytest.raises(LogContractError, match="reserved attribute"):
+            plog.debug(  # also filtered out
+                Event.CONNECT,
+                session="peer", peer_ip="192.0.2.1",
+                module="bad",  # reserved
+            )
+
 
 # ===========================================================================
 # ProxyLogger — level gating + lazy formatting

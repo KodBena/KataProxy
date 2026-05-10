@@ -237,7 +237,7 @@ class OrchestrationContext:
             Event.ORCHESTRATION_SPAWN,
             cid=self._parent_id,
             sub_orig=sub_orig_id,
-            name=self._middleware.name,
+            orch_name=self._middleware.name,
             msg=(
                 f"orchestration[{self._middleware.name}] spawn "
                 f"sub={sub_orig_id} parent={self._parent_id}"
@@ -527,7 +527,7 @@ class OrchestrationMiddleware(SessionMiddleware):
             # end, with the outcome surfaced.
             self._log.info(
                 Event.ORCHESTRATION_DONE,
-                cid=parent_id, name=self.name, outcome=outcome,
+                cid=parent_id, orch_name=self.name, outcome=outcome,
                 msg=f"orchestration[{self.name}] {outcome} for {parent_id}",
             )
             # Cancel any still-in-flight sub-queries.

@@ -310,8 +310,8 @@ context only — it's a snapshot, not a stream.
 | `middleware_skip`      | DEBUG   | `cid`, `orig`, `middleware_name`, `cause=opt_out|absent_capability`        | Capability gate bypassed.            |
 | `transformer_apply`    | DEBUG   | `cid`, `orig`, `transformer_name`, `direction=on_query|on_response`        | Transformer modified the message.    |
 | `transformer_drop`     | DEBUG   | `cid`, `orig`, `transformer_name`                                          | Transformer suppressed (returned None). |
-| `orchestration_spawn`  | INFO    | `cid` (parent), `sub_orig`, `name`                                         | Orchestration coroutine spawned sub-query. |
-| `orchestration_done`   | INFO    | `cid`, `name`, `outcome=normal|error|cancelled`                            | Orchestration coroutine completed.   |
+| `orchestration_spawn`  | INFO    | `cid` (parent), `sub_orig`, `orch_name`                                    | Orchestration coroutine spawned sub-query. |
+| `orchestration_done`   | INFO    | `cid`, `orch_name`, `outcome=normal|error|cancelled`                       | Orchestration coroutine completed.   |
 
 ### 4.11 Diagnostic catch-all
 
