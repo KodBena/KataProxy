@@ -18,9 +18,9 @@ from scipy.stats import entropy
 from delta_analysis import DeltaAnalysisState
 
 
-from typing import Optional, Dict
+from typing import Any, Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ClientId, ProxyLink
+from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import (
     AnalyzeResponse,
     KataGoAction,
@@ -37,7 +37,7 @@ from proxy_logging import Event, get_proxy_logger
 logger = logging.getLogger("kataproxy." + __name__)
 _log = get_proxy_logger(__name__)
 
-def sliding_median(arr, window):
+def sliding_median(arr: Any, window: int) -> Any:
     return np.median(np.lib.stride_tricks.sliding_window_view(arr, (window,)), axis=1)
 
 # NOTE: The analysis functions previously defined here as module-level lambdas
@@ -49,7 +49,9 @@ def sliding_median(arr, window):
 
 from registry_interpreter import RegistryInterpreter
 
-def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoResponse]:
+def analysis_enricher(
+    link: ProxyLink[ClientId, InternalId],
+) -> Transformer[KataGoQuery, KataGoResponse]:
     request_cache: Dict[ClientId, DeltaAnalysisState] = {}
 
     def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:

@@ -419,6 +419,43 @@ implementation arc confirms) passes on the proxy's full
 surface. CI integration of the typecheck as a gate, if not
 already present.
 
+**Implementation note (Phase 3 landing):** The phase landed
+comprehensive — the user's "let the chips fall where they
+may" framing in the Phase 3 kickoff message extended the
+brand-only minimal scope into a full `mypy --strict` pass
+across all 54 source files. The cascade closed 651 cold-
+invocation errors:
+
+  - 168 brand-related `arg-type` errors (the Phase 2 cascade
+    proper) — fixed by wrapping construction-side strings in
+    the brand constructors and threading the brand through
+    the `OnResponse` / `OnComplete` / `_callbacks` /
+    `_tracker` declarations on each `BackendRouter` variant.
+  - 214 `no-untyped-def` errors (pre-existing aspirational-
+    strict gaps in test helpers and `registry_interpreter`'s
+    asteval wrappers) — annotated with `Any` for the dynamic
+    surface, branded types for the test fixtures.
+  - 94 `type-arg` errors — parameterised every bare generic
+    (`Dict` → `Dict[K, V]`, `Task` → `Task[None]`, etc.).
+  - ~175 misc errors (`no-untyped-call`, `attr-defined`,
+    `unused-ignore`, …) — resolved on a per-site basis.
+
+The brand discipline forbids `# type: ignore` (per §6 Rule 4
+below); the implementation introduced none. Three documented
+casts in `protocol_transformer.py`, `katago_proxy.py`, and
+`contextual.py` bridge structural-but-true contracts that
+Python's type system cannot encode without restructuring the
+underlying framework (e.g., `TransformedChain`'s wrapper
+contract being structurally satisfied by both
+`ProxyLink[U, D]` and `ProxyChain[I]`); each carries an
+ADR-0002 Rule 2 comment naming the gap.
+
+The CI gate lives at `.github/workflows/typecheck.yml` (mypy
+on Python 3.12 against `[dev]` extras). The namespace-contract
+regression tests live at `tests/test_identity_types.py` (8
+`assert_type` pinning tests + a documentation block of
+deliberate negative-space type errors).
+
 ---
 
 ## 6. Test discipline for the migration

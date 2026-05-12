@@ -359,7 +359,7 @@ class TraceCidFilter(logging.Filter):
         cid = getattr(record, "cid", None)
         if cid is None:
             return True  # session-lifecycle records pass through
-        return cid == self._target
+        return bool(cid == self._target)
 
 
 class RegexLineFilter(logging.Filter):

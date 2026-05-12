@@ -70,13 +70,14 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 # Make the proxy root importable when running as a script.
 _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
+from AbstractProxy.proxy_core import CanonicalId, ClientId  # noqa: E402
 from katago import (  # noqa: E402
     KataGoAction,
     KataGoQuery,
@@ -116,7 +117,7 @@ class _MockWebSocket:
     async def close(self) -> None:
         self.closed = True
 
-    def __aiter__(self):
+    def __aiter__(self) -> "_MockWebSocket":
         return self
 
     async def __anext__(self) -> str:
@@ -143,7 +144,7 @@ class _PhantomLeaf:
     keep_alive: KeepAliveMiddleware
     terminated_query_ids: list[str]
 
-    def feed(self, query: KataGoQuery, orig_id: str) -> None:
+    def feed(self, query: KataGoQuery, orig_id: ClientId) -> None:
         """Simulate this phantom LEAF's session observing one query.
 
         Mirrors what proxy_server.py's _handle_incoming does: parse
@@ -256,12 +257,12 @@ async def run_scenario() -> bool:
     # Sink callbacks for SELECTOR.dispatch — the SPA-side. The bug
     # under test is upstream of these (router routing); the SPA
     # callbacks just absorb whatever the SELECTOR emits.
-    sink_responses: list[tuple[str, dict]] = []
+    sink_responses: list[tuple[CanonicalId, Dict[str, Any]]] = []
 
-    async def on_response(cid: str, wire: dict) -> None:
+    async def on_response(cid: CanonicalId, wire: Dict[str, Any]) -> None:
         sink_responses.append((cid, wire))
 
-    async def on_complete(cid: str) -> None:
+    async def on_complete(cid: CanonicalId) -> None:
         pass
 
     # ----------------------------------------------------------------
@@ -273,14 +274,14 @@ async def run_scenario() -> bool:
     analyze = _analyze_query(model="weak")
     analyze_wire = translate_query_to_wire(analyze, "cid-analyze")
     await router.dispatch(
-        "cid-analyze", analyze_wire, analyze, on_response, on_complete,
+        CanonicalId("cid-analyze"), analyze_wire, analyze, on_response, on_complete,
     )
     # Production: the SELECTOR's read loop on the 'weak' upstream
     # would parse responses and forward them through the SELECTOR's
     # own ClientSession. The 'weak' LEAF's ClientSession sees the
     # analyze first (via _handle_incoming → middleware.on_query).
     # We simulate that step:
-    phantoms["weak"].feed(analyze, "cid-analyze")
+    phantoms["weak"].feed(analyze, ClientId("cid-analyze"))
     print(f"  router.dispatched (canonicals): {[k for k in router._callbacks]}")
     print(f"  weak.keep_alive._in_flight: {phantoms['weak'].keep_alive._in_flight}")
     print(f"  strong.keep_alive._in_flight: {phantoms['strong'].keep_alive._in_flight}")
@@ -302,7 +303,7 @@ async def run_scenario() -> bool:
         seq += 1
         elapsed += HEARTBEAT_CADENCE
         hb = _heartbeat_query()
-        cid = f"cid-hb-{seq}"
+        cid = CanonicalId(f"cid-hb-{seq}")
         hb_wire = translate_query_to_wire(hb, cid)
         # Snapshot pre-broadcast counts so we can verify *this* tick's
         # broadcast hit every LEAF.
@@ -328,7 +329,7 @@ async def run_scenario() -> bool:
         # Production: each LEAF's read loop parses the wire and calls
         # middleware.on_query. Simulate.
         for phantom in phantoms.values():
-            phantom.feed(hb, cid)
+            phantom.feed(hb, ClientId(cid))
 
     print(f"  sent {seq} heartbeats; both LEAFs received every one")
 

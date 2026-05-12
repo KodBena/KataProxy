@@ -1,0 +1,46 @@
+name: Typecheck (mypy --strict)
+
+# Phase 3 of the identity-type-branding migration (see
+# `proxy/docs/roadmap-identity-type-branding.md` §6 Rule 2) wires a
+# CI typecheck gate so any future change that violates the namespace
+# discipline (e.g., confuses ClientId / InternalId / CanonicalId /
+# WireId) fails the build instead of silently regressing.
+#
+# The configuration lives in `pyproject.toml` under `[tool.mypy]`
+# (`strict = true`, `ignore_missing_imports = true`); this workflow
+# is the runner-side gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  typecheck:
+    name: mypy --strict
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install runtime deps + the dev extras (mypy, typing_extensions).
+          pip install .[dev]
+
+      - name: Run mypy
+        run: |
+          # The mypy configuration lives in pyproject.toml; this command
+          # invokes the proxy's full surface (54 source files at the
+          # Phase-3 landing). Pre-existing aspirational-strict gaps were
+          # closed as part of Phase 3 — see the commit history for the
+          # cascade.
+          mypy .

@@ -37,6 +37,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Dict, List
 
 import pytest
 
@@ -73,11 +74,18 @@ from proxy_logging.formatters import (  # noqa: E402
 
 
 class _MemoryHandler(logging.Handler):
-    """Captures records for inspection. Tests assert on .records."""
+    """Captures records for inspection. Tests assert on .records.
+
+    Stores records as ``Any`` because the structured-logging adapter
+    sets per-event fields (``event``, ``cid``, ``action``, …) as
+    attributes on the underlying ``LogRecord``; mypy's stdlib stubs
+    for ``LogRecord`` don't model these. ``Any`` lets tests read those
+    fields as ``rec.event`` etc. without per-site casts.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.records: list[logging.LogRecord] = []
+        self.records: List[Any] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
@@ -110,7 +118,7 @@ class _MockQuery:
     def __init__(
         self,
         action_name: str,
-        opaque: dict | None = None,
+        opaque: Dict[str, Any] | None = None,
         analyze_turns: list[int] | None = None,
         terminate_id: str | None = None,
     ) -> None:
@@ -467,7 +475,7 @@ def _make_record(
     name: str = "kataproxy.test",
     level: int = logging.INFO,
     msg: str = "hello",
-    extra: dict | None = None,
+    extra: Dict[str, Any] | None = None,
 ) -> logging.LogRecord:
     """Construct a LogRecord with structured-fields extras attached."""
     record = logging.LogRecord(

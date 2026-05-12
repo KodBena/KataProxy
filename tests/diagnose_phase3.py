@@ -28,6 +28,7 @@ _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
+from AbstractProxy.proxy_core import ClientId  # noqa: E402
 from katago import KataGoAction, KataGoQuery  # noqa: E402
 from middleware.keep_alive import KeepAliveMiddleware  # noqa: E402
 from proxy_server import ClientSession  # noqa: E402
@@ -104,8 +105,8 @@ async def run_scenario() -> bool:
     # _handle_query alone does NOT call middleware.on_query (that's
     # _handle_incoming's job). For this test we mimic _handle_incoming by
     # calling on_query manually so the keep-alive's _in_flight is populated.
-    keep_alive.on_query("orig_A", _ponder_query())
-    await session._handle_query("orig_A", _ponder_query())
+    keep_alive.on_query(ClientId("orig_A"), _ponder_query())
+    await session._handle_query(ClientId("orig_A"), _ponder_query())
     print(f"  router.dispatched: {router.dispatched}")
     print(f"  keep_alive in-flight: {keep_alive._in_flight}")
 

@@ -34,7 +34,7 @@ from sortedcontainers.sortedlist import SortedList
 
 original_default = json.JSONEncoder.default
 
-def global_extended_encoder(self, obj):
+def global_extended_encoder(self: json.JSONEncoder, obj: Any) -> Any:
     # 1. Handle SortedList
     if isinstance(obj, SortedList):
         return list(obj)
@@ -51,8 +51,10 @@ def global_extended_encoder(self, obj):
 
     return original_default(self, obj)
 
-# Apply the patch globally
-json.JSONEncoder.default = global_extended_encoder
+# Apply the patch globally. setattr expresses the dynamic-rebind shape
+# so mypy doesn't flag a closed-class method-assign; same convention as
+# in proxy_server.py.
+setattr(json.JSONEncoder, "default", global_extended_encoder)
 
 import logging
 logger = logging.getLogger("kataproxy." + __name__)
@@ -310,7 +312,7 @@ class DeltaAnalysisState:
     def _make_branch(
         root_domain_size: int,
         color_indices: List[int],
-        summary_fn: Callable,
+        summary_fn: Callable[..., Any],
         include_triangular: bool
     ) -> CompiledPipeline:
         """
@@ -483,7 +485,8 @@ class DeltaAnalysisState:
         """
         if self._black_cwt_pipe is None:
             return {}
-        return self._black_cwt_pipe.nodes[-1].out_mem.get(0, {})
+        result: Dict[str, Any] = self._black_cwt_pipe.nodes[-1].out_mem.get(0, {})
+        return result
 
     @property
     def white_cwt_snapshot(self) -> Dict[str, Any]:
@@ -494,7 +497,8 @@ class DeltaAnalysisState:
         """
         if self._white_cwt_pipe is None:
             return {}
-        return self._white_cwt_pipe.nodes[-1].out_mem.get(0, {})
+        result: Dict[str, Any] = self._white_cwt_pipe.nodes[-1].out_mem.get(0, {})
+        return result
 
     # ------------------------------------------------------------------
     # Per-color delta lists

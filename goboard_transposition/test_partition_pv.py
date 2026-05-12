@@ -10,6 +10,8 @@ All tests use a 9x9 board for speed; the logic is size-independent.
 """
 
 import json
+from typing import Any, List, Optional
+
 import pytest
 
 go_transposition = pytest.importorskip(
@@ -25,12 +27,12 @@ go_transposition = pytest.importorskip(
 
 
 def make_req(
-    size=9,
-    initial_stones=None,
-    initial_player="B",
-    moves=None,
-):
-    d = {
+    size: int = 9,
+    initial_stones: Optional[List[Any]] = None,
+    initial_player: str = "B",
+    moves: Optional[List[Any]] = None,
+) -> str:
+    d: dict[str, Any] = {
         "boardXSize": size,
         "boardYSize": size,
         "initialPlayer": initial_player,
@@ -42,7 +44,7 @@ def make_req(
     return json.dumps(d)
 
 
-def make_resp(turn_number, current_player, move_infos):
+def make_resp(turn_number: int, current_player: str, move_infos: List[Any]) -> str:
     return json.dumps(
         {
             "turnNumber": turn_number,
@@ -52,7 +54,7 @@ def make_resp(turn_number, current_player, move_infos):
     )
 
 
-def run(req_str, resp_str):
+def run(req_str: str, resp_str: str) -> List[int]:
     raw = go_transposition.partition_pv(req_str, resp_str)
     data = json.loads(raw)
     ids = [mi["clusterId"] for mi in data["moveInfos"]]
@@ -60,7 +62,7 @@ def run(req_str, resp_str):
     return ids
 
 
-def same(*ids_at):
+def same(*ids_at: int) -> bool:
     vals = list(ids_at)
     ok = len(set(vals)) == 1
     if not ok:
@@ -68,7 +70,7 @@ def same(*ids_at):
     return ok
 
 
-def distinct(*ids_at):
+def distinct(*ids_at: int) -> bool:
     vals = list(ids_at)
     ok = len(set(vals)) == len(vals)
     if not ok:
@@ -79,7 +81,7 @@ def distinct(*ids_at):
 # ── tests ──────────────────────────────────────────────────────────────────────
 
 
-def test_single_pv_gets_cluster_zero():
+def test_single_pv_gets_cluster_zero() -> None:
     """Baseline: one moveInfo always lands in cluster 0."""
     ids = run(
         make_req(),
@@ -89,7 +91,7 @@ def test_single_pv_gets_cluster_zero():
     assert ids == [0]
 
 
-def test_disjoint_pvs_get_distinct_clusters():
+def test_disjoint_pvs_get_distinct_clusters() -> None:
     """
     Two PVs that visit completely different board regions share no
     intermediate state and must end up in different clusters.
@@ -105,7 +107,7 @@ def test_disjoint_pvs_get_distinct_clusters():
     assert distinct(ids[0], ids[1])
 
 
-def test_move_order_transposition():
+def test_move_order_transposition() -> None:
     """
     Two PVs that place the same stones in different orders reach an
     identical board state and must be assigned the same cluster.
@@ -124,7 +126,7 @@ def test_move_order_transposition():
     assert same(ids[0], ids[1])
 
 
-def test_shared_first_move_merges_at_step_one():
+def test_shared_first_move_merges_at_step_one() -> None:
     """
     Two PVs whose first move is identical produce the same board state
     after that move, triggering a merge immediately at step 1 —
@@ -141,7 +143,7 @@ def test_shared_first_move_merges_at_step_one():
     assert same(ids[0], ids[1])
 
 
-def test_three_way_merge_via_transitivity():
+def test_three_way_merge_via_transitivity() -> None:
     """
     Transitivity through the union-find: PV0 and PV1 share a final state
     so they merge.  Before that merge-and-break, PV1 recorded its own step-1
@@ -166,7 +168,7 @@ def test_three_way_merge_via_transitivity():
     assert same(ids[0], ids[1], ids[2])
 
 
-def test_two_independent_transposition_pairs():
+def test_two_independent_transposition_pairs() -> None:
     """
     When two disjoint pairs of PVs each form their own transposition,
     the result should be exactly two distinct cluster IDs — one per pair.
@@ -190,7 +192,7 @@ def test_two_independent_transposition_pairs():
     assert distinct(ids[0], ids[2])
 
 
-def test_missing_pv_key_gets_own_singleton_cluster():
+def test_missing_pv_key_gets_own_singleton_cluster() -> None:
     """
     A moveInfo with no "pv" key is skipped in the union-find loop and
     keeps its own singleton component, getting a cluster ID distinct from
@@ -207,7 +209,7 @@ def test_missing_pv_key_gets_own_singleton_cluster():
     assert distinct(ids[0], ids[1])
 
 
-def test_empty_pv_gets_own_singleton_cluster():
+def test_empty_pv_gets_own_singleton_cluster() -> None:
     """
     A moveInfo with an empty pv list is similarly skipped and must
     not be merged with anything.
@@ -223,7 +225,7 @@ def test_empty_pv_gets_own_singleton_cluster():
     assert distinct(ids[0], ids[1])
 
 
-def test_pass_moves_in_pv():
+def test_pass_moves_in_pv() -> None:
     """
     Passes are legal in Go and must be handled without crashing.
     Two PVs whose move sequences differ only in order but include
@@ -243,7 +245,7 @@ def test_pass_moves_in_pv():
     assert same(ids[0], ids[1])
 
 
-def test_initial_stones_dont_break_transposition_detection():
+def test_initial_stones_dont_break_transposition_detection() -> None:
     """
     Setup stones change the base Zobrist hash but the transposition
     logic must still work correctly over them.  A move-order transposition
@@ -261,7 +263,7 @@ def test_initial_stones_dont_break_transposition_detection():
     assert same(ids[0], ids[1])
 
 
-def test_turn_number_replays_move_history():
+def test_turn_number_replays_move_history() -> None:
     """
     A turnNumber > 0 causes the move history to be replayed into the
     base board before PV evaluation.  This test verifies that the
@@ -279,7 +281,7 @@ def test_turn_number_replays_move_history():
     assert same(ids[0], ids[1])
 
 
-def test_all_cluster_ids_are_non_negative_integers():
+def test_all_cluster_ids_are_non_negative_integers() -> None:
     """
     Every moveInfo in the output must have a clusterId that is a
     non-negative integer, regardless of whether it has a PV or not.
@@ -299,7 +301,7 @@ def test_all_cluster_ids_are_non_negative_integers():
     )
 
 
-def test_cluster_ids_are_dense_from_zero():
+def test_cluster_ids_are_dense_from_zero() -> None:
     """
     Cluster IDs are assigned in order of first appearance of each
     canonical root, so they must form a dense range [0, n_clusters).

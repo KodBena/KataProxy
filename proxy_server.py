@@ -50,7 +50,7 @@ import math
 import uuid
 from collections import OrderedDict
 from time import monotonic
-from typing import Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import numpy as np
 import websockets
@@ -120,7 +120,7 @@ from middleware.session_middleware import (
 
 original_default = json.JSONEncoder.default
 
-def global_extended_encoder(self, obj):
+def global_extended_encoder(self: json.JSONEncoder, obj: Any) -> Any:
     if isinstance(obj, SortedList):
         return list(obj)
     if isinstance(obj, (np.floating, np.integer)):
@@ -131,7 +131,12 @@ def global_extended_encoder(self, obj):
         return None
     return original_default(self, obj)
 
-json.JSONEncoder.default = global_extended_encoder
+# Method-assign on the stdlib JSON encoder is the deliberate
+# monkey-patch shape the encoder hooks expect; the assignment is
+# load-bearing for SortedList / np.floating handling and intentional.
+# Use setattr to express the dynamic-rebind intent so mypy doesn't
+# flag a closed-class method-assignment.
+setattr(json.JSONEncoder, "default", global_extended_encoder)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +183,10 @@ def _classify_response_kind(resp: KataGoResponse) -> str:
 # Type aliases
 # ---------------------------------------------------------------------------
 
-TransformerFactory = Callable[[ProxyLink], Transformer]
+TransformerFactory = Callable[
+    [ProxyLink[ClientId, InternalId]],
+    Transformer[KataGoQuery, KataGoResponse],
+]
 """A callable that receives the session's ProxyLink and returns a Transformer.
 Called once per ClientSession, so each session gets its own Transformer instance."""
 
@@ -259,15 +267,15 @@ class ClientSession:
 
     def __init__(
         self,
-        ws,
+        ws: Any,
         peer: str,
         hub: PubSubHub,
         router: BackendRouter,
         transformer_factory: Optional[TransformerFactory] = None,
         middleware: Optional[SessionMiddleware] = None,
         rate_limit: Optional[_PerIpRateLimit] = None,
-        proxy_log=None,
-    ):
+        proxy_log: Any = None,
+    ) -> None:
         self._ws = ws
         self._peer = peer
         # Structured-logging adapter: bound to role + session for
@@ -300,7 +308,7 @@ class ClientSession:
         # One tracker per client, shared with the ProxyLink so that
         # register_query_completion and the link's should_remove predicate
         # both operate on the same CompletionTracker instance.
-        self._tracker: CompletionTracker = CompletionTracker()
+        self._tracker: CompletionTracker[InternalId, int] = CompletionTracker()
         self._link = make_katago_link(tracker=self._tracker)
 
         transformer = transformer_factory and transformer_factory(self._link)
@@ -309,7 +317,7 @@ class ClientSession:
         )
 
         # Queue: hub puts relabelled wire dicts here; _send_loop drains it.
-        self._send_queue: asyncio.Queue = asyncio.Queue()
+        self._send_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
         # TransformedChain is always pure/synchronous.  Async policy lives
         # exclusively in SessionMiddleware, above this layer.
@@ -558,7 +566,7 @@ class ClientSession:
                 on_complete=self._hub.on_complete,
             )
 
-    async def _handle_terminate(self, orig_id: ClientId, query) -> None:
+    async def _handle_terminate(self, orig_id: ClientId, query: KataGoQuery) -> None:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
@@ -626,7 +634,7 @@ class ClientSession:
                 msg=f"terminate → upstream (canonical={canonical_id})",
             )
 
-            async def on_terminate_response(wire_id: str, wire: dict) -> None:
+            async def on_terminate_response(wire_id: str, wire: Dict[str, Any]) -> None:
                 relabelled = dict(wire)
                 relabelled["id"] = terminate_internal_id
                 if relabelled.get("terminateId") == canonical_id:
@@ -674,7 +682,7 @@ class ClientSession:
             # namespace; _deliver_upstream's translate_upstream pass
             # rewrites them to the client's namespace via the response
             # policy's referential fields (RESPONSE_TERMINATE_ID_FIELD).
-            synthesized_ack: dict = {
+            synthesized_ack: Dict[str, Any] = {
                 "id": terminate_internal_id,
                 "action": "terminate",
                 "terminateId": target_internal_id,
@@ -699,7 +707,7 @@ class ClientSession:
         middleware-initiated termination on a coalesced canonical only
         stops this session's view; other subscribers continue.
         """
-        synthetic_id = f"__keepalive_term_{uuid.uuid4().hex[:12]}"
+        synthetic_id = ClientId(f"__keepalive_term_{uuid.uuid4().hex[:12]}")
         term_query = KataGoQuery(
             action=KataGoAction.TERMINATE,
             terminate_id=target_orig_id,
@@ -752,7 +760,7 @@ class ClientSession:
                 msg=f"peer={self._peer} error in send loop",
             )
 
-    async def _deliver_upstream(self, wire: dict) -> None:
+    async def _deliver_upstream(self, wire: Dict[str, Any]) -> None:
         """Translate one relabelled response to client namespace and send.
 
         wire["id"] is already subscriber_internal_id (relabelled by the hub).
@@ -765,14 +773,26 @@ class ClientSession:
           3. middleware.handle_response: async policy; may buffer/inject/re-label.
           4. One WebSocket send per (orig_id, response) pair yielded.
         """
-        subscriber_internal_id = wire.get("id")
+        raw_internal_id = wire.get("id")
         self._log.debug(
             Event.DIAGNOSTIC,
             msg=(
                 f"peer={self._peer} "
-                f"internal_id={subscriber_internal_id!r}"
+                f"internal_id={raw_internal_id!r}"
             ),
         )
+
+        if raw_internal_id is None:
+            self._log.warning(
+                Event.DIAGNOSTIC,
+                msg="response missing 'id', skipping",
+            )
+            return
+        # The hub relabels wire["id"] to the subscriber_internal_id
+        # for this session before posting onto _send_queue (see
+        # pubsub_hub.PubSubHub.fanout); the brand is justified by that
+        # contract.
+        subscriber_internal_id = InternalId(raw_internal_id)
 
         try:
             _, response = parse_response_from_wire(wire)
@@ -889,7 +909,7 @@ class ClientSession:
             ),
         )
 
-        async def _drop_response(_wid: str, _wire: dict) -> None:
+        async def _drop_response(_wid: str, _wire: Dict[str, Any]) -> None:
             pass
 
         async def _drop_complete(_wid: str) -> None:
@@ -938,11 +958,11 @@ class RedirectSession:
 
     def __init__(
         self,
-        ws,
+        ws: Any,
         peer: str,
         upstream_urls: List[str],
-        rr_state: dict,
-    ):
+        rr_state: Dict[str, Any],
+    ) -> None:
         self._ws = ws
         self._peer = peer
         self._urls = upstream_urls
@@ -998,7 +1018,7 @@ class ProxyServer:
         self._hub_cache = LRUCacheStore(maxsize=cfg.HUB_CACHE_MAX)
         self._hub = PubSubHub(cache_store=self._hub_cache)
         self._router: Optional[BackendRouter] = None
-        self._rr_state: dict = {"counter": 0}
+        self._rr_state: Dict[str, Any] = {"counter": 0}
         # Concurrent-session bookkeeping (audit M-1). Capped via
         # PROXY_MAX_SESSIONS; a non-positive value disables the cap.
         self._active_sessions: int = 0
@@ -1038,7 +1058,7 @@ class ProxyServer:
         ):
             await asyncio.Future()  # run forever
 
-    async def _handle_connection(self, ws) -> None:
+    async def _handle_connection(self, ws: Any) -> None:
         peer = str(ws.remote_address)
         peer_ip = (
             ws.remote_address[0]
@@ -1076,6 +1096,7 @@ class ProxyServer:
         self._active_sessions += 1
         try:
             role = cfg.ROLE.upper()
+            session: "RedirectSession | ClientSession"
             if role in ("REDIRECT", "DELEGATE"):
                 session = RedirectSession(
                     ws=ws,
@@ -1088,6 +1109,12 @@ class ProxyServer:
                 # is stateful).
                 middleware = (
                     self._middleware_factory() if self._middleware_factory else None
+                )
+                # _router is None pre-start(), set non-None in start().
+                # Accepting connections without start() being called is a
+                # construction-order bug — assert rather than degrade.
+                assert self._router is not None, (
+                    "ProxyServer._accept_connection called before start()"
                 )
                 session = ClientSession(
                     ws=ws,
@@ -1161,7 +1188,7 @@ def _make_middleware() -> SessionMiddleware:
     )
 
 
-def _build_advertised_capabilities() -> dict[str, dict]:
+def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
     """Construct the server's capability advertisement at startup.
 
     delta_analysis and adaptive_reevaluate are unconditionally wired
@@ -1184,7 +1211,7 @@ def _build_advertised_capabilities() -> dict[str, dict]:
     on the *query* side (e.g. adaptive_reevaluate's worst_quantile /
     extra_visits overrides), not the advertisement side.
     """
-    advertised: dict[str, dict] = {
+    advertised: Dict[str, Dict[str, Any]] = {
         "delta_analysis": {},
         "adaptive_reevaluate": {},
     }

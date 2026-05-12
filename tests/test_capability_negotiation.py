@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, cast
 
 import pytest
 
@@ -41,10 +41,12 @@ if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
 from AbstractProxy.protocol_transformer import Transformer  # noqa: E402
+from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink  # noqa: E402
 from katago import (  # noqa: E402
     AnalyzeResponse,
     KataGoAction,
     KataGoQuery,
+    KataGoResponse,
     MetadataResponse,
     translate_query_to_wire,
 )
@@ -58,6 +60,15 @@ from transformers.capabilities_advertiser import capabilities_advertiser  # noqa
 from transformers.capability_gate import capability_gate  # noqa: E402
 
 
+# Tests use ``_MockLink`` (a duck-typed stand-in for ``ProxyLink``)
+# rather than constructing the real link to avoid coupling to KataGo's
+# tracker. At call sites passing into the typed transformer/middleware
+# factories, ``cast(ProxyLink[ClientId, InternalId], ...)`` records the
+# stand-in's intended type. The cast is the documented gap between
+# duck-typed test fixtures and the production type contract.
+_LinkT = ProxyLink[ClientId, InternalId]
+
+
 # ---------------------------------------------------------------------------
 # Test infrastructure: mocks for ProxyLink + stub Transformer/Middleware
 # ---------------------------------------------------------------------------
@@ -65,18 +76,20 @@ from transformers.capability_gate import capability_gate  # noqa: E402
 
 class _MockMapping:
     """Mimics the IdMapping surface the capability_gate consumes
-    (`forward(eid)` returning Optional[str])."""
+    (`forward(eid)` returning Optional[InternalId])."""
 
     def __init__(self) -> None:
-        self._fwd: dict[str, str] = {}
+        self._fwd: dict[ClientId, InternalId] = {}
 
-    def forward(self, orig_id: str) -> Optional[str]:
+    def forward(self, orig_id: ClientId) -> Optional[InternalId]:
         return self._fwd.get(orig_id)
 
-    def register(self, orig_id: str, downstream_id: str = "internal") -> None:
+    def register(
+        self, orig_id: ClientId, downstream_id: InternalId = InternalId("internal")
+    ) -> None:
         self._fwd[orig_id] = downstream_id
 
-    def complete(self, orig_id: str) -> None:
+    def complete(self, orig_id: ClientId) -> None:
         self._fwd.pop(orig_id, None)
 
 
@@ -87,17 +100,23 @@ class _MockLink:
 
 def _stub_transformer_factory(
     name: str = "stub",
-) -> tuple[Callable[[_MockLink], Transformer], dict]:
+) -> Tuple[
+    Callable[[_LinkT], Transformer[KataGoQuery, KataGoResponse]],
+    Dict[str, List[Tuple[ClientId, Any]]],
+]:
     """Return (factory, calls). The factory produces a Transformer
     whose on_query and on_response record their calls in `calls`."""
-    calls: dict[str, list] = {"on_query": [], "on_response": []}
+    calls: Dict[str, List[Tuple[ClientId, Any]]] = {
+        "on_query": [],
+        "on_response": [],
+    }
 
-    def factory(_link: _MockLink) -> Transformer:
-        def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
+    def factory(_link: _LinkT) -> Transformer[KataGoQuery, KataGoResponse]:
+        def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
             calls["on_query"].append((eid, q))
             return q
 
-        def on_response(eid: str, r: Any) -> Optional[Any]:
+        def on_response(eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
             calls["on_response"].append((eid, r))
             return r
 
@@ -111,8 +130,8 @@ class _RecordingMiddleware(SessionMiddleware):
     call for engagement-matrix testing."""
 
     def __init__(self) -> None:
-        self.queries: list[tuple[str, KataGoQuery]] = []
-        self.responses: list[tuple[str, Any]] = []
+        self.queries: List[Tuple[ClientId, KataGoQuery]] = []
+        self.responses: List[Tuple[ClientId, KataGoResponse]] = []
         self.session_starts: int = 0
         self.session_ends: int = 0
 
@@ -122,20 +141,25 @@ class _RecordingMiddleware(SessionMiddleware):
     def on_session_end(self) -> None:
         self.session_ends += 1
 
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
+    def on_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         self.queries.append((orig_id, query))
 
-    async def handle_response(self, orig_id, response, submit_query):
+    async def handle_response(
+        self,
+        orig_id: ClientId,
+        response: KataGoResponse,
+        submit_query: Callable[[ClientId, KataGoQuery], Awaitable[None]],
+    ) -> AsyncIterator[Tuple[ClientId, KataGoResponse]]:
         self.responses.append((orig_id, response))
         yield orig_id, response
 
 
 def _make_analyze_query(
     *,
-    capabilities: Optional[dict] = None,
-    extra_opaque: Optional[dict] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
+    extra_opaque: Optional[Dict[str, Any]] = None,
 ) -> KataGoQuery:
-    opaque: dict = {
+    opaque: Dict[str, Any] = {
         "rules": "tromp-taylor",
         "komi": 7.5,
         "boardXSize": 19,
@@ -179,7 +203,7 @@ class TestCoalescingCapabilities:
 
     def test_same_capabilities_produce_same_hash(self) -> None:
         policy = CoalescingPolicy()
-        caps = {"transposition": {}, "delta_analysis": {}}
+        caps: Dict[str, Any] = {"transposition": {}, "delta_analysis": {}}
         assert policy.query_hash(_make_analyze_query(capabilities=caps)) == \
                policy.query_hash(_make_analyze_query(capabilities=caps))
 
@@ -252,10 +276,10 @@ class TestCapabilityGateTransformer:
     def test_legacy_auto_engage_when_capabilities_absent(self) -> None:
         link = _MockLink()
         wrapped_factory, calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query()  # no capabilities field
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert len(calls["on_query"]) == 1, (
             "legacy auto-engage should call wrapped on_query"
         )
@@ -263,19 +287,19 @@ class TestCapabilityGateTransformer:
     def test_explicit_opt_in_engages(self) -> None:
         link = _MockLink()
         wrapped_factory, calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query(capabilities={"transposition": {}})
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert len(calls["on_query"]) == 1
 
     def test_explicit_opt_out_skips(self) -> None:
         link = _MockLink()
         wrapped_factory, calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query(capabilities={"delta_analysis": {}})  # no transposition
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert calls["on_query"] == [], (
             "explicit opt-out should not call wrapped on_query"
         )
@@ -283,23 +307,23 @@ class TestCapabilityGateTransformer:
     def test_empty_capabilities_skips(self) -> None:
         link = _MockLink()
         wrapped_factory, calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query(capabilities={})
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert calls["on_query"] == []
 
     def test_response_passthrough_when_not_engaged(self) -> None:
         link = _MockLink()
         wrapped_factory, calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query(capabilities={})
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         # Response side: not engaged for eid-1.
-        link.mapping.register("eid-1")  # mapping still alive
+        link.mapping.register(ClientId("eid-1"))  # mapping still alive
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={})
-        gated.on_response("eid-1", r)
+        gated.on_response(ClientId("eid-1"), r)
         assert calls["on_response"] == [], (
             "wrapped on_response should not be called when not engaged"
         )
@@ -307,34 +331,34 @@ class TestCapabilityGateTransformer:
     def test_response_engaged_when_query_opted_in(self) -> None:
         link = _MockLink()
         wrapped_factory, calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query(capabilities={"transposition": {}})
-        gated.on_query("eid-1", q)
-        link.mapping.register("eid-1")  # mapping alive
+        gated.on_query(ClientId("eid-1"), q)
+        link.mapping.register(ClientId("eid-1"))  # mapping alive
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={})
-        gated.on_response("eid-1", r)
+        gated.on_response(ClientId("eid-1"), r)
         assert len(calls["on_response"]) == 1
 
     def test_engaged_state_cleaned_when_mapping_completes(self) -> None:
         link = _MockLink()
         wrapped_factory, _calls = _stub_transformer_factory("inner")
-        gated = capability_gate("transposition", wrapped_factory)(link)
+        gated = capability_gate("transposition", wrapped_factory)(cast(_LinkT, link))
 
         q = _make_analyze_query(capabilities={"transposition": {}})
-        gated.on_query("eid-1", q)
-        link.mapping.register("eid-1")
+        gated.on_query(ClientId("eid-1"), q)
+        link.mapping.register(ClientId("eid-1"))
         # Final response arrives; mapping cleared by ProxyLink contract:
-        link.mapping.complete("eid-1")
+        link.mapping.complete(ClientId("eid-1"))
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={})
-        gated.on_response("eid-1", r)
+        gated.on_response(ClientId("eid-1"), r)
         # Now a *new* response for the same eid (shouldn't happen in
         # practice, but tests the cleanup): the engagement record was
         # dropped, so engagement is no longer recognised.
         wrapped_factory_2, calls_2 = _stub_transformer_factory("inner2")
-        gated_2 = capability_gate("transposition", wrapped_factory_2)(link)
+        gated_2 = capability_gate("transposition", wrapped_factory_2)(cast(_LinkT, link))
         # Already-completed eid: response passthrough.
-        gated_2.on_response("eid-1", r)
+        gated_2.on_response(ClientId("eid-1"), r)
         assert calls_2["on_response"] == []
 
 
@@ -350,7 +374,7 @@ class TestCapabilityGatedMiddleware:
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query()
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert rec.queries == [("eid-1", q)]
 
     async def test_explicit_opt_in_engages(self) -> None:
@@ -358,7 +382,7 @@ class TestCapabilityGatedMiddleware:
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query(capabilities={"adaptive_reevaluate": {}})
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert rec.queries == [("eid-1", q)]
 
     async def test_explicit_opt_out_skips_wrapped(self) -> None:
@@ -366,7 +390,7 @@ class TestCapabilityGatedMiddleware:
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query(capabilities={"transposition": {}})  # not adaptive
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         assert rec.queries == []
 
     async def test_response_unchanged_when_not_engaged(self) -> None:
@@ -393,47 +417,47 @@ class TestCapabilityGatedMiddleware:
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query(capabilities={})
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
         # The on_query gate stays — opt-out skips wrapped.on_query
         # (the cost gate; the wrapped's setup is not paid for opted-
         # out queries).
         assert rec.queries == []
 
-        async def submit_query(_id, _q): pass
+        async def submit_query(_id: ClientId, _q: KataGoQuery) -> None: pass
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={})
 
         out = []
-        async for oid, resp in gated.handle_response("eid-1", r, submit_query):
+        async for oid, resp in gated.handle_response(ClientId("eid-1"), r, submit_query):
             out.append((oid, resp))
         # Output unchanged — the user-visible contract.
-        assert out == [("eid-1", r)]
+        assert out == [(ClientId("eid-1"), r)]
         # Wrapped observes — contract change as of the sub-query
         # routing fix. _RecordingMiddleware just records and yields,
         # so the output is unchanged.
-        assert rec.responses == [("eid-1", r)]
+        assert rec.responses == [(ClientId("eid-1"), r)]
 
     async def test_response_engaged_when_query_opted_in(self) -> None:
         rec = _RecordingMiddleware()
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query(capabilities={"adaptive_reevaluate": {}})
-        gated.on_query("eid-1", q)
+        gated.on_query(ClientId("eid-1"), q)
 
-        async def submit_query(_id, _q): pass
+        async def submit_query(_id: ClientId, _q: KataGoQuery) -> None: pass
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={})
 
         out = []
-        async for oid, resp in gated.handle_response("eid-1", r, submit_query):
+        async for oid, resp in gated.handle_response(ClientId("eid-1"), r, submit_query):
             out.append((oid, resp))
-        assert out == [("eid-1", r)]
-        assert rec.responses == [("eid-1", r)]
+        assert out == [(ClientId("eid-1"), r)]
+        assert rec.responses == [(ClientId("eid-1"), r)]
 
     async def test_session_lifecycle_delegated(self) -> None:
         rec = _RecordingMiddleware()
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
-        async def submit_query(_id, _q): pass
-        async def terminate_query(_id): pass
+        async def submit_query(_id: ClientId, _q: KataGoQuery) -> None: pass
+        async def terminate_query(_id: ClientId) -> None: pass
         caps = SessionCapabilities(
             submit_query=submit_query,
             terminate_query=terminate_query,
@@ -449,8 +473,8 @@ class TestCapabilityGatedMiddleware:
         gated = CapabilityGatedMiddleware("adaptive_reevaluate", rec)
 
         q = _make_analyze_query(capabilities={"adaptive_reevaluate": {}})
-        gated.on_query("eid-1", q)
-        assert "eid-1" in gated._engaged
+        gated.on_query(ClientId("eid-1"), q)
+        assert ClientId("eid-1") in gated._engaged
 
         gated.on_session_end()
         assert gated._engaged == {}
@@ -476,7 +500,7 @@ class TestAdaptiveReevaluateMetadata:
     """
 
     @staticmethod
-    def _make_middleware():
+    def _make_middleware() -> Any:
         from middleware.adaptive_reevaluate import adaptive_reevaluate
         # The factory now returns a factory; call () to instantiate.
         return adaptive_reevaluate(
@@ -486,16 +510,16 @@ class TestAdaptiveReevaluateMetadata:
         )()
 
     @staticmethod
-    def _make_caps():
+    def _make_caps() -> Tuple[Any, SessionCapabilities]:
         """Fake SessionCapabilities recording submit/terminate calls."""
         class _Caps:
-            submitted: list = []
-            terminated: list = []
+            submitted: List[Tuple[ClientId, KataGoQuery]] = []
+            terminated: List[ClientId] = []
 
-            async def submit(self, oid, q):
+            async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
                 self.submitted.append((oid, q))
 
-            async def terminate(self, oid):
+            async def terminate(self, oid: ClientId) -> None:
                 self.terminated.append(oid)
 
         c = _Caps()
@@ -523,15 +547,17 @@ class TestAdaptiveReevaluateMetadata:
         )
 
     @staticmethod
-    async def _drive_response(m, orig_id, response):
+    async def _drive_response(
+        m: Any, orig_id: ClientId, response: KataGoResponse,
+    ) -> List[Tuple[ClientId, KataGoResponse]]:
         """Drain handle_response yields into a list."""
-        out = []
+        out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in m.handle_response(orig_id, response, None):
             out.append((oid, resp))
         return out
 
     @staticmethod
-    async def _wait_for_spawn(caps, timeout_s: float = 1.0):
+    async def _wait_for_spawn(caps: Any, timeout_s: float = 1.0) -> bool:
         """Poll until caps.submitted has at least one entry."""
         import asyncio
         deadline = asyncio.get_event_loop().time() + timeout_s
@@ -560,9 +586,9 @@ class TestAdaptiveReevaluateMetadata:
                 },
             },
         )
-        m.on_query("eid-1", q)
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        m.on_query(ClientId("eid-1"), q)
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(0))
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(1))
         assert await self._wait_for_spawn(c), "deeper query was not spawned"
         _, deeper = c.submitted[0]
         # extra_visits=1600 (override) + maxVisits=1000 (parent) = 2600.
@@ -586,9 +612,9 @@ class TestAdaptiveReevaluateMetadata:
                 "capabilities": {"adaptive_reevaluate": {}},  # opt-in, no overrides
             },
         )
-        m.on_query("eid-1", q)
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        m.on_query(ClientId("eid-1"), q)
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(0))
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(1))
         assert await self._wait_for_spawn(c)
         _, deeper = c.submitted[0]
         # extra_visits=800 (constructor default) + maxVisits=1000 = 1800.
@@ -612,9 +638,9 @@ class TestAdaptiveReevaluateMetadata:
                 # No capabilities field — legacy auto-engage path.
             },
         )
-        m.on_query("eid-1", q)
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        m.on_query(ClientId("eid-1"), q)
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(0))
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(1))
         assert await self._wait_for_spawn(c)
         _, deeper = c.submitted[0]
         # Constructor defaults: extra_visits=800 + maxVisits=1000 = 1800.
@@ -641,9 +667,9 @@ class TestAdaptiveReevaluateMetadata:
                 },
             },
         )
-        m.on_query("eid-1", q)
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(0))
-        await self._drive_response(m, "eid-1", self._make_response_with_deltas(1))
+        m.on_query(ClientId("eid-1"), q)
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(0))
+        await self._drive_response(m, ClientId("eid-1"), self._make_response_with_deltas(1))
         assert await self._wait_for_spawn(c)
         _, deeper = c.submitted[0]
         # extra_visits=2000 (override) + maxVisits=1000 = 3000.
@@ -704,7 +730,7 @@ class TestAdaptiveStreamingPreviews:
     """
 
     @staticmethod
-    def _make_middleware(window_size: int = 1):
+    def _make_middleware(window_size: int = 1) -> Any:
         from middleware.adaptive_reevaluate import adaptive_reevaluate
         return adaptive_reevaluate(
             worst_quantile=0.25,
@@ -713,15 +739,15 @@ class TestAdaptiveStreamingPreviews:
         )()
 
     @staticmethod
-    def _make_caps():
+    def _make_caps() -> Tuple[Any, SessionCapabilities]:
         class _Caps:
-            submitted: list = []
-            terminated: list = []
+            submitted: List[Tuple[ClientId, KataGoQuery]] = []
+            terminated: List[ClientId] = []
 
-            async def submit(self, oid, q):
+            async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
                 self.submitted.append((oid, q))
 
-            async def terminate(self, oid):
+            async def terminate(self, oid: ClientId) -> None:
                 self.terminated.append(oid)
 
         c = _Caps()
@@ -759,14 +785,16 @@ class TestAdaptiveStreamingPreviews:
         )
 
     @staticmethod
-    async def _drive_response(m, orig_id, response):
-        out = []
+    async def _drive_response(
+        m: Any, orig_id: ClientId, response: KataGoResponse,
+    ) -> List[Tuple[ClientId, KataGoResponse]]:
+        out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in m.handle_response(orig_id, response, None):
             out.append((oid, resp))
         return out
 
     @staticmethod
-    async def _wait_for_spawn(caps, timeout_s: float = 1.0):
+    async def _wait_for_spawn(caps: Any, timeout_s: float = 1.0) -> bool:
         import asyncio
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
@@ -797,12 +825,12 @@ class TestAdaptiveStreamingPreviews:
                 "maxVisits": 1000,
             },
         )
-        m.on_query("eid-1", q)
+        m.on_query(ClientId("eid-1"), q)
 
         # First final → preview emission immediately. The second turn
         # has not yet arrived; pre-v1.0.20 would have buffered turn 0
         # silently here.
-        out0 = await self._drive_response(m, "eid-1", self._bad_final(0))
+        out0 = await self._drive_response(m, ClientId("eid-1"), self._bad_final(0))
         previews_for_turn_0 = [
             r for _, r in out0
             if isinstance(r, AnalyzeResponse)
@@ -836,11 +864,11 @@ class TestAdaptiveStreamingPreviews:
                 "maxVisits": 1000,
             },
         )
-        m.on_query("eid-1", q)
+        m.on_query(ClientId("eid-1"), q)
 
-        all_yields: list = []
-        all_yields += await self._drive_response(m, "eid-1", self._neutral_final(0))
-        all_yields += await self._drive_response(m, "eid-1", self._neutral_final(1))
+        all_yields: List[Tuple[ClientId, KataGoResponse]] = []
+        all_yields += await self._drive_response(m, ClientId("eid-1"), self._neutral_final(0))
+        all_yields += await self._drive_response(m, ClientId("eid-1"), self._neutral_final(1))
 
         previews = sorted(
             r.turn_number for _, r in all_yields
@@ -889,12 +917,12 @@ class TestAdaptiveStreamingPreviews:
                 "maxVisits": 1000,
             },
         )
-        m.on_query("eid-1", q)
+        m.on_query(ClientId("eid-1"), q)
 
-        all_yields: list = []
+        all_yields: List[Tuple[ClientId, KataGoResponse]] = []
         for turn in range(6):
             resp = self._bad_final(0) if turn == 0 else self._neutral_final(turn)
-            all_yields += await self._drive_response(m, "eid-1", resp)
+            all_yields += await self._drive_response(m, ClientId("eid-1"), resp)
 
         # Every turn produced a preview during Stage 1.
         preview_turns = sorted(
@@ -935,11 +963,11 @@ class TestAdaptiveStreamingPreviews:
 class TestCapabilitiesAdvertiser:
     def test_query_version_response_gains_capabilities(self) -> None:
         link = _MockLink()
-        advertised = {"delta_analysis": {}, "transposition": {}, "adaptive_reevaluate": {}}
-        t = capabilities_advertiser(advertised)(link)
+        advertised: Dict[str, Dict[str, Any]] = {"delta_analysis": {}, "transposition": {}, "adaptive_reevaluate": {}}
+        t = capabilities_advertiser(advertised)(cast(_LinkT, link))
 
         r = MetadataResponse(opaque={"version": "1.16.0", "git_hash": "abcdef"})
-        out = t.on_response("eid-1", r)
+        out = t.on_response(ClientId("eid-1"), r)
         assert isinstance(out, MetadataResponse)
         assert out.opaque["capabilities"] == advertised
         # Original fields preserved.
@@ -949,41 +977,42 @@ class TestCapabilitiesAdvertiser:
     def test_other_metadata_responses_unchanged(self) -> None:
         # E.g., a clear_cache ack or terminate ack — no "version" key.
         link = _MockLink()
-        t = capabilities_advertiser({"delta_analysis": {}})(link)
+        t = capabilities_advertiser({"delta_analysis": {}})(cast(_LinkT, link))
 
         r = MetadataResponse(opaque={"action": "clear_cache"})
-        out = t.on_response("eid-1", r)
+        out = t.on_response(ClientId("eid-1"), r)
         assert out is r  # passthrough; same object
         assert "capabilities" not in out.opaque
 
     def test_analyze_responses_unchanged(self) -> None:
         link = _MockLink()
-        t = capabilities_advertiser({"delta_analysis": {}})(link)
+        t = capabilities_advertiser({"delta_analysis": {}})(cast(_LinkT, link))
 
         r = AnalyzeResponse(is_during_search=False, turn_number=1, opaque={"moveInfos": []})
-        out = t.on_response("eid-1", r)
+        out = t.on_response(ClientId("eid-1"), r)
         assert out is r
 
     def test_advertisement_is_copy_not_reference(self) -> None:
         link = _MockLink()
-        advertised = {"delta_analysis": {}}
-        t = capabilities_advertiser(advertised)(link)
+        advertised: Dict[str, Dict[str, Any]] = {"delta_analysis": {}}
+        t = capabilities_advertiser(advertised)(cast(_LinkT, link))
 
         # Mutate the source dict after factory construction.
         advertised["transposition"] = {}
 
         r = MetadataResponse(opaque={"version": "1.0"})
-        out = t.on_response("eid-1", r)
+        out = t.on_response(ClientId("eid-1"), r)
         # The advertisement was deep-copied at factory call time;
         # post-construction mutation should not leak into emitted
         # responses.
+        assert out is not None
         assert "transposition" not in out.opaque["capabilities"]
         assert out.opaque["capabilities"] == {"delta_analysis": {}}
 
     def test_query_side_is_identity(self) -> None:
         link = _MockLink()
-        t = capabilities_advertiser({"delta_analysis": {}})(link)
+        t = capabilities_advertiser({"delta_analysis": {}})(cast(_LinkT, link))
 
         q = _make_analyze_query()
-        out = t.on_query("eid-1", q)
+        out = t.on_query(ClientId("eid-1"), q)
         assert out is q

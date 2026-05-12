@@ -24,13 +24,16 @@ from copy import deepcopy
 from typing import Any, Callable, Dict, Optional
 
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ClientId, ProxyLink
+from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import KataGoQuery, KataGoResponse, MetadataResponse
 
 
 def capabilities_advertiser(
     advertised: Dict[str, Dict[str, Any]],
-) -> Callable[[ProxyLink], Transformer]:
+) -> Callable[
+    [ProxyLink[ClientId, InternalId]],
+    Transformer[KataGoQuery, KataGoResponse],
+]:
     """Return a Transformer factory that adds the capability advertisement
     to query_version responses.
 
@@ -59,7 +62,9 @@ def capabilities_advertiser(
     """
     advertised_snapshot: Dict[str, Dict[str, Any]] = deepcopy(advertised)
 
-    def factory(_link: ProxyLink) -> Transformer:
+    def factory(
+        _link: ProxyLink[ClientId, InternalId],
+    ) -> Transformer[KataGoQuery, KataGoResponse]:
         def on_query(_eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
             return q
 

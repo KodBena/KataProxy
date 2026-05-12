@@ -36,11 +36,13 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
+from AbstractProxy.proxy_core import ClientId  # noqa: E402
 from katago import KataGoAction, KataGoQuery  # noqa: E402
 from proxy_server import ClientSession  # noqa: E402
 from pubsub_hub import PubSubHub  # noqa: E402
@@ -90,9 +92,11 @@ def _terminate_query(target_orig_id: str) -> KataGoQuery:
     )
 
 
-async def _drain_queue(session: ClientSession, max_drains: int = 1000) -> list:
+async def _drain_queue(
+    session: ClientSession, max_drains: int = 1000
+) -> list[dict[str, Any]]:
     """Drain a session's send_queue, returning all wires."""
-    wires = []
+    wires: list[dict[str, Any]] = []
     for _ in range(max_drains):
         try:
             wires.append(session._send_queue.get_nowait())
@@ -101,7 +105,7 @@ async def _drain_queue(session: ClientSession, max_drains: int = 1000) -> list:
     return wires
 
 
-def _find_terminate_ack(wires: list) -> dict | None:
+def _find_terminate_ack(wires: list[dict[str, Any]]) -> dict[str, Any] | None:
     for w in wires:
         if isinstance(w, dict) and w.get("action") == "terminate":
             return w
@@ -130,8 +134,8 @@ async def run_scenario() -> bool:
     )
 
     print("\n--- Step 1: A and B subscribe to identical ponder (coalesce) ---")
-    await session_a._handle_query("orig_A", _ponder_query())
-    await session_b._handle_query("orig_B", _ponder_query())
+    await session_a._handle_query(ClientId("orig_A"), _ponder_query())
+    await session_b._handle_query(ClientId("orig_B"), _ponder_query())
     if len(router.dispatched) != 1:
         print(f"  UNEXPECTED: dispatched should be 1, got {len(router.dispatched)}")
         return False
@@ -148,7 +152,7 @@ async def run_scenario() -> bool:
     print(f"  router emit count (canonical): {emits_pre_a_terminate}")
 
     print("\n--- Step 3: A explicitly terminates its ponder ---")
-    await session_a._handle_terminate("orig_A_term", _terminate_query("orig_A"))
+    await session_a._handle_terminate(ClientId("orig_A_term"), _terminate_query("orig_A"))
 
     print("\n--- Step 4: verify multi-subscriber path ---")
     if router.terminated:
@@ -183,7 +187,7 @@ async def run_scenario() -> bool:
         return False
 
     print("\n--- Step 6: B explicitly terminates its ponder (now sole subscriber) ---")
-    await session_b._handle_terminate("orig_B_term", _terminate_query("orig_B"))
+    await session_b._handle_terminate(ClientId("orig_B_term"), _terminate_query("orig_B"))
 
     # Allow a tick for the router's terminate task and synthetic ack to settle.
     await asyncio.sleep(0.1)

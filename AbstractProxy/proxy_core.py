@@ -295,7 +295,14 @@ class TranslationError(Exception):
 # IdGenerator — pluggable ID minting strategy
 # ---------------------------------------------------------------------------
 
-class IdGenerator(Protocol[U, D]):
+# Protocol-variance-correct TypeVars for IdGenerator. mypy requires
+# protocol type parameters used only as callable inputs to be
+# contravariant and only as outputs to be covariant.
+_U_contra = TypeVar("_U_contra", bound=Hashable, contravariant=True)
+_D_co = TypeVar("_D_co", bound=Hashable, covariant=True)
+
+
+class IdGenerator(Protocol[_U_contra, _D_co]):
     """Strategy for generating downstream IDs from upstream IDs.
 
     Swapping this is how you get:
@@ -309,7 +316,7 @@ class IdGenerator(Protocol[U, D]):
     pre-branding KataGo wire form); the branding makes the
     upstream-vs-downstream asymmetry typecheck-visible.
     """
-    def __call__(self, upstream_id: U) -> D: ...
+    def __call__(self, upstream_id: _U_contra) -> _D_co: ...
 
 
 # ---------------------------------------------------------------------------

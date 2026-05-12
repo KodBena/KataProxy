@@ -65,6 +65,7 @@ def log_safe(s: object, *, max_len: int = _DEFAULT_LOG_TRUNCATE) -> str:
     bodies, peer addresses, KataGo stdout lines, upstream messages —
     before f-stringing it into a log record.
     """
+    truncated: object
     if isinstance(s, (bytes, bytearray)):
         truncated = bytes(s[:max_len]) + (b"..." if len(s) > max_len else b"")
     else:

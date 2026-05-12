@@ -25,7 +25,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional, Sequence, cast
 
 from AbstractProxy.proxy_core import (
     ClientId,
@@ -235,26 +235,52 @@ def make_katago_removal_predicate(
 
 def make_katago_query_policy(
     tracker: CompletionTracker[InternalId, int],
-) -> IdPolicy[KataGoQuery, str]:
+) -> IdPolicy[KataGoQuery, ClientId]:
     """Query-direction policy for KataGo.
 
     All query types get registered. The single referential field is
     terminateId. Queries never trigger mapping removal — only responses do.
+
+    The `I` parameter is `ClientId` because the query-direction policy's
+    referential field is read pre-translation, i.e., in the client-facing
+    namespace. The lambda's `_did` parameter is annotated `ClientId` to
+    match.
     """
     return IdPolicy(
         should_register=lambda _q: True,
-        referential_fields=[TERMINATE_ID_FIELD],
+        # Cast: TERMINATE_ID_FIELD's `I` is the raw `str` because a single
+        # ReferentialField cannot encode the get-namespace / set-namespace
+        # asymmetry of the translate path (the field reads ClientId
+        # pre-translation and writes InternalId post-translation, or
+        # vice-versa on the response side). The Phase 2 design memo
+        # acknowledges this; a future field-shape refactor (per §7 future
+        # work) would close the cast.
+        referential_fields=cast(
+            "Sequence[ReferentialField[KataGoQuery, ClientId]]",
+            [TERMINATE_ID_FIELD],
+        ),
         should_remove=lambda _did, _q: False,
     )
 
 
 def make_katago_response_policy(
     tracker: CompletionTracker[InternalId, int],
-) -> IdPolicy[KataGoResponse, str]:
-    """Response-direction policy for KataGo."""
+) -> IdPolicy[KataGoResponse, InternalId]:
+    """Response-direction policy for KataGo.
+
+    The `I` parameter is `InternalId` because the response-direction
+    policy's referential field is read pre-translation, i.e., in the
+    session-internal namespace before being lensed back to the
+    client-facing namespace. The `should_remove` predicate's first
+    argument lands in this namespace too.
+    """
     return IdPolicy(
         should_register=lambda _r: True,
-        referential_fields=[RESPONSE_TERMINATE_ID_FIELD],
+        # Cast: see the symmetric comment in make_katago_query_policy.
+        referential_fields=cast(
+            "Sequence[ReferentialField[KataGoResponse, InternalId]]",
+            [RESPONSE_TERMINATE_ID_FIELD],
+        ),
         should_remove=make_katago_removal_predicate(tracker),
     )
 
@@ -313,44 +339,34 @@ def make_katago_link(
         generator=katago_id_generator,
     )
 
-    # The framework's ProxyLink[ClientId, InternalId] expects
-    # query_policy: IdPolicy[Any, ClientId] and response_policy:
-    # IdPolicy[Any, InternalId]. The policy factories below return the
-    # pre-brand `IdPolicy[..., str]` shape because the underlying
-    # ReferentialFields (TERMINATE_ID_FIELD, RESPONSE_TERMINATE_ID_FIELD)
-    # carry an inherent get/set asymmetry — query-side fields read
-    # ClientId-namespace ids from the payload but set InternalId-namespace
-    # ids after translation, and the single-I ReferentialField shape
-    # can't represent both directions in one type. Phase 1's design
-    # memo acknowledges this and centralises the asymmetry as a `cast`
-    # at `ProxyLink.translate_downstream` / `translate_upstream`'s
-    # `translate_referentials` call site. The casts here are the
-    # symmetric construction-side counterpart: we know runtime
-    # behaviour is correct (NewType is identity at runtime); the
-    # typecheck-side approximation is the cast. Per ADR-0002 Rule 2,
-    # casts must be justified — this comment is the justification.
-    # A future Phase 3 that restructures ReferentialField to encode
-    # the asymmetry (e.g., `ReferentialField[P, F, T]` where F is the
-    # get-namespace and T is the set-namespace) would remove the
-    # casts; not in Phase 2's scope.
-    query_policy = cast(
-        IdPolicy[Any, ClientId], make_katago_query_policy(tracker),
-    )
-    response_policy = cast(
-        IdPolicy[Any, InternalId], make_katago_response_policy(tracker),
-    )
-
+    # The policy factories now return branded variants directly:
+    # `IdPolicy[KataGoQuery, ClientId]` and `IdPolicy[KataGoResponse,
+    # InternalId]`. The ReferentialField asymmetry (a field reads in
+    # one namespace and writes in another after translation) is
+    # absorbed by casts inside each factory, leaving the link
+    # composition site clean.
     return ProxyLink(
         mapping=mapping,
-        query_policy=query_policy,
-        response_policy=response_policy,
+        query_policy=make_katago_query_policy(tracker),
+        response_policy=make_katago_response_policy(tracker),
     )
 
 
-def make_katago_chain(depth: int = 1) -> ProxyChain[str]:
-    """Build a chain of `depth` independent KataGo proxy links."""
+def make_katago_chain(depth: int = 1) -> ProxyChain[ClientId]:
+    """Build a chain of `depth` independent KataGo proxy links.
+
+    Note: `ProxyChain` is homogeneous in a single namespace `I`; the
+    KataGo link is `ProxyLink[ClientId, InternalId]`, which is two
+    namespaces. A multi-link KataGo chain is only well-formed for
+    depth=1 at present; higher depths would require renormalising
+    each link's downstream to the next link's upstream (`InternalId
+    == ClientId` of the next), which is out of Phase 2's scope.
+    """
     links = [make_katago_link() for _ in range(depth)]
-    return ProxyChain(links)
+    # Cast: see docstring — ProxyChain's single-I generic cannot express
+    # the per-link two-namespace shape. Runtime behaviour is correct;
+    # the typecheck approximation is the cast.
+    return cast(ProxyChain[ClientId], ProxyChain(links))
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Optional
 
+from AbstractProxy.proxy_core import CanonicalId
 from katago import KataGoAction, KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
 
@@ -46,11 +47,11 @@ logger = logging.getLogger("kataproxy.tests.synthetic_backend")
 
 @dataclass
 class _LiveCanonical:
-    canonical_id: str
+    canonical_id: CanonicalId
     on_response: OnResponse
     on_complete: OnComplete
     turns: list[int]
-    emit_task: Optional[asyncio.Task] = None
+    emit_task: Optional[asyncio.Task[None]] = None
     emit_count: int = 0
 
 
@@ -71,12 +72,12 @@ class SyntheticPonderingRouter(BackendRouter):
     ) -> None:
         self._emit_interval_s = emit_interval_s
         self._max_intermediates = max_intermediates
-        self._live: dict[str, _LiveCanonical] = {}
-        self.dispatched: list[str] = []
-        self.terminated: list[str] = []
+        self._live: dict[CanonicalId, _LiveCanonical] = {}
+        self.dispatched: list[CanonicalId] = []
+        self.terminated: list[CanonicalId] = []
 
     @property
-    def live(self) -> dict[str, int]:
+    def live(self) -> dict[CanonicalId, int]:
         """Currently-pondering canonical_ids → intermediate emit counts."""
         return {cid: lc.emit_count for cid, lc in self._live.items()}
 
@@ -85,7 +86,7 @@ class SyntheticPonderingRouter(BackendRouter):
 
     async def dispatch(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -114,7 +115,7 @@ class SyntheticPonderingRouter(BackendRouter):
             name=f"synthetic-emit:{canonical_id}",
         )
 
-    async def _emit_loop(self, canonical_id: str) -> None:
+    async def _emit_loop(self, canonical_id: CanonicalId) -> None:
         try:
             for _ in range(self._max_intermediates):
                 await asyncio.sleep(self._emit_interval_s)
@@ -150,7 +151,7 @@ class SyntheticPonderingRouter(BackendRouter):
 
     async def terminate(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
@@ -170,7 +171,10 @@ class SyntheticPonderingRouter(BackendRouter):
         # the proxy's _handle_terminate relabel callback (or Phase 2's
         # synthesized ack) will rewrite it to the client's namespace via
         # the response policy's referential field.
-        term_wire_id = f"kg_{secrets.token_hex(6)}"
+        # Synthetic ack's wire id is a fresh string used as the
+        # routing key per the BackendRouter convention; brand as
+        # CanonicalId to match the callback signature.
+        term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
         ack: WireDict = {
             "id": term_wire_id,
             "action": "terminate",

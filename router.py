@@ -133,7 +133,9 @@ _WS_MAX_SIZE = _READER_LIMIT
 # ---------------------------------------------------------------------------
 
 def _register_query(
-    tracker: CompletionTracker[str, int], qid: str, query: KataGoQuery
+    tracker: CompletionTracker[CanonicalId, int],
+    qid: CanonicalId,
+    query: KataGoQuery,
 ) -> None:
     """Register the expected number of final responses for qid in tracker.
 
@@ -380,9 +382,9 @@ class LeafRouter(BackendRouter):
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stderr_task: Optional[asyncio.Task[None]] = None
-        self._tracker: CompletionTracker[str, int] = CompletionTracker()
+        self._tracker: CompletionTracker[CanonicalId, int] = CompletionTracker()
         # canonical_id → (on_response, on_complete)
-        self._callbacks: dict[str, tuple[OnResponse, OnComplete]] = {}
+        self._callbacks: dict[CanonicalId, tuple[OnResponse, OnComplete]] = {}
         # Structured-logging adapter, role-bound at construction. The
         # subprocess pid is bound into a sub-adapter (`self._kg_log`)
         # in _spawn so every kg_* event auto-carries it.
@@ -731,13 +733,17 @@ class LeafRouter(BackendRouter):
                 msg=f"stdout: {json.dumps(filter_dict(wire))}",
             )
 
-            canonical_id = wire.get("id")
-            if canonical_id is None:
+            raw_id = wire.get("id")
+            if raw_id is None:
                 self._kg_log.warning(
                     Event.DIAGNOSTIC,
                     msg="response missing 'id', skipping",
                 )
                 continue
+            # LEAF dispatches with canonical_id as the engine's wire id, so
+            # the response's id field is the originating canonical_id by
+            # construction.
+            canonical_id = CanonicalId(raw_id)
 
             # Startup-probe short-circuit. Any response on the probe id
             # counts as liveness — even a KataGo protocol error, since
@@ -988,7 +994,14 @@ class LeafRouter(BackendRouter):
         self._callbacks.pop(canonical_id, None)
 
         async def _send_synthetic_ack() -> None:
-            term_wire_id = f"kg_{secrets.token_hex(6)}"
+            # The synthetic terminate ack's id is a fresh wire-id
+            # (semantically distinct from the analyze's canonical_id),
+            # but the on_response/on_complete callbacks dispatch by
+            # whatever-id-came-out-of-the-wire convention. Brand as
+            # CanonicalId here to thread the typecheck without
+            # widening the callback signature; the runtime contract is
+            # unchanged.
+            term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
             synthetic: WireDict = {
                 "id": term_wire_id,
                 "action": "terminate",
@@ -1014,7 +1027,12 @@ class LeafRouter(BackendRouter):
             return
 
         # Mint a fresh wire id for the terminate query itself.
-        term_wire_id = f"kg_{secrets.token_hex(6)}"
+        # Brand as CanonicalId: see _send_synthetic_ack — the same
+        # convention applies (tracker and _callbacks key by
+        # whatever-id-came-out-of-the-wire, which for the terminate
+        # request is its wire-id; semantically distinct from the
+        # analyze's canonical_id but routed by the same dict).
+        term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
         term_wire: WireDict = {
             "id": term_wire_id,
             "action": "terminate",
@@ -1124,7 +1142,7 @@ class RelayRouter(BackendRouter):
         # (audit H-2). The set is self-pruning via the done-callback in
         # _schedule_reconnect.
         self._reconnect_tasks: set[asyncio.Task[None]] = set()
-        self._tracker: CompletionTracker[str, int] = CompletionTracker()
+        self._tracker: CompletionTracker[CanonicalId, int] = CompletionTracker()
         # canonical_id → (on_response, on_complete, url)
         self._callbacks: dict[str, tuple[OnResponse, OnComplete, str]] = {}
 
@@ -1502,7 +1520,9 @@ class RelayRouter(BackendRouter):
 
         # Helper to synthesize an ack so the client doesn't freeze
         async def _send_synthetic_ack() -> None:
-            term_wire_id = f"kg_{secrets.token_hex(6)}"
+            # Brand-as-CanonicalId at routing-key sites; see LEAF's
+            # _send_synthetic_ack for the rationale.
+            term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
             synthetic_ack: WireDict = {
                 "id": term_wire_id,
                 "action": "terminate",
@@ -1534,7 +1554,11 @@ class RelayRouter(BackendRouter):
             await _send_synthetic_ack()
             return
 
-        term_wire_id = f"kg_{secrets.token_hex(6)}"
+        # Brand-as-CanonicalId at routing-key sites; see LEAF's
+        # _send_synthetic_ack for the rationale (the terminate's wire
+        # id is the routing key for its own ack, distinct from the
+        # analyze's canonical_id).
+        term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
         term_wire: WireDict = {
             "id": term_wire_id,
             "action": "terminate",
@@ -1686,7 +1710,7 @@ class SelectorRouter(BackendRouter):
         self._log = get_proxy_logger("kataproxy.router").bind(role=Role.SELECTOR)
         # Completion-tracker shared with the read loop; the wire-id-
         # uniqueness invariant is the same as LeafRouter / RelayRouter.
-        self._tracker: CompletionTracker[str, int] = CompletionTracker()
+        self._tracker: CompletionTracker[CanonicalId, int] = CompletionTracker()
         # canonical_id → (on_response, on_complete, label). The label is
         # the routing record consulted by terminate() to send the
         # cancel to the correct upstream.
@@ -2384,7 +2408,9 @@ class SelectorRouter(BackendRouter):
         cb = self._callbacks.pop(canonical_id, None)
 
         async def _send_synthetic_ack() -> None:
-            term_wire_id = f"kg_{secrets.token_hex(6)}"
+            # Brand-as-CanonicalId at routing-key sites; see LEAF's
+            # _send_synthetic_ack for the rationale.
+            term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
             synthetic_ack: WireDict = {
                 "id": term_wire_id,
                 "action": "terminate",
@@ -2421,7 +2447,9 @@ class SelectorRouter(BackendRouter):
             await _send_synthetic_ack()
             return
 
-        term_wire_id = f"kg_{secrets.token_hex(6)}"
+        # Brand-as-CanonicalId at routing-key sites; see LEAF's
+        # _send_synthetic_ack for the rationale.
+        term_wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
         term_wire: WireDict = {
             "id": term_wire_id,
             "action": "terminate",
