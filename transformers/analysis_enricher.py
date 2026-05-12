@@ -53,15 +53,28 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
     request_cache: Dict[str, DeltaAnalysisState] = {}
 
     def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
-        # `analysis_config` is consumed by this transformer and must NEVER
-        # reach KataGo's stdin — KataGo's analysis-engine protocol does
-        # not define this field, and forwarding it produces malformed
-        # responses on short / empty queries (no moveInfos / rootInfo on
-        # returned packets, observed as a frontend crash on empty-board
-        # ponder). The strip is unconditional; analyser setup is gated
-        # below because DeltaAnalysisState requires ≥2 moves to compute
-        # meaningful deltas, but that gate must NOT also gate the strip.
-        config = q.opaque.pop('analysis_config', None)
+        # Read `analysis_config` non-destructively (v1.0.21). The
+        # authoritative line preventing it from reaching KataGo's stdin
+        # is the central wire-strip in
+        # katago/katago_proxy.py:_PROXY_ONLY_FIELDS; the pre-v1.0.21
+        # destructive pop here was belt-and-braces work that the
+        # wire-strip already covers, and keeping the field in opaque
+        # is load-bearing for sub-queries spawned by
+        # OrchestrationMiddleware (e.g., adaptive_reevaluate's deeper
+        # query, whose `_build_deeper_query` clones the parent's opaque
+        # via `dict(orig.opaque)`). Pre-v1.0.21, the cloned sub-query
+        # opaque was stripped of `analysis_config`, the gate below
+        # failed, no analyzer was cached for the sub-query's eid, and
+        # the sub-query's responses reached the client with `extra`
+        # undefined entirely — defeating the SPA's mergeKataExtra
+        # policy of preserving populated extra against an empty one.
+        #
+        # KataGo's analysis-engine protocol does not define this field,
+        # and forwarding it produces malformed responses on short /
+        # empty queries (no moveInfos / rootInfo on returned packets,
+        # observed as a frontend crash on empty-board ponder). The
+        # central wire-strip is what closes that exposure.
+        config = q.opaque.get('analysis_config')
 
         if (
             q.action == KataGoAction.ANALYZE

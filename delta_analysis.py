@@ -396,6 +396,63 @@ class DeltaAnalysisState:
                 else:
                     branch.updateAt(delta_idx, delta_val)
 
+        # ------------------------------------------------------------------
+        # 3. Belt-and-braces snapshot at the queried slot.
+        #
+        # The reactive_pipeline's CompiledNode.update short-circuits when
+        # the incoming input value equals the cached in_mem at that slot
+        # (`_are_equal` returns True → returns [] without running
+        # compute_fn). This is the right call for downstream performance
+        # but produces an empty `result` entry for the queried slot when
+        # KataGo emits an intermediate (`is_during_search=True`) and a
+        # final (`is_during_search=False`) packet with byte-identical
+        # content — a regular occurrence on short / fast searches or
+        # under v1.0.20's adaptive streaming refactor, where adaptive
+        # patches the parent's final to `is_during_search=True` AFTER
+        # the upstream final has already flowed through the
+        # analysis_enricher pipeline.
+        #
+        # That empty-result-after-short-circuit is what defeats
+        # adaptive_reevaluate's `_find_worst_turns`, which walks the
+        # buffered finals' `extra.<color>.deltas` to pick worst turns.
+        # If the F packets carry empty deltas (because the pipeline
+        # short-circuited against the prior D's content), worst is
+        # empty, adaptive doesn't deepen, the user observes
+        # "adaptive only fires on the second query (cache replay)"
+        # because the replay path's fresh analyzer instance hasn't
+        # been pre-populated by D packets.
+        #
+        # The belt-and-braces read here ensures every push_packet call
+        # surfaces the queried slot's current state and per-color delta
+        # snapshot, regardless of whether updateAt fired or
+        # short-circuited. Triangular and CWT branches are intentionally
+        # left as deltas-since-last (CWT specifically depends on throttle
+        # semantics that "every call emits snapshot" would break; the
+        # triangular branch's matrix consumers fetch full snapshots via
+        # `black_matrix` / `white_matrix` properties on initial
+        # hydration, so the per-call result doesn't need to be
+        # belt-and-braced).
+        if self._state_pipe is not None and move_idx not in result["state"]:
+            snap = self._state_pipe.nodes[-1].out_mem.get(move_idx)
+            if snap is not None:
+                result["state"][move_idx] = snap
+        for color in ("black", "white"):
+            mapping = self._black_to_local if color == "black" else self._white_to_local
+            if move_idx not in mapping:
+                # This slot isn't this color's responsibility — black
+                # owns odd global slots (1, 3, 5, …) under black_first;
+                # white owns the even ones. Skip the read.
+                continue
+            local_idx = mapping[move_idx]
+            if local_idx in result[color]["deltas"]:
+                # The deltas-since-last loop above already populated
+                # this entry; the snapshot read would be redundant.
+                continue
+            branch = self.black_pipe if color == "black" else self.white_pipe
+            substream_mem = branch.nodes[0].out_mem
+            if local_idx in substream_mem:
+                result[color]["deltas"][local_idx] = substream_mem[local_idx]
+
         return result
 
     # ------------------------------------------------------------------
