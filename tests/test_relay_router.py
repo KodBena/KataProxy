@@ -39,7 +39,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -52,6 +52,7 @@ from katago import (  # noqa: E402
     KataGoQuery,
     translate_query_to_wire,
 )
+from AbstractProxy.proxy_core import CanonicalId  # noqa: E402
 from router import (  # noqa: E402
     InFlightQueryLoad,
     RelayRouter,
@@ -136,13 +137,13 @@ class TestSingleTargetDispatch:
         sockets = _populate_connections(
             router, connected_urls=router._urls,
         )
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query()
         wire = translate_query_to_wire(q, "cid-analyze")
         await router.dispatch(
-            "cid-analyze", wire, q, on_response, on_complete,
+            CanonicalId("cid-analyze"), wire, q, on_response, on_complete,
         )
 
         sent_counts = {url: len(s.sent) for url, s in sockets.items()}
@@ -171,12 +172,12 @@ class TestSingleTargetDispatch:
         # in-flight query.
         router = _make_router()
         sockets = _populate_connections(router, connected_urls=router._urls)
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query()
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         # Exactly one URL has load=1; the others have load=0.
         loads = [router._load_metric.current_load(u) for u in router._urls]
@@ -198,12 +199,12 @@ class TestBroadcastDispatch:
         # on whatever ANALYZE the ring had hash-routed there.
         router = _make_router()
         sockets = _populate_connections(router, connected_urls=router._urls)
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         # Every connected upstream got the wire exactly once.
         for url, ws in sockets.items():
@@ -224,12 +225,12 @@ class TestBroadcastDispatch:
         # running.
         router = _make_router()
         sockets = _populate_connections(router, connected_urls=router._urls)
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.TERMINATE_ALL)
         wire = translate_query_to_wire(q, "cid-ta")
-        await router.dispatch("cid-ta", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-ta"), wire, q, on_response, on_complete)
 
         for url, ws in sockets.items():
             assert len(ws.sent) == 1, f"{url} should have received TERMINATE_ALL"
@@ -240,12 +241,12 @@ class TestBroadcastDispatch:
         # would leave (N-1) upstreams' caches stale.
         router = _make_router()
         sockets = _populate_connections(router, connected_urls=router._urls)
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.CLEAR_CACHE)
         wire = translate_query_to_wire(q, "cid-cc")
-        await router.dispatch("cid-cc", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-cc"), wire, q, on_response, on_complete)
 
         for url, ws in sockets.items():
             assert len(ws.sent) == 1, f"{url} should have received CLEAR_CACHE"
@@ -257,12 +258,12 @@ class TestBroadcastDispatch:
         # was added in v1.0.15; RELAY hasn't gained it).
         router = _make_router()
         # No connections populated.
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
         # Callback was not installed (no upstream → drop early).
         assert "cid-qv" not in router._callbacks
 
@@ -276,12 +277,12 @@ class TestBroadcastDispatch:
         bad_url = router._urls[0]
         sockets[bad_url].closed = True
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         # Bad upstream got nothing; the others got it.
         assert sockets[bad_url].sent == []
@@ -303,12 +304,12 @@ class TestBroadcastDispatch:
         for ws in sockets.values():
             ws.closed = True
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         assert "cid-qv" not in router._callbacks
         for ws in sockets.values():
@@ -324,12 +325,12 @@ class TestBroadcastDispatch:
         # the first response triggers QUERY_COMPLETE → callback pop).
         router = _make_router()
         _populate_connections(router, connected_urls=router._urls)
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         loads = [router._load_metric.current_load(u) for u in router._urls]
         assert sum(loads) == 0, (
@@ -355,14 +356,14 @@ class TestFirstResponseWins:
         # response would find no callback.
         router = _make_router()
         sockets = _populate_connections(router, connected_urls=router._urls)
-        responses: list[tuple[str, dict]] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(_cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
         # Broadcast installed the callback.
         assert "cid-qv" in router._callbacks
         # Simulate the read loop's QUERY_COMPLETE branch popping the

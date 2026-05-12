@@ -78,7 +78,7 @@ class CapabilityGatedMiddleware(SessionMiddleware):
         self._wrapped = wrapped
         # orig_id → per-query metadata for this capability (or empty
         # dict for legacy auto-engage / opt-in-with-defaults).
-        self._engaged: Dict[ClientId, dict] = {}
+        self._engaged: Dict[ClientId, Dict[str, Any]] = {}
         # Structured-logging adapter; refined in on_session_start
         # to bind the session-scoped context.
         self._log: Any = get_proxy_logger("kataproxy.middleware.capability_gate")

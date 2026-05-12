@@ -51,7 +51,7 @@ class MissingData(Exception):
     """Raised when a dependency index is not yet present in memory."""
 
 
-def extract_indices(shape: Any):
+def extract_indices(shape: Any) -> Any:
     """Yield every integer leaf in a (possibly nested) shape descriptor."""
     if isinstance(shape, int):
         yield shape
@@ -181,7 +181,9 @@ class MonitoredNode(CompiledNode):
         self._pending[idx] = val
 
         first_time = self._last_emit_time is None
-        gate_open = first_time or (now - self._last_emit_time >= self._throttle_s)
+        gate_open = first_time or (
+            now - (self._last_emit_time or 0.0) >= self._throttle_s
+        )
 
         if not gate_open:
             return []  # throttled — accumulate and wait
@@ -230,8 +232,8 @@ class Pipeline:
         if size is None:
             raise TypeError("Pipeline requires a domain size (positional or keyword)")
         self.domain: List[int] = list(range(size))
-        self._nodes: List[Tuple] = []   # 4-tuples: (domain, ctx, comp, throttle|None)
-        self._curr_context: Optional[Callable] = None
+        self._nodes: List[Tuple[Any, Any, Any, Any]] = []   # 4-tuples: (domain, ctx, comp, throttle|None)
+        self._curr_context: Optional[Callable[..., Any]] = None
         # Triangular interval metadata: set by Triangular(), consumed by compile().
         # Stores (s, t) tuples in the *input* coordinate system of that layer.
         self._triangular_intervals: Optional[List[Tuple[int, int]]] = None
@@ -240,7 +242,7 @@ class Pipeline:
 
     # -- Internal node registry ----------------------------------------------
 
-    def _append_node(self, domain: List[int], ctx: Any, comp: Callable) -> None:
+    def _append_node(self, domain: List[int], ctx: Any, comp: Callable[..., Any]) -> None:
         """
         Central choke-point for all node registrations.  Captures and clears
         any pending Monitor throttle so it is attached to exactly this node.
@@ -303,7 +305,7 @@ class Pipeline:
     def Window(self, left: int, right: int) -> "Pipeline":
         N = len(self.domain)
         def ctx(j: int) -> Optional[List[int]]:
-            ks = tuple(range(j + left, j + right + 1))
+            ks = list(range(j + left, j + right + 1))
             return ks if all(0 <= k < N for k in ks) else None
         self._curr_context = ctx
         return self
@@ -340,7 +342,7 @@ class Pipeline:
 
     # -- Domain-morphing topology --------------------------------------------
 
-    def ZipWith(self, num_streams: int, func: Callable) -> "Pipeline":
+    def ZipWith(self, num_streams: int, func: Callable[..., Any]) -> "Pipeline":
         assert len(self.domain) % num_streams == 0, (
             f"Domain size {len(self.domain)} not divisible by num_streams={num_streams}"
         )
@@ -383,7 +385,7 @@ class Pipeline:
         self._curr_context = lambda j, _ivs=intervals: tuple(range(_ivs[j][0], _ivs[j][1] + 1))
         return self
 
-    def ApplyTriangular(self, aggregate: Optional[Callable] = None) -> "Pipeline":
+    def ApplyTriangular(self, aggregate: Optional[Callable[..., Any]] = None) -> "Pipeline":
         """
         CONVENIENCE WRAPPER: Sets triangular topology and applies an aggregate.
         """
@@ -415,7 +417,7 @@ class Pipeline:
 
         new_domain_size = branch_out_size * num_branches
 
-        def interleave_ctx(k: int) -> int:
+        def interleave_ctx(k: int) -> Any:
             return "ROUTE_SIGNAL"
 
         self._append_node(list(range(new_domain_size)), interleave_ctx, interleave_compute)
@@ -424,7 +426,7 @@ class Pipeline:
 
     # -- Algebra steps -------------------------------------------------------
 
-    def Map(self, func: Callable) -> "Pipeline":
+    def Map(self, func: Callable[..., Any]) -> "Pipeline":
         ctx = self._curr_context or (lambda j: j)
         self._append_node(list(self.domain), ctx, func)
         self._curr_context = None
@@ -474,7 +476,7 @@ class Pipeline:
 class CompiledPipeline:
     def __init__(
         self,
-        node_specs: List[Tuple],
+        node_specs: List[Tuple[Any, ...]],
         *,
         intervals: Optional[List[Tuple[int, int]]] = None,
     ) -> None:

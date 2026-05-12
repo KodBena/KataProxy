@@ -24,6 +24,7 @@ from __future__ import annotations
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 
@@ -391,7 +392,7 @@ def test_translate_query_models_response_is_transparent() -> None:
     # error response (metadata-shaped)
     {"id": "x", "error": "out of memory"},
 ])
-def test_response_round_trip_is_identity(wire: dict) -> None:
+def test_response_round_trip_is_identity(wire: Dict[str, Any]) -> None:
     eid, r = parse_response_from_wire(wire)
     out = translate_response_to_wire(r, eid)
     assert out == wire
@@ -485,7 +486,7 @@ def test_metadata_response_is_frozen() -> None:
 # parametrisation but for the response side.
 # ---------------------------------------------------------------------------
 
-_METADATA_RESPONSE_SAMPLES: list[tuple[str, dict]] = [
+_METADATA_RESPONSE_SAMPLES: list[tuple[str, Dict[str, Any]]] = [
     ("query_version", {"id": "x", "version": "1.13.0"}),
     ("query_models", {"id": "x", "models": []}),
     ("clear_cache", {"id": "x", "action": "clear_cache"}),
@@ -495,7 +496,7 @@ _METADATA_RESPONSE_SAMPLES: list[tuple[str, dict]] = [
 
 @pytest.mark.parametrize("action_name,wire", _METADATA_RESPONSE_SAMPLES)
 def test_non_analyze_responses_parse_as_metadata(
-    action_name: str, wire: dict
+    action_name: str, wire: Dict[str, Any]
 ) -> None:
     _, r = parse_response_from_wire(wire)
     assert isinstance(r, MetadataResponse), (

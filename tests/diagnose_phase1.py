@@ -33,6 +33,7 @@ _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
+from AbstractProxy.proxy_core import ClientId  # noqa: E402
 from katago import KataGoAction, KataGoQuery  # noqa: E402
 from proxy_server import ClientSession  # noqa: E402
 from pubsub_hub import PubSubHub  # noqa: E402
@@ -124,12 +125,12 @@ async def run_scenario() -> bool:
     )
 
     print("\n--- Step 1: A subscribes to ponder ---")
-    await session_a._handle_query("orig_A", _ponder_query())
+    await session_a._handle_query(ClientId("orig_A"), _ponder_query())
     print(f"  session_a._active_queries: {dict(session_a._active_queries)}")
     print(f"  router.dispatched: {router.dispatched}")
 
     print("\n--- Step 2: B subscribes to identical ponder (should coalesce) ---")
-    await session_b._handle_query("orig_B", _ponder_query())
+    await session_b._handle_query(ClientId("orig_B"), _ponder_query())
     print(f"  session_b._active_queries: {dict(session_b._active_queries)}")
     print(f"  router.dispatched: {router.dispatched}")
     if len(router.dispatched) != 1:

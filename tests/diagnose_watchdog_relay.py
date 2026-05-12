@@ -71,12 +71,13 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
+from AbstractProxy.proxy_core import CanonicalId, ClientId  # noqa: E402
 from katago import (  # noqa: E402
     KataGoAction,
     KataGoQuery,
@@ -134,7 +135,7 @@ class _PhantomLeaf:
     keep_alive: KeepAliveMiddleware
     terminated_query_ids: list[str]
 
-    def feed(self, query: KataGoQuery, orig_id: str) -> None:
+    def feed(self, query: KataGoQuery, orig_id: ClientId) -> None:
         self.keep_alive.on_query(orig_id, query)
 
 
@@ -234,12 +235,12 @@ async def run_scenario() -> bool:
     }
     _populate_relay(router, phantoms)
 
-    sink_responses: list[tuple[str, dict]] = []
+    sink_responses: list[tuple[CanonicalId, Dict[str, Any]]] = []
 
-    async def on_response(cid: str, wire: dict) -> None:
+    async def on_response(cid: CanonicalId, wire: Dict[str, Any]) -> None:
         sink_responses.append((cid, wire))
 
-    async def on_complete(cid: str) -> None:
+    async def on_complete(cid: CanonicalId) -> None:
         pass
 
     # ----------------------------------------------------------------
@@ -249,7 +250,7 @@ async def run_scenario() -> bool:
     analyze = _analyze_query()
     analyze_wire = translate_query_to_wire(analyze, "cid-analyze")
     await router.dispatch(
-        "cid-analyze", analyze_wire, analyze, on_response, on_complete,
+        CanonicalId("cid-analyze"), analyze_wire, analyze, on_response, on_complete,
     )
 
     # Identify which upstream the ring picked.
@@ -265,7 +266,7 @@ async def run_scenario() -> bool:
 
     # Production: that upstream's session sees the analyze first
     # (via _handle_incoming → middleware.on_query). Simulate.
-    phantoms[analyze_target_url].feed(analyze, "cid-analyze")
+    phantoms[analyze_target_url].feed(analyze, ClientId("cid-analyze"))
     print(
         f"  {analyze_target_url}.keep_alive._in_flight: "
         f"{phantoms[analyze_target_url].keep_alive._in_flight}"
@@ -288,7 +289,7 @@ async def run_scenario() -> bool:
         seq += 1
         elapsed += HEARTBEAT_CADENCE
         hb = _heartbeat_query()
-        cid = f"cid-hb-{seq}"
+        cid = CanonicalId(f"cid-hb-{seq}")
         hb_wire = translate_query_to_wire(hb, cid)
         prev_counts = {
             url: len(p.socket.sent) for url, p in phantoms.items()
@@ -311,7 +312,10 @@ async def run_scenario() -> bool:
         # Production: each LEAF's read loop parses the wire and calls
         # middleware.on_query.
         for phantom in phantoms.values():
-            phantom.feed(hb, cid)
+            # The phantom sees the heartbeat under what would be
+            # its own session's orig_id, which happens to equal the
+            # canonical_id at the LEAF boundary; brand accordingly.
+            phantom.feed(hb, ClientId(cid))
 
     print(f"  sent {seq} heartbeats; all {len(phantoms)} upstreams received every one")
 

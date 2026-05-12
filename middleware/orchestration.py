@@ -34,7 +34,7 @@ import asyncio
 import functools
 import logging
 import uuid
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Optional, Tuple, Union
 
 import sproxy_config as cfg
 from AbstractProxy.proxy_core import ClientId
@@ -107,7 +107,7 @@ class _SubQueryRecord:
     """
 
     def __init__(self, expected_finals: int) -> None:
-        self.queue: asyncio.Queue = asyncio.Queue()
+        self.queue: asyncio.Queue[Union[KataGoResponse, _Sentinel]] = asyncio.Queue()
         self.expected_finals = expected_finals
         self.received_finals = 0
         self.completed = False
@@ -138,17 +138,19 @@ class OrchestrationContext:
         self._caps = session_capabilities
         self._middleware = middleware
         # Original-stream state.
-        self._original_queue: asyncio.Queue = asyncio.Queue()
+        self._original_queue: asyncio.Queue[Union[KataGoResponse, _Sentinel]] = asyncio.Queue()
         self._original_completed = False
         self._original_discarded = False
         self._original_expected = self._compute_expected_finals(parent_query)
         self._original_received = 0
         # Per-sub-query state. orig_id → _SubQueryRecord.
-        self._sub_queries: dict[str, _SubQueryRecord] = {}
+        self._sub_queries: dict[ClientId, _SubQueryRecord] = {}
         # Output stream from the coroutine. The driver puts
         # (parent_id, KataGoResponse) tuples here; handle_response
         # drains it.
-        self._output_queue: asyncio.Queue = asyncio.Queue()
+        self._output_queue: asyncio.Queue[
+            Union[Tuple[ClientId, KataGoResponse], _Sentinel]
+        ] = asyncio.Queue()
 
     # ---------------- Static helpers ----------------
 
@@ -408,7 +410,7 @@ class OrchestrationMiddleware(SessionMiddleware):
         # parent_id → context
         self._contexts: dict[ClientId, OrchestrationContext] = {}
         # parent_id → coroutine driver task
-        self._tasks: dict[ClientId, asyncio.Task] = {}
+        self._tasks: dict[ClientId, asyncio.Task[None]] = {}
         # sub_orig_id → parent_id  (for response routing)
         self._sub_to_parent: dict[ClientId, ClientId] = {}
         # Structured-logging adapter; refined in on_session_start.
@@ -662,7 +664,12 @@ def orchestration_middleware(
     CapabilityGatedMiddleware compose with the factory's product
     transparently.
     """
-    def decorator(coro):
+    def decorator(
+        coro: Callable[
+            [KataGoQuery, OrchestrationContext],
+            AsyncIterator[KataGoResponse],
+        ],
+    ) -> Callable[[], OrchestrationMiddleware]:
         @functools.wraps(coro)
         def factory() -> OrchestrationMiddleware:
             return OrchestrationMiddleware(coro_factory=coro, name=name)

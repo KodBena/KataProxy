@@ -42,7 +42,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import pytest
 
@@ -51,6 +51,7 @@ if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
 import sproxy_config as cfg  # noqa: E402
+from AbstractProxy.proxy_core import CanonicalId  # noqa: E402
 from katago import (  # noqa: E402
     KataGoAction,
     KataGoQuery,
@@ -90,7 +91,7 @@ class _MockWebSocket:
     async def close(self) -> None:
         self.closed = True
 
-    def __aiter__(self):
+    def __aiter__(self) -> "_MockWebSocket":
         return self
 
     async def __anext__(self) -> str:
@@ -115,7 +116,7 @@ def _populate_post_start_state(
     healthy_labels: list[str],
     disconnected_labels: Optional[list[str]] = None,
     unhealthy_labels: Optional[list[str]] = None,
-) -> dict[str, _MockWebSocket]:
+) -> Dict[str, _MockWebSocket]:
     """Bypass start(): populate _url_for_label, _failure_budget, _connections.
 
     Returns the mock websockets keyed by label so tests can inspect
@@ -123,7 +124,7 @@ def _populate_post_start_state(
     """
     disconnected_labels = disconnected_labels or []
     unhealthy_labels = unhealthy_labels or []
-    sockets: dict[str, _MockWebSocket] = {}
+    sockets: Dict[str, _MockWebSocket] = {}
     for label, url in router._models:
         router._url_for_label[label] = url
         router._failure_budget[label] = router._max_connect_failures
@@ -138,9 +139,9 @@ def _populate_post_start_state(
 
 def _make_analyze_query(
     model: Optional[str] = None,
-    extra_opaque: Optional[dict] = None,
+    extra_opaque: Optional[Dict[str, Any]] = None,
 ) -> KataGoQuery:
-    opaque: dict = {
+    opaque: Dict[str, Any] = {
         "rules": "tromp-taylor",
         "komi": 7.5,
         "boardXSize": 19,
@@ -291,15 +292,15 @@ class TestSelectorDispatch:
     async def test_analyze_without_model_field_returns_error(self) -> None:
         router = _make_router()
         _populate_post_start_state(router, healthy_labels=["strong", "weak"])
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
         q = _make_analyze_query()  # no model
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         assert len(responses) == 1
         assert responses[0][1]["error"].startswith("missing 'model' field")
@@ -309,15 +310,15 @@ class TestSelectorDispatch:
     async def test_analyze_unknown_model_returns_error(self) -> None:
         router = _make_router()
         _populate_post_start_state(router, healthy_labels=["strong", "weak"])
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
         q = _make_analyze_query(model="nonexistent")
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         assert len(responses) == 1
         assert "nonexistent" in responses[0][1]["error"]
@@ -333,15 +334,15 @@ class TestSelectorDispatch:
             healthy_labels=["strong"],
             unhealthy_labels=["weak"],
         )
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
         q = _make_analyze_query(model="weak")
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         assert len(responses) == 1
         assert "weak" in responses[0][1]["error"]
@@ -353,15 +354,15 @@ class TestSelectorDispatch:
         sockets = _populate_post_start_state(
             router, healthy_labels=["strong", "weak"]
         )
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
         q = _make_analyze_query(model="strong")
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         # Forwarded to "strong", not "weak".
         assert len(sockets["strong"].sent) == 1
@@ -382,15 +383,15 @@ class TestSelectorDispatch:
             healthy_labels=[],  # nothing connected
             disconnected_labels=["strong"],
         )
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
         q = _make_analyze_query(model="strong")
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         assert "strong" in responses[0][1]["error"]
         assert "disconnected" in responses[0][1]["error"]
@@ -400,15 +401,15 @@ class TestSelectorDispatch:
         sockets = _populate_post_start_state(
             router, healthy_labels=["strong", "weak"]
         )
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
         q = KataGoQuery(action=KataGoAction.QUERY_MODELS, opaque={})
         wire = translate_query_to_wire(q, "cid-qm")
-        await router.dispatch("cid-qm", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qm"), wire, q, on_response, on_complete)
 
         # Synthesised — no upstream traffic.
         assert sockets["strong"].sent == []
@@ -431,13 +432,13 @@ class TestSelectorDispatch:
         _populate_post_start_state(
             router, healthy_labels=[], unhealthy_labels=["strong", "weak"]
         )
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.QUERY_MODELS, opaque={})
         wire = translate_query_to_wire(q, "cid-qm")
-        await router.dispatch("cid-qm", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qm"), wire, q, on_response, on_complete)
         # Both labels are unhealthy — the SPA's dropdown grey-outs both.
         assert responses[0][1]["models"] == [
             {"label": "strong", "healthy": False},
@@ -455,13 +456,13 @@ class TestSelectorDispatch:
         sockets = _populate_post_start_state(
             router, healthy_labels=["strong", "weak"]
         )
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         # Every healthy upstream received the wire exactly once.
         assert len(sockets["strong"].sent) == 1
@@ -485,12 +486,12 @@ class TestSelectorDispatch:
         sockets = _populate_post_start_state(
             router, healthy_labels=["strong", "weak"]
         )
-        async def on_response(cid, w): pass
-        async def on_complete(cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.TERMINATE_ALL, opaque={})
         wire = translate_query_to_wire(q, "cid-ta")
-        await router.dispatch("cid-ta", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-ta"), wire, q, on_response, on_complete)
 
         assert len(sockets["strong"].sent) == 1
         assert len(sockets["weak"].sent) == 1
@@ -503,12 +504,12 @@ class TestSelectorDispatch:
         sockets = _populate_post_start_state(
             router, healthy_labels=["strong", "weak"]
         )
-        async def on_response(cid, w): pass
-        async def on_complete(cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.CLEAR_CACHE, opaque={})
         wire = translate_query_to_wire(q, "cid-cc")
-        await router.dispatch("cid-cc", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-cc"), wire, q, on_response, on_complete)
 
         assert len(sockets["strong"].sent) == 1
         assert len(sockets["weak"].sent) == 1
@@ -518,13 +519,13 @@ class TestSelectorDispatch:
         _populate_post_start_state(
             router, healthy_labels=[], unhealthy_labels=["strong", "weak"]
         )
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
         assert "no healthy upstream" in responses[0][1]["error"]
 
     async def test_broadcast_skips_unhealthy_targets_remainder(self) -> None:
@@ -537,12 +538,12 @@ class TestSelectorDispatch:
             healthy_labels=["weak"],
             unhealthy_labels=["strong"],
         )
-        async def on_response(cid, w): pass
-        async def on_complete(cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
         # "strong" is unhealthy → not in _connections in this fixture
         # AND in _unhealthy_models. "weak" is healthy. Broadcast hits
         # only "weak".
@@ -562,12 +563,12 @@ class TestSelectorDispatch:
         )
         # "strong" refuses every send.
         sockets["strong"].closed = True
-        async def on_response(cid, w): pass
-        async def on_complete(cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         # "weak" got it; "strong" didn't (the send raised).
         assert sockets["strong"].sent == []
@@ -585,13 +586,13 @@ class TestSelectorDispatch:
         )
         sockets["strong"].closed = True
         sockets["weak"].closed = True
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = KataGoQuery(action=KataGoAction.QUERY_VERSION, opaque={})
         wire = translate_query_to_wire(q, "cid-qv")
-        await router.dispatch("cid-qv", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
 
         # _callbacks was popped — the canonical isn't hung.
         assert "cid-qv" not in router._callbacks
@@ -613,14 +614,14 @@ class TestSelectorTerminate:
             router, healthy_labels=["strong", "weak"]
         )
         # Pretend an in-flight query exists routed to "weak".
-        async def cb_response(cid, w): pass
-        async def cb_complete(cid): pass
-        router._callbacks["cid-1"] = (cb_response, cb_complete, "weak")
+        async def cb_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def cb_complete(cid: CanonicalId) -> None: pass
+        router._callbacks[CanonicalId("cid-1")] = (cb_response, cb_complete, "weak")
 
-        async def on_response(cid, w): pass
-        async def on_complete(cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def on_complete(cid: CanonicalId) -> None: pass
 
-        await router.terminate("cid-1", on_response, on_complete)
+        await router.terminate(CanonicalId("cid-1"), on_response, on_complete)
 
         # Terminate sent to "weak", not "strong".
         assert len(sockets["weak"].sent) == 1
@@ -632,12 +633,12 @@ class TestSelectorTerminate:
     async def test_terminate_unknown_canonical_synthesises_ack(self) -> None:
         router = _make_router()
         _populate_post_start_state(router, healthy_labels=["strong"])
-        responses: list[tuple[str, dict]] = []
-        completes: list[str] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): completes.append(cid)
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        completes: List[CanonicalId] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: completes.append(cid)
 
-        await router.terminate("never-existed", on_response, on_complete)
+        await router.terminate(CanonicalId("never-existed"), on_response, on_complete)
 
         # Synthetic ack: action=terminate, terminateId=never-existed.
         assert len(responses) == 1
@@ -651,15 +652,15 @@ class TestSelectorTerminate:
         _populate_post_start_state(
             router, healthy_labels=[], disconnected_labels=["weak"]
         )
-        async def cb_response(cid, w): pass
-        async def cb_complete(cid): pass
-        router._callbacks["cid-1"] = (cb_response, cb_complete, "weak")
+        async def cb_response(cid: CanonicalId, w: Dict[str, Any]) -> None: pass
+        async def cb_complete(cid: CanonicalId) -> None: pass
+        router._callbacks[CanonicalId("cid-1")] = (cb_response, cb_complete, "weak")
 
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: pass
 
-        await router.terminate("cid-1", on_response, on_complete)
+        await router.terminate(CanonicalId("cid-1"), on_response, on_complete)
 
         assert len(responses) == 1
         assert responses[0][1]["action"] == "terminate"
@@ -680,17 +681,17 @@ class TestFailureBudget:
         _populate_post_start_state(
             router, healthy_labels=[], unhealthy_labels=["strong"]
         )
-        responses: list[tuple[str, dict]] = []
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(cid): pass
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(cid: CanonicalId) -> None: pass
 
         q = _make_analyze_query(model="strong")
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
         assert "unavailable" in responses[0][1]["error"]
 
     async def test_reconnect_loop_decrements_budget_and_marks_unhealthy(
-        self, monkeypatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Patch websockets.connect to always fail; patch asyncio.sleep
         # to be a no-op so the loop iterates immediately. After the
@@ -698,10 +699,10 @@ class TestFailureBudget:
         # the loop exits.
         import websockets
 
-        async def always_fail(*args, **kwargs):
+        async def always_fail(*args: Any, **kwargs: Any) -> _MockWebSocket:
             raise ConnectionError("simulated upstream down")
 
-        async def no_sleep(_delay):
+        async def no_sleep(_delay: float) -> None:
             return None
 
         monkeypatch.setattr(websockets, "connect", always_fail)
@@ -719,7 +720,7 @@ class TestFailureBudget:
         assert "strong" not in router._connections
 
     async def test_reconnect_loop_succeeds_within_budget(
-        self, monkeypatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # First attempt fails, second succeeds. Budget should not be
         # exhausted; label should be in _connections.
@@ -727,13 +728,13 @@ class TestFailureBudget:
 
         attempts = {"n": 0}
 
-        async def fail_then_succeed(*args, **kwargs):
+        async def fail_then_succeed(*args: Any, **kwargs: Any) -> _MockWebSocket:
             attempts["n"] += 1
             if attempts["n"] == 1:
                 raise ConnectionError("simulated transient blip")
             return _MockWebSocket()
 
-        async def no_sleep(_delay):
+        async def no_sleep(_delay: float) -> None:
             return None
 
         monkeypatch.setattr(websockets, "connect", fail_then_succeed)
@@ -761,7 +762,7 @@ class TestFailureBudget:
 
 
 class TestSelectorAdvertisement:
-    def test_selector_advertised_when_role_is_selector(self, monkeypatch) -> None:
+    def test_selector_advertised_when_role_is_selector(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # _build_advertised_capabilities reads cfg.ROLE; patch it.
         monkeypatch.setattr(cfg, "ROLE", "SELECTOR")
         from proxy_server import _build_advertised_capabilities
@@ -769,19 +770,19 @@ class TestSelectorAdvertisement:
         assert "selector" in advertised
         assert advertised["selector"] == {}
 
-    def test_selector_not_advertised_when_role_is_leaf(self, monkeypatch) -> None:
+    def test_selector_not_advertised_when_role_is_leaf(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cfg, "ROLE", "LEAF")
         from proxy_server import _build_advertised_capabilities
         advertised = _build_advertised_capabilities()
         assert "selector" not in advertised
 
-    def test_selector_not_advertised_when_role_is_relay(self, monkeypatch) -> None:
+    def test_selector_not_advertised_when_role_is_relay(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cfg, "ROLE", "RELAY")
         from proxy_server import _build_advertised_capabilities
         advertised = _build_advertised_capabilities()
         assert "selector" not in advertised
 
-    def test_role_check_is_case_insensitive(self, monkeypatch) -> None:
+    def test_role_check_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # cfg.ROLE.upper() in _build_advertised_capabilities.
         monkeypatch.setattr(cfg, "ROLE", "selector")
         from proxy_server import _build_advertised_capabilities

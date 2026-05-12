@@ -48,6 +48,7 @@ from __future__ import annotations
 import builtins as _builtins
 import logging
 import os
+from typing import Any, Callable, Dict, Optional
 
 import numpy as _np
 from scipy.stats import entropy as _scipy_entropy
@@ -90,7 +91,12 @@ _DEFAULT_ARRAY_CAP = int(os.environ.get("KATAPROXY_ANALYSIS_ARRAY_CAP", "1000000
 # Coercion + validation helpers (private — never enter the symtable)
 # ---------------------------------------------------------------------------
 
-def _to_array(x, *, max_size: int | None = None, allow_complex: bool = False):
+def _to_array(
+    x: Any,
+    *,
+    max_size: int | None = None,
+    allow_complex: bool = False,
+) -> Any:
     """Coerce x to ndarray with a strict size cap and refused-dtype set.
 
     Refused dtypes:
@@ -108,7 +114,7 @@ def _to_array(x, *, max_size: int | None = None, allow_complex: bool = False):
     return a
 
 
-def _check_window(w, n: int) -> None:
+def _check_window(w: Any, n: int) -> None:
     """Validate a sliding-window size against the array length it will scan."""
     # Reject bool explicitly — `bool` is a subclass of `int` in Python and
     # `True`/`False` would otherwise sneak through the integer check below.
@@ -120,7 +126,7 @@ def _check_window(w, n: int) -> None:
         raise ValueError(f"window size {w} exceeds array length {n}")
 
 
-def _check_count(n, name: str) -> None:
+def _check_count(n: Any, name: str) -> None:
     """Validate an array-construction element count against the global cap."""
     if isinstance(n, bool) or not isinstance(n, (int, _np.integer)):
         raise TypeError(f"{name}: count must be an integer, got {type(n).__name__}")
@@ -132,7 +138,7 @@ def _check_count(n, name: str) -> None:
         )
 
 
-def _is_asteval_callable(f) -> bool:
+def _is_asteval_callable(f: Any) -> bool:
     """True iff f is an asteval-compiled Procedure.
 
     `apply_window` uses this gate to refuse arbitrary Python callables; only
@@ -146,7 +152,7 @@ def _is_asteval_callable(f) -> bool:
     return t.__name__ == "Procedure" and "asteval" in (t.__module__ or "")
 
 
-def _check_q(q, name: str, *, upper: float):
+def _check_q(q: Any, name: str, *, upper: float) -> Any:
     """Validate a percentile/quantile q value (scalar or short array)."""
     q_arr = _np.asarray(q, dtype=float)
     if q_arr.size > 100:
@@ -173,81 +179,81 @@ def _check_q(q, name: str, *, upper: float):
 
 # ---- Reductions ----
 
-def mean(x, axis=None):
+def mean(x: Any, axis: Any = None) -> Any:
     return _np.mean(_to_array(x), axis=axis)
 
-def median(x, axis=None):
+def median(x: Any, axis: Any = None) -> Any:
     return _np.median(_to_array(x), axis=axis)
 
-def std(x, axis=None):
+def std(x: Any, axis: Any = None) -> Any:
     return _np.std(_to_array(x), axis=axis)
 
-def var(x, axis=None):
+def var(x: Any, axis: Any = None) -> Any:
     return _np.var(_to_array(x), axis=axis)
 
-def sum(x, axis=None):  # noqa: A001 — deliberate shadow per dispatch
+def sum(x: Any, axis: Any = None) -> Any:  # noqa: A001 — deliberate shadow per dispatch
     return _np.sum(_to_array(x), axis=axis)
 
-def prod(x, axis=None):
+def prod(x: Any, axis: Any = None) -> Any:
     return _np.prod(_to_array(x), axis=axis)
 
-def min(x, axis=None):  # noqa: A001 — deliberate shadow per dispatch
+def min(x: Any, axis: Any = None) -> Any:  # noqa: A001 — deliberate shadow per dispatch
     return _np.min(_to_array(x), axis=axis)
 
-def max(x, axis=None):  # noqa: A001 — deliberate shadow per dispatch
+def max(x: Any, axis: Any = None) -> Any:  # noqa: A001 — deliberate shadow per dispatch
     return _np.max(_to_array(x), axis=axis)
 
-def percentile(x, q, axis=None):
+def percentile(x: Any, q: Any, axis: Any = None) -> Any:
     a = _to_array(x)
     q_arr = _check_q(q, "percentile", upper=100.0)
     return _np.percentile(a, q_arr, axis=axis)
 
-def quantile(x, q, axis=None):
+def quantile(x: Any, q: Any, axis: Any = None) -> Any:
     a = _to_array(x)
     q_arr = _check_q(q, "quantile", upper=1.0)
     return _np.quantile(a, q_arr, axis=axis)
 
-def argmin(x, axis=None):
+def argmin(x: Any, axis: Any = None) -> Any:
     return _np.argmin(_to_array(x), axis=axis)
 
-def argmax(x, axis=None):
+def argmax(x: Any, axis: Any = None) -> Any:
     return _np.argmax(_to_array(x), axis=axis)
 
-def argsort(x, axis=-1):
+def argsort(x: Any, axis: Any = -1) -> Any:
     return _np.argsort(_to_array(x), axis=axis)
 
 
 # ---- Element-wise ----
 
-def log(x):
+def log(x: Any) -> Any:
     return _np.log(_to_array(x))
 
-def exp(x):
+def exp(x: Any) -> Any:
     return _np.exp(_to_array(x))
 
-def sqrt(x):
+def sqrt(x: Any) -> Any:
     return _np.sqrt(_to_array(x))
 
-def abs(x):  # noqa: A001 — deliberate shadow per dispatch
+def abs(x: Any) -> Any:  # noqa: A001 — deliberate shadow per dispatch
     return _np.abs(_to_array(x))
 
-def sign(x):
+def sign(x: Any) -> Any:
     return _np.sign(_to_array(x))
 
-def clip(x, lo, hi):
+def clip(x: Any, lo: Any, hi: Any) -> Any:
     # Refuse array-shaped lo/hi to keep the operation predictable and the
     # output shape determined entirely by x.
     if not _np.isscalar(lo) or not _np.isscalar(hi):
         raise TypeError("clip bounds must be scalars")
     return _np.clip(_to_array(x), lo, hi)
 
-def isnan(x):
+def isnan(x: Any) -> Any:
     return _np.isnan(_to_array(x))
 
-def isfinite(x):
+def isfinite(x: Any) -> Any:
     return _np.isfinite(_to_array(x))
 
-def where(cond, a, b):
+def where(cond: Any, a: Any, b: Any) -> Any:
     """Ternary form only — the 1-arg form (returns indices) is intentionally
     not exposed; it leaks shape via the index list and has no analysis use
     case the dispatch enumerated."""
@@ -258,14 +264,14 @@ def where(cond, a, b):
 
 _CONVOLVE_MODES = ("full", "same", "valid")
 
-def convolve(a, v, mode="full"):
+def convolve(a: Any, v: Any, mode: Any = "full") -> Any:
     if mode not in _CONVOLVE_MODES:
         raise ValueError(
             f"convolve mode must be one of {_CONVOLVE_MODES}, got {mode!r}"
         )
     return _np.convolve(_to_array(a), _to_array(v), mode=mode)
 
-def correlate(a, v, mode="full"):
+def correlate(a: Any, v: Any, mode: Any = "full") -> Any:
     if mode not in _CONVOLVE_MODES:
         raise ValueError(
             f"correlate mode must be one of {_CONVOLVE_MODES}, got {mode!r}"
@@ -275,27 +281,27 @@ def correlate(a, v, mode="full"):
 
 # ---- Sliding window ----
 
-def sliding_window(x, w):
+def sliding_window(x: Any, w: Any) -> Any:
     a = _to_array(x)
     _check_window(w, a.size)
     return _np.lib.stride_tricks.sliding_window_view(a, w)
 
-def sliding_mean(x, w):
+def sliding_mean(x: Any, w: Any) -> Any:
     return _np.mean(sliding_window(x, w), axis=-1)
 
-def sliding_median(x, w):
+def sliding_median(x: Any, w: Any) -> Any:
     return _np.median(sliding_window(x, w), axis=-1)
 
-def sliding_std(x, w):
+def sliding_std(x: Any, w: Any) -> Any:
     return _np.std(sliding_window(x, w), axis=-1)
 
-def sliding_percentile(x, w, q):
+def sliding_percentile(x: Any, w: Any, q: Any) -> Any:
     view = sliding_window(x, w)
     q_arr = _check_q(q, "sliding_percentile", upper=100.0)
     return _np.percentile(view, q_arr, axis=-1)
 
 
-def apply_window(f, x, w):
+def apply_window(f: Any, x: Any, w: Any) -> Any:
     """Apply a symbol-defined function `f` over each w-sized window of `x`.
 
     `f` MUST be an asteval-compiled Procedure (i.e. a function declared in
@@ -316,12 +322,12 @@ def apply_window(f, x, w):
 
 # ---- Stats ----
 
-def entropy(p, q=None):
+def entropy(p: Any, q: Any = None) -> Any:
     pk = _to_array(p)
     qk = _to_array(q) if q is not None else None
     return _scipy_entropy(pk, qk)
 
-def normalized_entropy(p):
+def normalized_entropy(p: Any) -> float:
     pk = _to_array(p)
     if pk.size <= 1:
         return 0.0
@@ -330,25 +336,25 @@ def normalized_entropy(p):
 
 # ---- Array construction (size-capped) ----
 
-def array(x):
+def array(x: Any) -> Any:
     # `.copy()` detaches the result from any source list/array, so downstream
     # mutation (which user code can do — asteval permits item-assignment on
     # ndarrays) cannot reach back into the caller's data structures.
     return _to_array(x).copy()
 
-def zeros(n):
+def zeros(n: int) -> Any:
     _check_count(n, "zeros")
     return _np.zeros(n)
 
-def ones(n):
+def ones(n: int) -> Any:
     _check_count(n, "ones")
     return _np.ones(n)
 
-def full(n, v):
+def full(n: int, v: Any) -> Any:
     _check_count(n, "full")
     return _np.full(n, v)
 
-def arange(*args):
+def arange(*args: Any) -> Any:
     """Mirror numpy's arange: arange(stop) | arange(start, stop) | arange(start, stop, step).
 
     The size of the resulting array is computed up-front and checked against
@@ -372,17 +378,17 @@ def arange(*args):
         )
     return _np.arange(*args)
 
-def linspace(start, stop, n):
+def linspace(start: Any, stop: Any, n: int) -> Any:
     _check_count(n, "linspace")
     return _np.linspace(start, stop, n)
 
 
 # ---- Indexing ----
 
-def take(x, indices):
+def take(x: Any, indices: Any) -> Any:
     return _np.take(_to_array(x), _to_array(indices))
 
-def nonzero(x):
+def nonzero(x: Any) -> Any:
     return _np.nonzero(_to_array(x))
 
 
@@ -523,7 +529,7 @@ class RegistryInterpreter:
     bad ``analysis_config`` does not kill the WebSocket connection.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: Optional[Dict[str, Any]]) -> None:
         logger.debug(f"Interp: config = {config}")
         self.aeval = Interpreter()
 
@@ -559,7 +565,7 @@ class RegistryInterpreter:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _exec(self, code, label="<unknown>"):
+    def _exec(self, code: str, label: str = "<unknown>") -> None:
         """Execute *code* in the interpreter, raising on any compile failure."""
         self.aeval(code)
         if self.aeval.error:
@@ -574,7 +580,7 @@ class RegistryInterpreter:
     # Public API — unchanged shape from pre-v1.0.3
     # ------------------------------------------------------------------
 
-    def resolve_binding(self, key):
+    def resolve_binding(self, key: str) -> Callable[[Any], Any]:
         """Look up *key* in bindings; return the bound function or a zero stub.
 
         Falls back to ``lambda x: 0`` if the binding is missing or names a
@@ -584,19 +590,20 @@ class RegistryInterpreter:
         """
         symbol_name = self.bindings.get(key)
         if symbol_name and symbol_name in self.aeval.symtable:
-            return self.aeval.symtable[symbol_name]
+            fn: Callable[[Any], Any] = self.aeval.symtable[symbol_name]
+            return fn
         logger.warning(
             f"FALLBACK: no binding for key={key!r} (symbol={symbol_name!r})"
         )
         return lambda x: 0
 
-    def get_delta_fn(self):
+    def get_delta_fn(self) -> Callable[[Any], Any]:
         return self.resolve_binding("delta_fn")
 
-    def get_summary_fn(self):
+    def get_summary_fn(self) -> Callable[[Any], Any]:
         return self.resolve_binding("summary_fn")
 
-    def get_state_fns(self):
+    def get_state_fns(self) -> Dict[str, Callable[[Any], Any]]:
         """Return the {label: fn} mapping requested by bindings['state_fns'].
 
         Missing symbols are silently skipped rather than raising — same

@@ -25,6 +25,11 @@ dev = [
     "pytest>=8.0",
     "mypy>=1.8",
     "pytest-asyncio>=0.23",
+    # ``typing.assert_type`` is exported on Python 3.11+, but
+    # ``tests/test_identity_types.py`` imports it from
+    # ``typing_extensions`` for source-portability across the
+    # ``requires-python = ">=3.10"`` window.
+    "typing_extensions>=4.0",
 ]
 
 [project.scripts]

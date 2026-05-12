@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -38,6 +38,7 @@ if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
 import sproxy_config as cfg  # noqa: E402
+from AbstractProxy.proxy_core import ClientId  # noqa: E402
 from katago import (  # noqa: E402
     AnalyzeResponse,
     KataGoAction,
@@ -66,10 +67,10 @@ from middleware.session_middleware import (  # noqa: E402
 
 def _make_analyze_query(
     *, model: Optional[str] = None,
-    capabilities: Optional[dict] = None,
+    capabilities: Optional[Dict[str, Any]] = None,
     analyze_turns: Optional[list[int]] = None,
 ) -> KataGoQuery:
-    opaque: dict = {
+    opaque: Dict[str, Any] = {
         "rules": "tromp-taylor",
         "komi": 7.5,
         "boardXSize": 19,
@@ -110,13 +111,13 @@ class _FakeSessionCapabilities:
     """
 
     def __init__(self) -> None:
-        self.submitted: list[tuple[str, KataGoQuery]] = []
-        self.terminated: list[str] = []
+        self.submitted: List[Tuple[ClientId, KataGoQuery]] = []
+        self.terminated: List[ClientId] = []
 
-    async def submit_query(self, orig_id: str, query: KataGoQuery) -> None:
+    async def submit_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         self.submitted.append((orig_id, query))
 
-    async def terminate_query(self, orig_id: str) -> None:
+    async def terminate_query(self, orig_id: ClientId) -> None:
         self.terminated.append(orig_id)
 
     def as_session_capabilities(self) -> SessionCapabilities:
@@ -128,20 +129,21 @@ class _FakeSessionCapabilities:
 
 async def _drive_response(
     middleware: OrchestrationMiddleware,
-    orig_id: str,
+    orig_id: ClientId,
     response: KataGoResponse,
-) -> list[tuple[str, KataGoResponse]]:
+) -> List[Tuple[ClientId, KataGoResponse]]:
     """Helper: invoke handle_response and collect its yields into a list."""
-    out: list[tuple[str, KataGoResponse]] = []
+    out: List[Tuple[ClientId, KataGoResponse]] = []
+    assert middleware._caps is not None
     async for oid, resp in middleware.handle_response(
-        orig_id, response, middleware._caps.submit_query  # type: ignore[union-attr]
+        orig_id, response, middleware._caps.submit_query
     ):
         out.append((oid, resp))
     return out
 
 
 async def _wait_for(
-    predicate, timeout_s: float = 1.0, interval_s: float = 0.005,
+    predicate: Callable[[], bool], timeout_s: float = 1.0, interval_s: float = 0.005,
 ) -> bool:
     """Poll predicate; return True once it's true, False on timeout."""
     deadline = asyncio.get_event_loop().time() + timeout_s
@@ -162,12 +164,12 @@ class TestContextOriginalStream:
     async def test_original_stream_yields_pushed_responses(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c),
+            coro_factory=_identity_coro,
             name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(analyze_turns=[0, 1]),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -175,7 +177,7 @@ class TestContextOriginalStream:
 
         responses_seen: list[KataGoResponse] = []
 
-        async def consumer():
+        async def consumer() -> None:
             async for r in ctx.original_stream():
                 responses_seen.append(r)
 
@@ -189,11 +191,11 @@ class TestContextOriginalStream:
     async def test_original_completed_flips_on_last_final(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(analyze_turns=[0, 1]),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -206,11 +208,11 @@ class TestContextOriginalStream:
     async def test_partials_dont_count_toward_completion(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(analyze_turns=[0]),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -223,11 +225,11 @@ class TestContextOriginalStream:
     async def test_discard_originals_drops_buffer(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(analyze_turns=[0]),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -242,11 +244,11 @@ class TestContextOriginalStream:
         # when the upstream is done with the parent.
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(analyze_turns=[0]),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -255,15 +257,15 @@ class TestContextOriginalStream:
         await ctx._push_original(_final_analyze(turn=0))
         assert ctx.original_completed
 
-    async def test_buffer_overflow_drops_oldest(self, monkeypatch) -> None:
+    async def test_buffer_overflow_drops_oldest(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cfg, "ORCHESTRATION_BUFFER_MAX", 3)
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(analyze_turns=[0, 1, 2, 3, 4]),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -285,11 +287,11 @@ class TestContextSpawn:
     async def test_spawn_submits_via_session_capabilities(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -298,7 +300,7 @@ class TestContextSpawn:
         sub_query = _make_analyze_query(model="strong")
         responses: list[KataGoResponse] = []
 
-        async def consumer():
+        async def consumer() -> None:
             async for r in ctx.spawn(sub_query):
                 responses.append(r)
 
@@ -323,18 +325,18 @@ class TestContextSpawn:
     async def test_spawn_completes_on_expected_finals(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
         )
         responses: list[KataGoResponse] = []
 
-        async def consumer():
+        async def consumer() -> None:
             sub = _make_analyze_query(analyze_turns=[0, 1])
             async for r in ctx.spawn(sub):
                 responses.append(r)
@@ -356,11 +358,11 @@ class TestContextSpawn:
     async def test_parallel_returns_per_query_response_lists(self) -> None:
         caps = _FakeSessionCapabilities()
         middleware = OrchestrationMiddleware(
-            coro_factory=lambda p, c: _identity_coro(p, c), name="t",
+            coro_factory=_identity_coro, name="t",
         )
         middleware.on_session_start(caps.as_session_capabilities())
         ctx = OrchestrationContext(
-            parent_id="p1",
+            parent_id=ClientId("p1"),
             parent_query=_make_analyze_query(),
             session_capabilities=caps.as_session_capabilities(),
             middleware=middleware,
@@ -368,7 +370,7 @@ class TestContextSpawn:
 
         result_holder: list[list[list[KataGoResponse]]] = []
 
-        async def driver():
+        async def driver() -> None:
             r = await ctx.parallel(
                 _make_analyze_query(model="strong"),
                 _make_analyze_query(model="weak"),
@@ -396,11 +398,29 @@ class TestContextSpawn:
 # ===========================================================================
 
 
-@orchestration_middleware(name="identity")
 async def _identity_coro(
     parent: KataGoQuery, ctx: OrchestrationContext,
 ) -> AsyncIterator[KataGoResponse]:
-    """Test fixture: forward originals unchanged; emit no derived."""
+    """Test fixture: forward originals unchanged; emit no derived.
+
+    Not decorated because some tests pass the raw coroutine into
+    ``OrchestrationMiddleware`` directly. See
+    ``_identity_middleware_factory`` for the decorated form.
+    """
+    async for resp in ctx.original_stream():
+        yield resp
+
+
+@orchestration_middleware(name="identity")
+async def _identity_middleware_factory(
+    parent: KataGoQuery, ctx: OrchestrationContext,
+) -> AsyncIterator[KataGoResponse]:
+    """Decorated form of ``_identity_coro`` — a factory that returns an
+    ``OrchestrationMiddleware``. Tests that need the lifecycle hooks
+    (on_session_start / on_query / handle_response / on_session_end)
+    call ``_identity_middleware_factory()`` to get the middleware
+    instance.
+    """
     async for resp in ctx.original_stream():
         yield resp
 
@@ -414,50 +434,52 @@ async def _identity_coro(
 class TestCoroutineLifecycle:
     async def test_on_query_spawns_coroutine(self) -> None:
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()  # factory call returns OrchestrationMiddleware
+        m = _identity_middleware_factory()  # factory call returns OrchestrationMiddleware
         m.on_session_start(caps.as_session_capabilities())
-        m.on_query("p1", _make_analyze_query(analyze_turns=[0]))
-        assert "p1" in m._contexts
-        assert "p1" in m._tasks
+        m.on_query(ClientId("p1"), _make_analyze_query(analyze_turns=[0]))
+        assert ClientId("p1") in m._contexts
+        assert ClientId("p1") in m._tasks
         # Cleanup.
         m.on_session_end()
 
     async def test_handle_response_routes_original_to_stream(self) -> None:
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         m.on_session_start(caps.as_session_capabilities())
-        m.on_query("p1", _make_analyze_query(analyze_turns=[0]))
+        m.on_query(ClientId("p1"), _make_analyze_query(analyze_turns=[0]))
         # Push a final via handle_response; the identity coroutine
         # should yield it back.
-        out = await _drive_response(m, "p1", _final_analyze(turn=0))
+        out = await _drive_response(m, ClientId("p1"), _final_analyze(turn=0))
         # The coroutine completes; the output is the same response
         # under the parent's orig_id.
-        assert any(oid == "p1" for oid, _ in out)
+        assert any(oid == ClientId("p1") for oid, _ in out)
         m.on_session_end()
 
     async def test_unrelated_response_passes_through(self) -> None:
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         m.on_session_start(caps.as_session_capabilities())
         # No on_query for "unknown"; handle_response should pass through.
-        out = await _drive_response(m, "unknown", _final_analyze(turn=0))
+        out = await _drive_response(m, ClientId("unknown"), _final_analyze(turn=0))
         assert len(out) == 1
-        assert out[0][0] == "unknown"
+        assert out[0][0] == ClientId("unknown")
         m.on_session_end()
 
     async def test_session_end_cancels_live_tasks(self) -> None:
         caps = _FakeSessionCapabilities()
 
         @orchestration_middleware(name="long_running")
-        async def long_running(parent, ctx):
+        async def long_running(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
             # Wait forever.
             await asyncio.Event().wait()
-            yield  # type: ignore[unreachable]
+            yield _final_analyze()  # never reached; satisfies generator shape
 
         m = long_running()
         m.on_session_start(caps.as_session_capabilities())
-        m.on_query("p1", _make_analyze_query(analyze_turns=[0]))
-        task = m._tasks["p1"]
+        m.on_query(ClientId("p1"), _make_analyze_query(analyze_turns=[0]))
+        task = m._tasks[ClientId("p1")]
         assert not task.done()
         m.on_session_end()
         # Task should be cancelled; its finally block runs.
@@ -468,21 +490,23 @@ class TestCoroutineLifecycle:
         caps = _FakeSessionCapabilities()
 
         @orchestration_middleware(name="raises")
-        async def raises(parent, ctx):
+        async def raises(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
             raise ValueError("simulated coroutine bug")
-            yield  # type: ignore[unreachable]
+            yield _final_analyze()  # never reached; satisfies generator shape
 
         m = raises()
         m.on_session_start(caps.as_session_capabilities())
-        m.on_query("p1", _make_analyze_query(analyze_turns=[0]))
+        m.on_query(ClientId("p1"), _make_analyze_query(analyze_turns=[0]))
         # The coroutine raises immediately; the error response is queued.
         # Push a partial to trigger the drain in handle_response.
-        out = await _drive_response(m, "p1", _partial_analyze(turn=0))
+        out = await _drive_response(m, ClientId("p1"), _partial_analyze(turn=0))
         # Should yield exactly one error response (the structured one
         # from the coroutine driver's exception handler).
         assert len(out) >= 1
         oid, resp = out[-1]
-        assert oid == "p1"
+        assert oid == ClientId("p1")
         assert isinstance(resp, MetadataResponse)
         assert "error" in resp.opaque
         assert "raises" in resp.opaque["error"]
@@ -498,42 +522,42 @@ class TestCoroutineLifecycle:
 class TestCompositionWithCapabilityGate:
     async def test_opt_in_engages_orchestration(self) -> None:
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         gated = CapabilityGatedMiddleware("identity", m)
         gated.on_session_start(caps.as_session_capabilities())
         gated.on_query(
-            "p1",
+            ClientId("p1"),
             _make_analyze_query(
                 capabilities={"identity": {}}, analyze_turns=[0],
             ),
         )
         # Orchestration's on_query should have been called via the gate.
-        assert "p1" in m._contexts
+        assert ClientId("p1") in m._contexts
         gated.on_session_end()
 
     async def test_opt_out_skips_orchestration(self) -> None:
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         gated = CapabilityGatedMiddleware("identity", m)
         gated.on_session_start(caps.as_session_capabilities())
         # capabilities present but does NOT name "identity" → skip.
         gated.on_query(
-            "p1",
+            ClientId("p1"),
             _make_analyze_query(
                 capabilities={"other": {}}, analyze_turns=[0],
             ),
         )
         # Orchestration's on_query should NOT have been called.
-        assert "p1" not in m._contexts
+        assert ClientId("p1") not in m._contexts
         gated.on_session_end()
 
     async def test_opt_out_passthrough_handle_response(self) -> None:
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         gated = CapabilityGatedMiddleware("identity", m)
         gated.on_session_start(caps.as_session_capabilities())
         gated.on_query(
-            "p1",
+            ClientId("p1"),
             _make_analyze_query(
                 capabilities={"other": {}}, analyze_turns=[0],
             ),
@@ -543,12 +567,12 @@ class TestCompositionWithCapabilityGate:
         # opt-out branch) and falls through to "Not orchestrated;
         # pass through". Output is the original response unchanged.
         resp = _final_analyze(turn=0)
-        out: list = []
+        out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, r in gated.handle_response(
-            "p1", resp, caps.submit_query
+            ClientId("p1"), resp, caps.submit_query
         ):
             out.append((oid, r))
-        assert out == [("p1", resp)]
+        assert out == [(ClientId("p1"), resp)]
         gated.on_session_end()
 
     async def test_sub_query_response_relabels_through_gate(self) -> None:
@@ -589,7 +613,9 @@ class TestCompositionWithCapabilityGate:
         # — mirrors adaptive_reevaluate's stage-4 shape (spawn +
         # forward) without the buffering/decision logic.
         @orchestration_middleware(name="forwarder")
-        async def forwarder(parent, ctx):
+        async def forwarder(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
             sub = _make_analyze_query(analyze_turns=[0])
             async for resp in ctx.spawn(sub):
                 yield resp
@@ -600,7 +626,7 @@ class TestCompositionWithCapabilityGate:
 
         # Parent opts in to the gated capability — orchestration
         # engages, coroutine starts, ctx.spawn fires.
-        gated.on_query("p1", _make_analyze_query(
+        gated.on_query(ClientId("p1"), _make_analyze_query(
             capabilities={"forwarder": {}}, analyze_turns=[0],
         ))
         # Let the coroutine reach ctx.spawn → submit_query.
@@ -618,7 +644,7 @@ class TestCompositionWithCapabilityGate:
         # _sub_to_parent lookup re-routes the response under the
         # parent's orig_id.
         sub_response = _final_analyze(turn=0)
-        out: list[tuple[str, Any]] = []
+        out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in gated.handle_response(
             sub_orig_id, sub_response, caps.submit_query
         ):
@@ -628,7 +654,7 @@ class TestCompositionWithCapabilityGate:
         # parent's orig_id). The pre-fix bug had this output carrying
         # the synthetic sub_orig_id, which the SPA's subscriber map
         # would silently drop.
-        assert any(oid == "p1" for oid, _ in out), (
+        assert any(oid == ClientId("p1") for oid, _ in out), (
             f"sub-query response did not reach the orchestration's "
             f"auto-relabel; out={[(oid, type(r).__name__) for oid, r in out]}. "
             f"Regression: CapabilityGatedMiddleware short-circuited "
@@ -653,24 +679,24 @@ class TestCompositionWithCapabilityGate:
 
 class TestCompositionWithMiddlewareChain:
     def test_single_orchestration_in_chain_works(self) -> None:
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         chain = MiddlewareChain(inner=m, outer=IdentityMiddleware())
         assert chain is not None  # construction succeeded
 
     def test_two_orchestrations_in_chain_raises(self) -> None:
         with pytest.raises(MiddlewareChainConfigurationError, match="2 OrchestrationMiddleware"):
-            MiddlewareChain(inner=_identity_coro(), outer=_identity_coro())
+            MiddlewareChain(inner=_identity_middleware_factory(), outer=_identity_middleware_factory())
 
     def test_nested_chain_with_two_orchestrations_raises(self) -> None:
         # Construct a nested chain where the inner is another chain
         # containing an orchestration; the outer chain has another
         # orchestration. The guard should recurse.
         inner_chain = MiddlewareChain(
-            inner=_identity_coro(),
+            inner=_identity_middleware_factory(),
             outer=IdentityMiddleware(),
         )
         with pytest.raises(MiddlewareChainConfigurationError, match="2 OrchestrationMiddleware"):
-            MiddlewareChain(inner=inner_chain, outer=_identity_coro())
+            MiddlewareChain(inner=inner_chain, outer=_identity_middleware_factory())
 
     def test_nested_chain_with_one_orchestration_works(self) -> None:
         # Single orchestration anywhere in nested chains is fine.
@@ -678,7 +704,7 @@ class TestCompositionWithMiddlewareChain:
             inner=IdentityMiddleware(),
             outer=IdentityMiddleware(),
         )
-        outer = MiddlewareChain(inner=inner_chain, outer=_identity_coro())
+        outer = MiddlewareChain(inner=inner_chain, outer=_identity_middleware_factory())
         assert outer is not None
 
     def test_chain_with_no_orchestrations_works(self) -> None:
@@ -701,14 +727,16 @@ class TestSubQueryRouting:
 
         # Coroutine that spawns one sub-query and yields its responses.
         @orchestration_middleware(name="forwarder")
-        async def forwarder(parent, ctx):
+        async def forwarder(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
             sub = _make_analyze_query(model="strong", analyze_turns=[0])
             async for resp in ctx.spawn(sub):
                 yield resp
 
         m = forwarder()
         m.on_session_start(caps.as_session_capabilities())
-        m.on_query("p1", _make_analyze_query(analyze_turns=[0]))
+        m.on_query(ClientId("p1"), _make_analyze_query(analyze_turns=[0]))
         # Coroutine started; let it reach the spawn submit.
         await asyncio.sleep(0.01)
         assert len(caps.submitted) == 1
@@ -716,7 +744,7 @@ class TestSubQueryRouting:
         # Sub-query response arrives at handle_response.
         out = await _drive_response(m, sub_orig_id, _final_analyze(turn=0))
         # The coroutine yields it under the parent's orig_id.
-        assert any(oid == "p1" for oid, _ in out)
+        assert any(oid == ClientId("p1") for oid, _ in out)
         m.on_session_end()
 
     async def test_unrelated_sub_query_response_after_parent_cleanup_drops(
@@ -725,12 +753,12 @@ class TestSubQueryRouting:
         # Race scenario: parent's coroutine completes (cleanup happens),
         # then a stray sub-query response arrives. Should drop silently.
         caps = _FakeSessionCapabilities()
-        m = _identity_coro()
+        m = _identity_middleware_factory()
         m.on_session_start(caps.as_session_capabilities())
         # Manually populate _sub_to_parent without a context (simulates
         # the post-cleanup race).
-        m._sub_to_parent["__orch__abc"] = "p1"
-        out = await _drive_response(m, "__orch__abc", _final_analyze(turn=0))
+        m._sub_to_parent[ClientId("__orch__abc")] = ClientId("p1")
+        out = await _drive_response(m, ClientId("__orch__abc"), _final_analyze(turn=0))
         assert out == []  # nothing yielded; response dropped
         m.on_session_end()
 
@@ -743,8 +771,10 @@ class TestSubQueryRouting:
 class TestDecorator:
     def test_decorator_returns_factory(self) -> None:
         @orchestration_middleware(name="x")
-        async def coro(parent, ctx):
-            yield  # type: ignore[unreachable]
+        async def coro(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
+            yield _final_analyze()  # never reached
 
         # The decorator returns a factory (callable).
         assert callable(coro)
@@ -755,8 +785,10 @@ class TestDecorator:
 
     def test_factory_returns_fresh_instance_each_call(self) -> None:
         @orchestration_middleware(name="y")
-        async def coro(parent, ctx):
-            yield  # type: ignore[unreachable]
+        async def coro(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
+            yield _final_analyze()  # never reached
 
         m1 = coro()
         m2 = coro()

@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
@@ -80,7 +81,7 @@ def _section(title: str) -> None:
     print("=" * 78)
 
 
-def _scenario_leaf(role_log) -> None:
+def _scenario_leaf(role_log: Any) -> None:
     """Per-session LEAF scenario: connect → subscribe → dispatch → respond
     × 3 → complete → disconnect."""
     session = "('192.168.122.1', 47748)"
@@ -106,7 +107,7 @@ def _scenario_leaf(role_log) -> None:
     lifecycle.disconnect(s_log, code=1000, reason="bye")
 
 
-def _scenario_relay(role_log) -> None:
+def _scenario_relay(role_log: Any) -> None:
     """RELAY scenario: per-upstream session bound; broadcast for
     metadata, dispatch for analyze, dispatch_error on a closed
     upstream."""
@@ -135,7 +136,7 @@ def _scenario_relay(role_log) -> None:
     )
 
 
-def _scenario_selector(role_log) -> None:
+def _scenario_selector(role_log: Any) -> None:
     """SELECTOR scenario: per-label upstream bind; dispatch picks the
     label; unhealthy label surfaces upstream_unhealthy."""
     cid = "hub_3f0594e2c68e361a89a8"
@@ -158,7 +159,7 @@ def _scenario_selector(role_log) -> None:
     )
 
 
-def _scenario_echo(role_log) -> None:
+def _scenario_echo(role_log: Any) -> None:
     """ECHO scenario: synthetic responses; minimal lifecycle."""
     cid = "echo-001"
     orig = "client-orig-1"
@@ -167,7 +168,7 @@ def _scenario_echo(role_log) -> None:
     )
 
 
-def _scenario_diagnostic(role_log) -> None:
+def _scenario_diagnostic(role_log: Any) -> None:
     """The catch-all: a record that doesn't fit a typed lifecycle
     event but still goes through the structured envelope."""
     role_log.info(
@@ -194,7 +195,7 @@ def _run_role(role: Role, formatter: logging.Formatter) -> None:
     _scenario_diagnostic(role_log)
 
 
-def _run_filter_demo(role_log) -> None:
+def _run_filter_demo(role_log: Any) -> None:
     """Demonstrate trace-cid + regex filters on a small mixed
     sequence."""
     cids = ["hub_aaaa", "hub_bbbb", "hub_aaaa"]

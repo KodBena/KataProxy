@@ -26,19 +26,23 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ClientId, ProxyLink
+from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import KataGoQuery, KataGoResponse
 
 
 def capability_gate(
     name: str,
     wrapped_factory: Callable[
-        [ProxyLink], Transformer
+        [ProxyLink[ClientId, InternalId]],
+        Transformer[KataGoQuery, KataGoResponse],
     ],
-) -> Callable[[ProxyLink], Transformer]:
+) -> Callable[
+    [ProxyLink[ClientId, InternalId]],
+    Transformer[KataGoQuery, KataGoResponse],
+]:
     """Wrap a Transformer factory so the wrapped transformer engages
     only when the query's `capabilities` field opts in to ``name``.
 
@@ -64,9 +68,11 @@ def capability_gate(
     authoritative line ensuring it never reaches KataGo.
     """
 
-    def factory(link: ProxyLink) -> Transformer:
+    def factory(
+        link: ProxyLink[ClientId, InternalId],
+    ) -> Transformer[KataGoQuery, KataGoResponse]:
         wrapped = wrapped_factory(link)
-        engaged: Dict[ClientId, dict] = {}
+        engaged: Dict[ClientId, Dict[str, Any]] = {}
 
         def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
             opaque_caps = q.opaque.get("capabilities")

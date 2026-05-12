@@ -48,10 +48,10 @@ from proxy_logging import Event, get_proxy_logger
 logger = logging.getLogger("kataproxy." + __name__)
 _log = get_proxy_logger(__name__)
 try:
-    import go_transposition as _go_transposition  # type: ignore[import]
+    import go_transposition as _go_transposition
     _TRANSPOSITION_AVAILABLE = True
 except ImportError:
-    _go_transposition = None  # type: ignore[assignment]
+    _go_transposition = None
     _TRANSPOSITION_AVAILABLE = False
 if not _TRANSPOSITION_AVAILABLE:
     logging.getLogger("kataproxy.transposition_enricher").warning(
@@ -62,7 +62,7 @@ if not _TRANSPOSITION_AVAILABLE:
 import json
 from typing import Any, Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ClientId, ProxyLink
+from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import (
     KataGoAction,
     KataGoQuery,
@@ -239,7 +239,9 @@ def _validate_partition_pv_response(wire_dict: Dict[str, Any]) -> None:
                 _validate_coord(m, f"response.moveInfos[{i}].pv[{j}]")
 
 
-def transposition_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoResponse]:
+def transposition_enricher(
+    link: ProxyLink[ClientId, InternalId],
+) -> Transformer[KataGoQuery, KataGoResponse]:
     """
     Stateful transformer for PV partitioning.
     Monitors the ProxyLink to know when to purge the request cache.

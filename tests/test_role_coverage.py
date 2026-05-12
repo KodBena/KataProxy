@@ -42,7 +42,9 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Iterator, List, Optional
+
+from AbstractProxy.proxy_core import CanonicalId, ClientId, InternalId
 
 import pytest
 
@@ -98,7 +100,7 @@ class _CaptureHandler(logging.Handler):
 
 
 @pytest.fixture
-def capture() -> _CaptureHandler:
+def capture() -> Iterator[_CaptureHandler]:
     handler = _CaptureHandler()
     root = logging.getLogger("kataproxy")
     # Snapshot existing state so the test fixture is reentrant.
@@ -145,7 +147,7 @@ class _MockWebSocket:
 
 
 def _analyze_query(*, model: Optional[str] = None) -> KataGoQuery:
-    opaque: dict = {
+    opaque: Dict[str, Any] = {
         "moves": [],
         "rules": "tromp-taylor",
         "komi": 7.5,
@@ -184,13 +186,13 @@ class TestRelayCoverage:
         for url, ws in sockets.items():
             router._connections[url] = ws
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query()
         wire = translate_query_to_wire(q, "cid-analyze")
         await router.dispatch(
-            "cid-analyze", wire, q, on_response, on_complete,
+            CanonicalId("cid-analyze"), wire, q, on_response, on_complete,
         )
 
         assert "dispatch" in capture.events
@@ -210,13 +212,13 @@ class TestRelayCoverage:
         for url, ws in sockets.items():
             router._connections[url] = ws
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-hb")
         await router.dispatch(
-            "cid-hb", wire, q, on_response, on_complete,
+            CanonicalId("cid-hb"), wire, q, on_response, on_complete,
         )
 
         assert "broadcast" in capture.events
@@ -230,13 +232,13 @@ class TestRelayCoverage:
         router = RelayRouter(
             upstream_urls=["ws://a:1"], load_metric=InFlightQueryLoad(),
         )
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-hb")
         await router.dispatch(
-            "cid-hb", wire, q, on_response, on_complete,
+            CanonicalId("cid-hb"), wire, q, on_response, on_complete,
         )
 
         assert "no_upstream" in capture.events
@@ -270,13 +272,13 @@ class TestSelectorCoverage:
         for label, ws in sockets.items():
             router._connections[label] = ws
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query(model="strong")
         wire = translate_query_to_wire(q, "cid-analyze")
         await router.dispatch(
-            "cid-analyze", wire, q, on_response, on_complete,
+            CanonicalId("cid-analyze"), wire, q, on_response, on_complete,
         )
 
         assert "dispatch" in capture.events
@@ -294,13 +296,13 @@ class TestSelectorCoverage:
         for label, _ in router._models:
             router._connections[label] = _MockWebSocket(label)
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-hb")
         await router.dispatch(
-            "cid-hb", wire, q, on_response, on_complete,
+            CanonicalId("cid-hb"), wire, q, on_response, on_complete,
         )
 
         assert "broadcast" in capture.events
@@ -316,12 +318,13 @@ class TestSelectorCoverage:
         router._failure_budget["strong"] = 3
         router._unhealthy_models.add("strong")
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query(model="strong")
         wire = translate_query_to_wire(q, "cid-x")
-        await router.dispatch("cid-x", wire, q, on_response, on_complete)
+        await router.dispatch(
+            CanonicalId("cid-x"), wire, q, on_response, on_complete)
 
         # The pre-broadcast unhealthy-model check fires through the
         # `_send_structured_error` path, which emits no separate
@@ -334,7 +337,8 @@ class TestSelectorCoverage:
         # no_upstream:
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-y")
-        await router.dispatch("cid-y", wire, q, on_response, on_complete)
+        await router.dispatch(
+            CanonicalId("cid-y"), wire, q, on_response, on_complete)
         assert "no_upstream" in capture.events
 
 
@@ -351,14 +355,15 @@ class TestEchoCoverage:
         self, capture: _CaptureHandler,
     ) -> None:
         router = EchoRouter()
-        responses: list[tuple[str, dict]] = []
+        responses: List[tuple[CanonicalId, Dict[str, Any]]] = []
 
-        async def on_response(cid, w): responses.append((cid, w))
-        async def on_complete(_cid): pass
+        async def on_response(cid: CanonicalId, w: Dict[str, Any]) -> None: responses.append((cid, w))
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query()
         wire = translate_query_to_wire(q, "cid-x")
-        await router.dispatch("cid-x", wire, q, on_response, on_complete)
+        await router.dispatch(
+            CanonicalId("cid-x"), wire, q, on_response, on_complete)
 
         assert "dispatch" in capture.events
         # ECHO synthesizes responses; verify the dispatch event came
@@ -395,12 +400,12 @@ class TestSchemaContract:
         )
         router._connections["ws://a:1"] = _MockWebSocket("a")
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _analyze_query()
         wire = translate_query_to_wire(q, "cid-1")
-        await router.dispatch("cid-1", wire, q, on_response, on_complete)
+        await router.dispatch(CanonicalId("cid-1"), wire, q, on_response, on_complete)
 
         # Filter to records that carry a TYPED event (anything other
         # than the DIAGNOSTIC catch-all) and assert role is present
@@ -461,13 +466,13 @@ class TestRelayDispatchError:
         for url, ws in sockets.items():
             router._connections[url] = ws
 
-        async def on_response(_cid, _w): pass
-        async def on_complete(_cid): pass
+        async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_cid: CanonicalId) -> None: pass
 
         q = _heartbeat_query()
         wire = translate_query_to_wire(q, "cid-hb")
         await router.dispatch(
-            "cid-hb", wire, q, on_response, on_complete,
+            CanonicalId("cid-hb"), wire, q, on_response, on_complete,
         )
 
         # The closed socket's send failure surfaces as dispatch_error.
@@ -531,10 +536,10 @@ class TestHubCoalesceEvent:
         # First subscriber.
         is_new1, canonical1 = hub.subscribe(
             query=q,
-            subscriber_internal_id="iid-1",
+            subscriber_internal_id=InternalId("iid-1"),
             subscriber_queue=asyncio.Queue(),
             proxy_log=plog,
-            orig_id="orig-1",
+            orig_id=ClientId("orig-1"),
         )
         # Second subscriber, same query. The hub.subscribe API
         # consumes the cache flags via .pop(), so re-build a fresh
@@ -543,10 +548,10 @@ class TestHubCoalesceEvent:
         q2 = _analyze_query()
         is_new2, canonical2 = hub.subscribe(
             query=q2,
-            subscriber_internal_id="iid-2",
+            subscriber_internal_id=InternalId("iid-2"),
             subscriber_queue=asyncio.Queue(),
             proxy_log=plog,
-            orig_id="orig-2",
+            orig_id=ClientId("orig-2"),
         )
 
         assert is_new1 is True, "first subscribe should be new"
@@ -592,14 +597,18 @@ class TestMiddlewareEngageEvent:
         # capture so the schema-validity contract holds end-to-end.
         get_proxy_logger("kataproxy.test").bind(role=Role.LEAF)
 
+        async def _noop_submit(_id: ClientId, _q: KataGoQuery) -> None: pass
+        async def _noop_terminate(_id: ClientId) -> None: pass
         gated.on_session_start(
-            SessionCapabilities(submit_query=None, terminate_query=None),
+            SessionCapabilities(
+                submit_query=_noop_submit, terminate_query=_noop_terminate,
+            ),
         )
 
         # Per-query opt-in: capabilities dict naming the gated cap.
         q = _analyze_query()
         q.opaque["capabilities"] = {"test_capability": {}}
-        gated.on_query("orig-1", q)
+        gated.on_query(ClientId("orig-1"), q)
 
         # The gate's engagement decision lands as middleware_engage.
         # `middleware_name` is the wrapped class name (the helper
@@ -646,16 +655,22 @@ class TestOrchestrationSpawnEvent:
         )
         from middleware.session_middleware import SessionCapabilities
 
-        submitted: list = []
+        submitted: List[tuple[ClientId, KataGoQuery]] = []
 
-        async def submit(oid, q):
+        async def submit(oid: ClientId, q: KataGoQuery) -> None:
             submitted.append((oid, q))
 
-        async def terminate(_oid):
+        async def terminate(_oid: ClientId) -> None:
             pass
 
+        from middleware.orchestration import OrchestrationContext as _OrchCtx
+        from typing import AsyncIterator as _AsyncIterator
+        from katago import KataGoResponse as _KataGoResponse
+
         @orchestration_middleware(name="test_orch")
-        async def coro(parent, ctx):
+        async def coro(
+            parent: KataGoQuery, ctx: _OrchCtx,
+        ) -> _AsyncIterator[_KataGoResponse]:
             # Discard originals so the framework doesn't buffer; we're
             # testing the spawn emission shape.
             await ctx.discard_originals()
@@ -669,7 +684,7 @@ class TestOrchestrationSpawnEvent:
                 submit_query=submit, terminate_query=terminate,
             ),
         )
-        m.on_query("parent-orig", _analyze_query())
+        m.on_query(ClientId("parent-orig"), _analyze_query())
 
         # Allow the coroutine to reach ctx.spawn → submit_query.
         for _ in range(50):

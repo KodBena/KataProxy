@@ -42,7 +42,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -59,7 +59,8 @@ from pubsub_hub import LRUCacheStore, PubSubHub  # noqa: E402
 from transformers.analysis_enricher import analysis_enricher  # noqa: E402
 from transformers.capability_gate import capability_gate  # noqa: E402
 
-from router import BackendRouter  # noqa: E402
+from AbstractProxy.proxy_core import CanonicalId, ClientId  # noqa: E402
+from router import BackendRouter, OnComplete, OnResponse  # noqa: E402
 from tests.synthetic_backend import SyntheticPonderingRouter  # noqa: E402
 
 
@@ -98,16 +99,16 @@ class MaxVisitsSyntheticRouter(BackendRouter):
     ) -> None:
         self._n_intermediates = n_intermediates
         self._emit_interval_s = emit_interval_s
-        self._live: dict[str, asyncio.Task] = {}
-        self.dispatched: list[str] = []
-        self.terminated: list[str] = []
+        self._live: dict[CanonicalId, asyncio.Task[None]] = {}
+        self.dispatched: list[CanonicalId] = []
+        self.terminated: list[CanonicalId] = []
 
     async def start(self) -> None:
         pass
 
     async def dispatch(
-        self, canonical_id: str, wire_dict: dict, query: KataGoQuery,
-        on_response, on_complete,
+        self, canonical_id: CanonicalId, wire_dict: Dict[str, Any], query: KataGoQuery,
+        on_response: OnResponse, on_complete: OnComplete,
     ) -> None:
         self.dispatched.append(canonical_id)
         if query.action != KataGoAction.ANALYZE:
@@ -125,8 +126,8 @@ class MaxVisitsSyntheticRouter(BackendRouter):
         self._live[canonical_id] = task
 
     async def _emit_for(
-        self, canonical_id: str, max_visits: int, turns: list[int],
-        on_response, on_complete,
+        self, canonical_id: CanonicalId, max_visits: int, turns: list[int],
+        on_response: OnResponse, on_complete: OnComplete,
     ) -> None:
         try:
             # `n_intermediates` ticks; each tick emits one packet per turn
@@ -159,7 +160,10 @@ class MaxVisitsSyntheticRouter(BackendRouter):
         finally:
             self._live.pop(canonical_id, None)
 
-    async def terminate(self, canonical_id: str, on_response, on_complete) -> None:
+    async def terminate(
+        self, canonical_id: CanonicalId,
+        on_response: OnResponse, on_complete: OnComplete,
+    ) -> None:
         self.terminated.append(canonical_id)
         task = self._live.pop(canonical_id, None)
         if task is not None:
@@ -169,7 +173,10 @@ class MaxVisitsSyntheticRouter(BackendRouter):
             except asyncio.CancelledError:
                 pass
         import secrets
-        wire_id = f"kg_{secrets.token_hex(6)}"
+        # Synthetic ack's wire id is brand-CanonicalId at routing-key
+        # sites; see SyntheticPonderingRouter.terminate for the same
+        # convention.
+        wire_id = CanonicalId(f"kg_{secrets.token_hex(6)}")
         await on_response(wire_id, {
             "id": wire_id, "action": "terminate", "terminateId": canonical_id,
         })
@@ -205,7 +212,7 @@ class _MockWebSocket:
         pass
 
 
-def _palette() -> dict:
+def _palette() -> Dict[str, Any]:
     """Minimal analysis_config compatible with the synthetic backend's
     emitted fields. State_fns read rootInfo.visits / rootInfo.scoreLead;
     delta_fn reads visits across the windowed pair. Sufficient to drive
@@ -282,7 +289,9 @@ def _build_chain() -> SessionMiddleware:
     )
 
 
-def _transformer_factory(link):
+def _transformer_factory(
+    link: Any,
+) -> Any:
     """Capability-gated analysis_enricher — mirrors proxy_server's main()
     composition for the delta_analysis capability."""
     return capability_gate("delta_analysis", analysis_enricher)(link)
@@ -292,9 +301,9 @@ async def _run_query(
     *,
     session: ClientSession,
     query: KataGoQuery,
-    orig_id: str,
+    orig_id: ClientId,
     settle_s: float,
-) -> list[dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     """Drive a single query through the session and capture wire output.
 
     Resets the MockWebSocket's `sent` buffer before issuing so the
@@ -307,16 +316,16 @@ async def _run_query(
     pick generously enough to cover N intermediates + finals + any
     adaptive-spawned sub-query.
     """
-    ws: _MockWebSocket = session._ws  # type: ignore[attr-defined]
+    ws: _MockWebSocket = session._ws
     ws.sent.clear()
     # The production receive loop calls middleware.on_query before
     # dispatching; for direct _handle_query callers (this test, the
     # diagnose_* scripts) we mirror that explicitly so the orchestration
     # bookkeeping fires.
-    session._middleware.on_query(orig_id, query)  # type: ignore[attr-defined]
+    session._middleware.on_query(orig_id, query)
     await session._handle_query(orig_id, query)
     await asyncio.sleep(settle_s)
-    out: list[dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for raw in ws.sent:
         try:
             out.append(json.loads(raw))
@@ -330,7 +339,7 @@ async def _setup_session(
     cache_store: Optional[LRUCacheStore] = None,
     max_intermediates: int = 3,
     emit_interval_s: float = 0.01,
-) -> tuple[ClientSession, "MaxVisitsSyntheticRouter", _MockWebSocket, asyncio.Task]:
+) -> tuple[ClientSession, "MaxVisitsSyntheticRouter", _MockWebSocket, asyncio.Task[None]]:
     """Build a fully-wired ClientSession with a running send_loop.
 
     Returns (session, router, ws, send_task). Caller is responsible for
@@ -359,7 +368,7 @@ async def _setup_session(
         rate_limit=None,
     )
     send_task = asyncio.create_task(
-        session._send_loop(),  # type: ignore[attr-defined]
+        session._send_loop(),
         name="test-send-loop",
     )
     return session, router, ws, send_task
@@ -368,7 +377,7 @@ async def _setup_session(
 async def _teardown_session(
     session: ClientSession,
     router: "MaxVisitsSyntheticRouter",
-    send_task: asyncio.Task,
+    send_task: asyncio.Task[None],
 ) -> None:
     """Standard cleanup: cancel send_loop, stop router, await middleware end."""
     send_task.cancel()
@@ -381,7 +390,7 @@ async def _teardown_session(
     # such); call it bare to release the orchestration framework's
     # bookkeeping. Tasks spawned by on_session_start should already be
     # cancelled by the send_loop teardown above.
-    session._middleware.on_session_end()  # type: ignore[attr-defined]
+    session._middleware.on_session_end()
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +454,7 @@ class TestAdaptiveCacheMatrix:
             wires = await _run_query(
                 session=session,
                 query=_build_query("A", cache=False, lookup_cache=False),
-                orig_id="orig-A",
+                orig_id=ClientId("orig-A"),
                 settle_s=0.5,
             )
         finally:
@@ -481,7 +490,7 @@ class TestAdaptiveCacheMatrix:
             wires = await _run_query(
                 session=session,
                 query=_build_query("B", cache=True, lookup_cache=False),
-                orig_id="orig-B",
+                orig_id=ClientId("orig-B"),
                 settle_s=0.5,
             )
         finally:
@@ -518,7 +527,7 @@ class TestAdaptiveCacheMatrix:
             await _run_query(
                 session=session,
                 query=_build_query("prime", cache=True, lookup_cache=False),
-                orig_id="orig-prime",
+                orig_id=ClientId("orig-prime"),
                 settle_s=0.5,
             )
             assert len(cache_store) >= 1, "prime should populate cache"
@@ -531,7 +540,7 @@ class TestAdaptiveCacheMatrix:
                 query=_build_query(
                     "C", cache=False, lookup_cache=True, replay_final_only=False,
                 ),
-                orig_id="orig-C",
+                orig_id=ClientId("orig-C"),
                 settle_s=0.5,
             )
         finally:
@@ -568,7 +577,7 @@ class TestAdaptiveCacheMatrix:
             await _run_query(
                 session=session,
                 query=_build_query("prime", cache=True, lookup_cache=False),
-                orig_id="orig-prime",
+                orig_id=ClientId("orig-prime"),
                 settle_s=0.5,
             )
             wires = await _run_query(
@@ -576,7 +585,7 @@ class TestAdaptiveCacheMatrix:
                 query=_build_query(
                     "D", cache=False, lookup_cache=True, replay_final_only=True,
                 ),
-                orig_id="orig-D",
+                orig_id=ClientId("orig-D"),
                 settle_s=0.5,
             )
         finally:

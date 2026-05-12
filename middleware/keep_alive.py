@@ -109,7 +109,7 @@ class KeepAliveMiddleware(SessionMiddleware):
         self._last_heartbeat: float = monotonic()
         self._in_flight: set[ClientId] = set()
         self._caps: Optional[SessionCapabilities] = None
-        self._task: Optional[asyncio.Task] = None
+        self._task: Optional[asyncio.Task[None]] = None
         # Structured-logging adapter. Falls back to a module-bare
         # ProxyLogger if the SessionCapabilities didn't carry one
         # (test harnesses, diagnose scripts that bypass ClientSession).

@@ -72,6 +72,7 @@ _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
+from AbstractProxy.proxy_core import ClientId  # noqa: E402
 from katago import KataGoAction, KataGoQuery  # noqa: E402
 from middleware.adaptive_reevaluate import adaptive_reevaluate  # noqa: E402
 from middleware.capability_gate import CapabilityGatedMiddleware  # noqa: E402
@@ -237,8 +238,8 @@ async def run_scenario() -> bool:
     # _handle_query alone does NOT call middleware.on_query (that's
     # _handle_incoming's job). For this test we mimic _handle_incoming
     # by calling on_query manually so the chain's bookkeeping runs.
-    middleware.on_query("orig_A", _ponder_query())
-    await session._handle_query("orig_A", _ponder_query())
+    middleware.on_query(ClientId("orig_A"), _ponder_query())
+    await session._handle_query(ClientId("orig_A"), _ponder_query())
     if not router.dispatched:
         print("  FAIL: synthetic router never received the dispatch")
         await router.stop()
@@ -275,7 +276,7 @@ async def run_scenario() -> bool:
         # the keep-alive contract depends only on the on_query side;
         # dispatching adds response-side noise without exercising
         # additional contract.
-        middleware.on_query(f"hb-{seq}", _heartbeat_query())
+        middleware.on_query(ClientId(f"hb-{seq}"), _heartbeat_query())
         # Bound queue growth from the synthetic router's intermediates.
         await _drain_send_queue(session)
 
