@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Callable, Dict, Optional
 
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ProxyLink
+from AbstractProxy.proxy_core import ClientId, ProxyLink
 from katago import KataGoQuery, KataGoResponse
 
 
@@ -66,9 +66,9 @@ def capability_gate(
 
     def factory(link: ProxyLink) -> Transformer:
         wrapped = wrapped_factory(link)
-        engaged: Dict[str, dict] = {}
+        engaged: Dict[ClientId, dict] = {}
 
-        def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
+        def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
             opaque_caps = q.opaque.get("capabilities")
             if opaque_caps is None:
                 # Legacy auto-engage (no capabilities field present).
@@ -83,7 +83,7 @@ def capability_gate(
             # will short-circuit too.
             return q
 
-        def on_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+        def on_response(eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
             if eid in engaged:
                 result = wrapped.on_response(eid, r)
             else:

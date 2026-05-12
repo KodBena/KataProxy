@@ -54,6 +54,7 @@ import logging
 from time import monotonic
 from typing import Callable, Optional
 
+from AbstractProxy.proxy_core import ClientId
 from katago import (
     AnalyzeResponse,
     KataGoAction,
@@ -106,7 +107,7 @@ class KeepAliveMiddleware(SessionMiddleware):
         )
         self._is_heartbeat = is_heartbeat or _is_query_version
         self._last_heartbeat: float = monotonic()
-        self._in_flight: set[str] = set()
+        self._in_flight: set[ClientId] = set()
         self._caps: Optional[SessionCapabilities] = None
         self._task: Optional[asyncio.Task] = None
         # Structured-logging adapter. Falls back to a module-bare
@@ -142,7 +143,7 @@ class KeepAliveMiddleware(SessionMiddleware):
     # Per-message hooks
     # ------------------------------------------------------------------
 
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
+    def on_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         if self._is_heartbeat(query):
             self._last_heartbeat = monotonic()
             # Lifecycle: heartbeat observed; timer reset. DEBUG-level
@@ -169,7 +170,7 @@ class KeepAliveMiddleware(SessionMiddleware):
 
     async def handle_response(
         self,
-        orig_id: str,
+        orig_id: ClientId,
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:

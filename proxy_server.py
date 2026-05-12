@@ -86,7 +86,16 @@ from katago import (
     translate_response_to_wire,
     KATAGO_QUERY_PRISMS,
 )
-from AbstractProxy.proxy_core import CompletionTracker, Envelope, TranslationError, Dispatcher, ProxyLink
+from AbstractProxy.proxy_core import (
+    CanonicalId,
+    ClientId,
+    CompletionTracker,
+    Dispatcher,
+    Envelope,
+    InternalId,
+    ProxyLink,
+    TranslationError,
+)
 from AbstractProxy.protocol_transformer import TransformedChain, Transformer
 from pubsub_hub import PubSubHub, LRUCacheStore
 from proxy_json import loads_bounded, JsonDepthExceededError
@@ -274,7 +283,7 @@ class ClientSession:
         self._log = proxy_log
         # Per-query start-time tracking for the `complete` event's
         # duration_ms field. Keyed by orig_id.
-        self._query_started_at: dict[str, float] = {}
+        self._query_started_at: dict[ClientId, float] = {}
         # Extract IP for the per-IP rate limiter. ws.remote_address is a
         # (host, port) tuple from the websockets library; falls back to the
         # full peer string if the tuple shape isn't available.
@@ -310,7 +319,10 @@ class ClientSession:
         self._middleware: SessionMiddleware = middleware or IdentityMiddleware()
 
         # Maps orig_id → (subscriber_internal_id, canonical_id) for cleanup.
-        self._active_queries: Dict[str, tuple] = {}
+        # Keys are ClientId-namespace (the client's wire-id) per the
+        # identity-type-branding migration; values are the
+        # (InternalId, CanonicalId) tuple the link + hub produced.
+        self._active_queries: Dict[ClientId, tuple[InternalId, CanonicalId]] = {}
 
         self._log.debug(
             Event.DIAGNOSTIC,
@@ -464,7 +476,15 @@ class ClientSession:
                 )
             return
 
-        prism, orig_id, query = result
+        prism, raw_orig_id, query = result
+        # Construction site: the prism extracted a raw `str` from the
+        # wire's `id` field, which is in the client's wire-namespace.
+        # Brand it as ClientId here so the downstream call chain
+        # (_handle_query, _handle_terminate, middleware.on_query,
+        # hub.subscribe, …) is typecheck-coherent end-to-end. The
+        # framework's Prism.preview signature returns `tuple[str, A]`
+        # generically; this is the protocol-aware brand assignment.
+        orig_id: ClientId = ClientId(raw_orig_id)
 
         if prism.name == "terminate":
             await self._handle_terminate(orig_id, query)
@@ -473,7 +493,7 @@ class ClientSession:
             self._middleware.on_query(orig_id, query)
             await self._handle_query(orig_id, query)
 
-    async def _handle_query(self, orig_id: str, query: KataGoQuery) -> None:
+    async def _handle_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         """Translate and submit a query through the full Transformer + hub/router pipeline.
 
         Used for both client-originated queries and middleware-injected queries.
@@ -498,7 +518,7 @@ class ClientSession:
             )
             return
 
-        subscriber_internal_id: str = env.id
+        subscriber_internal_id: InternalId = env.id
         translated_query = env.payload
 
         register_query_completion(self._tracker, subscriber_internal_id, translated_query)
@@ -538,7 +558,7 @@ class ClientSession:
                 on_complete=self._hub.on_complete,
             )
 
-    async def _handle_terminate(self, orig_id: str, query) -> None:
+    async def _handle_terminate(self, orig_id: ClientId, query) -> None:
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
         except TranslationError as e:
@@ -555,7 +575,7 @@ class ClientSession:
         if env is None:
             return
 
-        terminate_internal_id: str = env.id
+        terminate_internal_id: InternalId = env.id
         translated_query = env.payload
         target_internal_id = translated_query.terminate_id
 
@@ -664,7 +684,7 @@ class ClientSession:
             )
             await send_queue.put(synthesized_ack)
 
-    async def _terminate_query(self, target_orig_id: str) -> None:
+    async def _terminate_query(self, target_orig_id: ClientId) -> None:
         """Terminate an in-flight ANALYZE query by its client-namespace orig_id.
 
         Surfaced to middleware via SessionCapabilities.terminate_query so
@@ -686,7 +706,9 @@ class ClientSession:
         )
         await self._handle_terminate(synthetic_id, term_query)
 
-    def _internal_to_canonical(self, subscriber_internal_id: str) -> Optional[str]:
+    def _internal_to_canonical(
+        self, subscriber_internal_id: InternalId,
+    ) -> Optional[CanonicalId]:
         """Reverse lookup: subscriber_internal_id → canonical_id."""
         for _orig, (iid, cid) in self._active_queries.items():
             if iid == subscriber_internal_id:

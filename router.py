@@ -42,6 +42,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Any, Awaitable, Callable, Deque, Optional
 
+from AbstractProxy.proxy_core import CanonicalId, WireId
+
 from AbstractProxy.proxy_core import CompletionSignal, CompletionTracker
 from katago import (
     KataGoAction,
@@ -119,8 +121,8 @@ WireDict = dict[str, Any]
 # contract: any object with __await__ satisfies it, including async def
 # functions, async lambdas, and wrapped tasks. The contract must constrain
 # the *result* (must be awaitable, must yield None), not the implementation.
-OnResponse = Callable[[str, WireDict], Awaitable[None]]
-OnComplete = Callable[[str], Awaitable[None]]
+OnResponse = Callable[[CanonicalId, WireDict], Awaitable[None]]
+OnComplete = Callable[[CanonicalId], Awaitable[None]]
 
 _READER_LIMIT = 64 * 1024 * 1024
 _WS_MAX_SIZE = _READER_LIMIT
@@ -168,11 +170,11 @@ class LoadMetric(ABC):
     """
 
     @abstractmethod
-    def on_query_sent(self, url: str, canonical_id: str) -> None:
+    def on_query_sent(self, url: str, canonical_id: CanonicalId) -> None:
         """Called immediately after a query is dispatched to url."""
 
     @abstractmethod
-    def on_query_complete(self, url: str, canonical_id: str) -> None:
+    def on_query_complete(self, url: str, canonical_id: CanonicalId) -> None:
         """Called when the router receives QUERY_COMPLETE for this canonical_id."""
 
     @abstractmethod
@@ -184,10 +186,10 @@ class InFlightQueryLoad(LoadMetric):
     """Load = number of queries dispatched but not yet QUERY_COMPLETE."""
 
     def __init__(self) -> None:
-        self._counts: dict[str, int] = {}          # url → count
-        self._assignments: dict[str, str] = {}     # canonical_id → url
+        self._counts: dict[str, int] = {}                  # url → count
+        self._assignments: dict[CanonicalId, str] = {}     # canonical_id → url
 
-    def on_query_sent(self, url: str, canonical_id: str) -> None:
+    def on_query_sent(self, url: str, canonical_id: CanonicalId) -> None:
         self._counts[url] = self._counts.get(url, 0) + 1
         self._assignments[canonical_id] = url
         _log.info(
@@ -196,7 +198,7 @@ class InFlightQueryLoad(LoadMetric):
             msg=f"url={url} load={self._counts[url]}",
         )
 
-    def on_query_complete(self, url: str, canonical_id: str) -> None:
+    def on_query_complete(self, url: str, canonical_id: CanonicalId) -> None:
         self._counts[url] = max(0, self._counts.get(url, 0) - 1)
         self._assignments.pop(canonical_id, None)
         _log.info(
@@ -208,7 +210,7 @@ class InFlightQueryLoad(LoadMetric):
     def current_load(self, url: str) -> int:
         return self._counts.get(url, 0)
 
-    def url_for(self, canonical_id: str) -> Optional[str]:
+    def url_for(self, canonical_id: CanonicalId) -> Optional[str]:
         """Convenience: which upstream owns this in-flight query?"""
         return self._assignments.get(canonical_id)
 
@@ -290,7 +292,7 @@ class BackendRouter(ABC):
     @abstractmethod
     async def dispatch(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -304,7 +306,7 @@ class BackendRouter(ABC):
     @abstractmethod
     async def terminate(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
@@ -898,7 +900,7 @@ class LeafRouter(BackendRouter):
 
     async def dispatch(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -972,7 +974,7 @@ class LeafRouter(BackendRouter):
 
     async def terminate(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
@@ -1302,7 +1304,7 @@ class RelayRouter(BackendRouter):
         # under sustained successful reconnects.
         task.add_done_callback(self._reconnect_tasks.discard)
 
-    def _select_upstream(self, canonical_id: str) -> Optional[str]:
+    def _select_upstream(self, canonical_id: CanonicalId) -> Optional[str]:
         """Walk the ring in preference order; return first under max_load."""
         candidates = self._ring.ordered_nodes_for(canonical_id)
         self._log.info(
@@ -1341,7 +1343,7 @@ class RelayRouter(BackendRouter):
 
     async def dispatch(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -1386,7 +1388,7 @@ class RelayRouter(BackendRouter):
 
     async def _broadcast(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -1492,7 +1494,7 @@ class RelayRouter(BackendRouter):
 
     async def terminate(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
@@ -1997,7 +1999,7 @@ class SelectorRouter(BackendRouter):
 
     async def _send_synthetic_response(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         opaque: dict[str, Any],
         on_response: OnResponse,
         on_complete: OnComplete,
@@ -2009,7 +2011,7 @@ class SelectorRouter(BackendRouter):
 
     async def _send_structured_error(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         message: str,
         on_response: OnResponse,
         on_complete: OnComplete,
@@ -2033,7 +2035,7 @@ class SelectorRouter(BackendRouter):
 
     async def dispatch(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -2170,7 +2172,7 @@ class SelectorRouter(BackendRouter):
 
     async def _forward(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         label: str,
@@ -2241,7 +2243,7 @@ class SelectorRouter(BackendRouter):
 
     async def _broadcast(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -2367,7 +2369,7 @@ class SelectorRouter(BackendRouter):
 
     async def terminate(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
@@ -2490,7 +2492,7 @@ class EchoRouter(BackendRouter):
 
     async def dispatch(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         wire_dict: WireDict,
         query: KataGoQuery,
         on_response: OnResponse,
@@ -2519,7 +2521,7 @@ class EchoRouter(BackendRouter):
 
     async def terminate(
         self,
-        canonical_id: str,
+        canonical_id: CanonicalId,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:

@@ -47,6 +47,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+from AbstractProxy.proxy_core import ClientId
 from katago import KataGoQuery, KataGoResponse
 
 __all__ = [
@@ -79,9 +80,9 @@ __all__ = [
 #   concrete class.
 # ---------------------------------------------------------------------------
 
-SubmitQuery = Callable[[str, KataGoQuery], Awaitable[None]]
-TerminateQuery = Callable[[str], Awaitable[None]]
-ResponseStream = AsyncIterator[tuple[str, KataGoResponse]]
+SubmitQuery = Callable[[ClientId, KataGoQuery], Awaitable[None]]
+TerminateQuery = Callable[[ClientId], Awaitable[None]]
+ResponseStream = AsyncIterator[tuple[ClientId, KataGoResponse]]
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +148,7 @@ class SessionMiddleware(ABC):
         default implementation is a no-op.
         """
 
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
+    def on_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         """Called synchronously when a client query is received, before routing.
 
         Use to record expected response counts or annotate per-query state.
@@ -157,7 +158,7 @@ class SessionMiddleware(ABC):
     @abstractmethod
     def handle_response(
         self,
-        orig_id: str,
+        orig_id: ClientId,
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:
@@ -184,7 +185,7 @@ class IdentityMiddleware(SessionMiddleware):
 
     async def handle_response(
         self,
-        orig_id: str,
+        orig_id: ClientId,
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:
@@ -258,13 +259,13 @@ class MiddlewareChain(SessionMiddleware):
         self._outer.on_session_end()
         self._inner.on_session_end()
 
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
+    def on_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         self._inner.on_query(orig_id, query)
         self._outer.on_query(orig_id, query)
 
     async def handle_response(
         self,
-        orig_id: str,
+        orig_id: ClientId,
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:

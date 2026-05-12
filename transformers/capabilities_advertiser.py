@@ -24,7 +24,7 @@ from copy import deepcopy
 from typing import Any, Callable, Dict, Optional
 
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ProxyLink
+from AbstractProxy.proxy_core import ClientId, ProxyLink
 from katago import KataGoQuery, KataGoResponse, MetadataResponse
 
 
@@ -60,10 +60,10 @@ def capabilities_advertiser(
     advertised_snapshot: Dict[str, Dict[str, Any]] = deepcopy(advertised)
 
     def factory(_link: ProxyLink) -> Transformer:
-        def on_query(_eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
+        def on_query(_eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
             return q
 
-        def on_response(_eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+        def on_response(_eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
             if isinstance(r, MetadataResponse) and "version" in r.opaque:
                 new_opaque = dict(r.opaque)
                 new_opaque["capabilities"] = deepcopy(advertised_snapshot)

@@ -62,7 +62,7 @@ if not _TRANSPOSITION_AVAILABLE:
 import json
 from typing import Any, Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ProxyLink
+from AbstractProxy.proxy_core import ClientId, ProxyLink
 from katago import (
     KataGoAction,
     KataGoQuery,
@@ -244,9 +244,9 @@ def transposition_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRe
     Stateful transformer for PV partitioning.
     Monitors the ProxyLink to know when to purge the request cache.
     """
-    request_cache: Dict[str, str] = {}
+    request_cache: Dict[ClientId, str] = {}
 
-    def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
+    def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
         # Guard: only cache for analysis
         if q.action == KataGoAction.ANALYZE:
             wire_dict = translate_query_to_wire(q, eid)
@@ -266,7 +266,7 @@ def transposition_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRe
             request_cache[eid] = json.dumps(wire_dict)
         return q
 
-    def on_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+    def on_response(eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
         # 1. Attempt enrichment
         req_json = request_cache.get(eid)
         if _TRANSPOSITION_AVAILABLE and req_json is not None and "moveInfos" in r.opaque:
