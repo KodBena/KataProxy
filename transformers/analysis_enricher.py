@@ -20,7 +20,7 @@ from delta_analysis import DeltaAnalysisState
 
 from typing import Optional, Dict
 from AbstractProxy.protocol_transformer import Transformer
-from AbstractProxy.proxy_core import ProxyLink
+from AbstractProxy.proxy_core import ClientId, ProxyLink
 from katago import (
     AnalyzeResponse,
     KataGoAction,
@@ -50,9 +50,9 @@ def sliding_median(arr, window):
 from registry_interpreter import RegistryInterpreter
 
 def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoResponse]:
-    request_cache: Dict[str, DeltaAnalysisState] = {}
+    request_cache: Dict[ClientId, DeltaAnalysisState] = {}
 
-    def on_query(eid: str, q: KataGoQuery) -> Optional[KataGoQuery]:
+    def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
         # Read `analysis_config` non-destructively (v1.0.21). The
         # authoritative line preventing it from reaching KataGo's stdin
         # is the central wire-strip in
@@ -126,7 +126,7 @@ def analysis_enricher(link: ProxyLink) -> Transformer[KataGoQuery, KataGoRespons
             request_cache[eid] = analyzer
         return q
 
-    def on_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+    def on_response(eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
         # 1. Attempt enrichment
         req_analyzer = request_cache.get(eid)
         # Tighten the gate from "moveInfos in opaque" (which was already

@@ -68,6 +68,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
+from AbstractProxy.proxy_core import CanonicalId, ClientId, InternalId
 from proxy_logging import Event, get_proxy_logger, lifecycle
 
 from katago import KataGoAction, KataGoQuery
@@ -252,7 +253,7 @@ class Subscriber:
         value before putting them on the queue.
     queue: the asyncio.Queue the client's send loop drains.
     """
-    subscriber_internal_id: str
+    subscriber_internal_id: InternalId
     queue: asyncio.Queue[WireDict]
 
 
@@ -263,7 +264,7 @@ class Subscriber:
 @dataclass
 class InFlightEntry:
     """State for one live backend query slot."""
-    canonical_id: str             # the id sent to the backend router
+    canonical_id: CanonicalId     # the id sent to the backend router
     content_hash: str             # for coalescing / logging
     cache_key: str                # FULL analysis-level key for replay cache
     subscribers: list[Subscriber] = field(default_factory=list)
@@ -287,16 +288,17 @@ class PubSubHub:
     def __init__(
         self,
         policy: CoalescingPolicy = DEFAULT_POLICY,
-        canonical_id_generator: Optional[Callable[[], str]] = None,
+        canonical_id_generator: Optional[Callable[[], CanonicalId]] = None,
         cache_store: Optional[CacheStore] = None,
     ) -> None:
         self._policy = policy
         self._gen = canonical_id_generator or _default_canonical_id
         self._cache_store = cache_store
-        # content_hash → InFlightEntry
+        # content_hash → InFlightEntry. The content_hash is a hex digest
+        # — NOT an identity in the namespace sense; stays `str`.
         self._by_hash: dict[str, InFlightEntry] = {}
         # canonical_id → InFlightEntry (same objects, indexed two ways)
-        self._by_canonical: dict[str, InFlightEntry] = {}
+        self._by_canonical: dict[CanonicalId, InFlightEntry] = {}
 
     # -----------------------------------------------------------------------
     # Internal cache helpers (future-proof for Redis / external stores)
@@ -416,11 +418,11 @@ class PubSubHub:
     def subscribe(
         self,
         query: KataGoQuery,
-        subscriber_internal_id: str,
+        subscriber_internal_id: InternalId,
         subscriber_queue: asyncio.Queue[WireDict],
         proxy_log: Optional[Any] = None,
-        orig_id: Optional[str] = None,
-    ) -> tuple[bool, str]:
+        orig_id: Optional[ClientId] = None,
+    ) -> tuple[bool, CanonicalId]:
         """Register a subscriber for this query.
 
         Returns (is_new_query, canonical_id).
@@ -504,7 +506,7 @@ class PubSubHub:
         if lookup_cache_flag and query.action == KataGoAction.ANALYZE:
             cached_record = self._get_record(cache_key)
             if cached_record is not None:
-                dummy_canonical_id = f"replay_{secrets.token_hex(8)}"
+                dummy_canonical_id = CanonicalId(f"replay_{secrets.token_hex(8)}")
                 if proxy_log is not None and orig_id is not None:
                     lifecycle.cache_hit(
                         proxy_log,
@@ -591,7 +593,9 @@ class PubSubHub:
     # Public: unsubscribe (on client disconnect before query completes)
     # -----------------------------------------------------------------------
 
-    def unsubscribe(self, subscriber_internal_id: str, canonical_id: str) -> bool:
+    def unsubscribe(
+        self, subscriber_internal_id: InternalId, canonical_id: CanonicalId,
+    ) -> bool:
         """Remove a subscriber from an in-flight slot.
 
         Returns True iff this call left the subscriber list empty — i.e., the
@@ -641,7 +645,7 @@ class PubSubHub:
     # Router callbacks (async, called from the router's read loop)
     # -----------------------------------------------------------------------
 
-    async def on_response(self, canonical_id: str, wire: WireDict) -> None:
+    async def on_response(self, canonical_id: CanonicalId, wire: WireDict) -> None:
         """Fan out a wire dict to all subscribers of this canonical_id.
 
         Each subscriber receives a copy with "id" replaced by their own
@@ -685,7 +689,7 @@ class PubSubHub:
             )
             await sub.queue.put(relabelled)
 
-    async def on_complete(self, canonical_id: str) -> None:
+    async def on_complete(self, canonical_id: CanonicalId) -> None:
         """Clean up the hub entry after all responses have been delivered.
 
         If the query was being recorded, the full response stream is now
@@ -732,6 +736,6 @@ class PubSubHub:
 # Canonical ID generator
 # ---------------------------------------------------------------------------
 
-def _default_canonical_id() -> str:
+def _default_canonical_id() -> CanonicalId:
     """Generate a short opaque canonical ID for hub-internal use."""
-    return f"hub_{secrets.token_hex(10)}"
+    return CanonicalId(f"hub_{secrets.token_hex(10)}")

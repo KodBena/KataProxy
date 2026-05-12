@@ -28,6 +28,7 @@ from typing import (
     Generic,
     Hashable,
     Iterable,
+    NewType,
     Optional,
     Protocol,
     Sequence,
@@ -56,6 +57,14 @@ __all__ = [
     "Envelope",
     "ProxyLink",
     "ProxyChain",
+    # Identity namespace NewTypes — Phase 2 of the migration described
+    # in proxy/docs/roadmap-identity-type-branding.md. See the
+    # "Identity namespace NewTypes" section below for the per-namespace
+    # contracts.
+    "ClientId",
+    "InternalId",
+    "CanonicalId",
+    "WireId",
 ]
 
 # ---------------------------------------------------------------------------
@@ -78,6 +87,98 @@ A = TypeVar("A")                   # abstract-level payload (e.g. KataGoQuery)
 # `I` shape — the U/D distinction is a property of crossing a
 # boundary, not of holding an identity. Phase 2 introduces NewType
 # brands at the `make_katago_link` instantiation site.
+
+
+# ---------------------------------------------------------------------------
+# Identity namespace NewTypes (Phase 2)
+# ---------------------------------------------------------------------------
+#
+# The four namespaces a proxy chain crosses, per
+# `proxy/ARCHITECTURE.md` § "ID namespaces and translation":
+#
+#   client_id  --[ProxyLink in ClientSession]-->  internal_id
+#   internal_id  --[PubSubHub coalescing]-->      canonical_id
+#   canonical_id  --[BackendRouter dispatch]-->   wire_id
+#
+# Pre-Phase-2, every namespace was a bare `str`. Functions that
+# accepted `wire_id` could be called with `client_id` and the
+# typechecker had nothing to say. The NewType brands below close
+# that gap: at typecheck time, mypy/pyright will refuse to confuse
+# them; at runtime they are identity-`str`, no overhead.
+#
+# These four namespaces are universal to any protocol proxy that uses
+# this framework. Protocol-specific concretions (the KataGo wire
+# fields, the per-protocol prisms) live elsewhere; the namespaces
+# don't.
+#
+# Construction sites: where a raw `str` is known to be a particular
+# namespace, the explicit `ClientId(raw)` cast records the assumption
+# at the type level. The `IdGenerator` Protocol's `__call__: U -> D`
+# signature lets framework callers thread the brand through the
+# `IdMapping.register` path without explicit constructors at every
+# site.
+
+ClientId = NewType("ClientId", str)
+"""Identity as the client wrote it on the wire.
+
+Lives in: incoming wire messages' `id` field (pre-translation);
+post-translation responses' relabelled `id` field; transformer and
+middleware `eid` parameters (the transformer chain runs at this
+namespace per `protocol_transformer.TransformedChain`'s composition
+of identity-translation + content-transformation).
+
+NewType origin sites:
+  - `proxy_server.ClientSession._handle_query`'s `orig_id` parameter
+    (the parsed wire `id` field).
+  - `OrchestrationContext.spawn`'s synthetic `__orch__<hex>`
+    sub-query ids (per the §7.2 design call: sub-query orig-ids are
+    `ClientId` values whose prefix discipline lives in runtime
+    convention, not the type system).
+"""
+
+
+InternalId = NewType("InternalId", str)
+"""Identity inside one client session, after ClientSession's
+ProxyLink translation.
+
+Lives in: the downstream side of `IdMapping[ClientId, InternalId]`
+in the per-session `ProxyLink`; the `subscriber_internal_id` keys in
+`pubsub_hub.PubSubHub`'s per-subscriber routing.
+
+NewType origin sites:
+  - `IdMapping.register`'s return when the link's downstream
+    namespace is InternalId (via the link's `IdGenerator`).
+"""
+
+
+CanonicalId = NewType("CanonicalId", str)
+"""Identity of a coalesced semantic-equivalence class inside
+`PubSubHub`.
+
+Lives in: `PubSubHub`'s `_canonicals` keys; the canonical_id passed
+to `BackendRouter.dispatch`; the `cid` field on structured-log
+records.
+
+Two queries with identical content (per `CoalescingPolicy.query_hash`)
+share one CanonicalId regardless of how many client sessions
+subscribed.
+"""
+
+
+WireId = NewType("WireId", str)
+"""Identity sent to (and received from) the actual backend engine.
+
+Lives in: `BackendRouter`-internal wire-id mappings (LEAF mints
+fresh ids per dispatch; RELAY/SELECTOR use upstream-supplied ids
+within their own per-upstream namespace).
+
+WireId is intentionally NOT parameterised per upstream
+(SELECTOR's labelled pool, RELAY's hash-ring pool) — per-upstream
+isolation is router-internal; the type represents
+"downstream-of-router id" and that suffices for consumer-facing
+typecheck. See `proxy/docs/roadmap-identity-type-branding.md`
+§7.3 for the design call.
+"""
 
 
 # ---------------------------------------------------------------------------

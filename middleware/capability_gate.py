@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from AbstractProxy.proxy_core import ClientId
 from katago import KataGoQuery, KataGoResponse
 from middleware.session_middleware import (
     ResponseStream,
@@ -77,7 +78,7 @@ class CapabilityGatedMiddleware(SessionMiddleware):
         self._wrapped = wrapped
         # orig_id → per-query metadata for this capability (or empty
         # dict for legacy auto-engage / opt-in-with-defaults).
-        self._engaged: Dict[str, dict] = {}
+        self._engaged: Dict[ClientId, dict] = {}
         # Structured-logging adapter; refined in on_session_start
         # to bind the session-scoped context.
         self._log: Any = get_proxy_logger("kataproxy.middleware.capability_gate")
@@ -99,7 +100,7 @@ class CapabilityGatedMiddleware(SessionMiddleware):
     # Query side: record engagement, conditionally delegate
     # ------------------------------------------------------------------
 
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
+    def on_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         opaque_caps = query.opaque.get("capabilities")
         if opaque_caps is None:
             # Legacy auto-engage.
@@ -144,7 +145,7 @@ class CapabilityGatedMiddleware(SessionMiddleware):
 
     async def handle_response(
         self,
-        orig_id: str,
+        orig_id: ClientId,
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:

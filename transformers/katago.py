@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from AbstractProxy.protocol_transformer import Transformer
+from AbstractProxy.proxy_core import ClientId
 from katago import (
     AnalyzeResponse,
     KataGoQuery,
@@ -33,7 +34,7 @@ from katago import (
 def min_visits_filter(threshold: int) -> Transformer[KataGoQuery, KataGoResponse]:
     """Drop moveInfos entries with fewer than `threshold` visits."""
 
-    def filter_response(_eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+    def filter_response(_eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
         # moveInfos is analyze-only by structural protocol; metadata
         # responses carry no moveInfos and pass through unchanged.
         if isinstance(r, AnalyzeResponse) and "moveInfos" in r.opaque:
@@ -66,7 +67,7 @@ def add_score_delta() -> Transformer[KataGoQuery, KataGoResponse]:
     """
     scores: dict[str, float] = {}  # eid → last known scoreLead
 
-    def enrich_response(eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+    def enrich_response(eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
         # rootInfo is analyze-only by structural protocol; metadata
         # responses carry no rootInfo and pass through unchanged.
         if not isinstance(r, AnalyzeResponse):
@@ -102,7 +103,7 @@ def final_only() -> Transformer[KataGoQuery, KataGoResponse]:
     query_models, terminate ack) are inherently single-shot finals
     and pass through unchanged.
     """
-    def filter_response(_eid: str, r: KataGoResponse) -> Optional[KataGoResponse]:
+    def filter_response(_eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
         if isinstance(r, MetadataResponse):
             return r
         return None if r.is_during_search else r
@@ -124,7 +125,7 @@ def inject_defaults(**defaults: Any) -> Transformer[KataGoQuery, KataGoResponse]
     Useful for enforcing analysis parameters (e.g., maxVisits, komi)
     without requiring the client to specify them.
     """
-    def augment_query(_eid: str, q: KataGoQuery) -> KataGoQuery:
+    def augment_query(_eid: ClientId, q: KataGoQuery) -> KataGoQuery:
         merged = {**defaults, **q.opaque}  # client's values win
         return KataGoQuery(
             action=q.action,

@@ -37,6 +37,7 @@ import uuid
 from typing import Any, AsyncIterator, Callable, Optional
 
 import sproxy_config as cfg
+from AbstractProxy.proxy_core import ClientId
 from katago import (
     AnalyzeResponse,
     KataGoAction,
@@ -127,7 +128,7 @@ class OrchestrationContext:
     def __init__(
         self,
         *,
-        parent_id: str,
+        parent_id: ClientId,
         parent_query: KataGoQuery,
         session_capabilities: SessionCapabilities,
         middleware: "OrchestrationMiddleware",
@@ -224,7 +225,7 @@ class OrchestrationContext:
         Cancellation of the orchestration coroutine cancels all
         outstanding sub-queries via session_capabilities.terminate_query.
         """
-        sub_orig_id = f"__orch__{uuid.uuid4().hex[:12]}"
+        sub_orig_id: ClientId = ClientId(f"__orch__{uuid.uuid4().hex[:12]}")
         record = _SubQueryRecord(
             expected_finals=self._compute_expected_finals(query),
         )
@@ -356,7 +357,7 @@ class OrchestrationContext:
             await self._original_queue.put(_SENTINEL)
 
     async def _push_sub_response(
-        self, sub_orig_id: str, response: KataGoResponse
+        self, sub_orig_id: ClientId, response: KataGoResponse
     ) -> None:
         """Route a sub-query response to its spawn iterator."""
         record = self._sub_queries.get(sub_orig_id)
@@ -405,11 +406,11 @@ class OrchestrationMiddleware(SessionMiddleware):
         self.name = name  # exposed for chain-debug logs and the chain guard
         self._caps: Optional[SessionCapabilities] = None
         # parent_id → context
-        self._contexts: dict[str, OrchestrationContext] = {}
+        self._contexts: dict[ClientId, OrchestrationContext] = {}
         # parent_id → coroutine driver task
-        self._tasks: dict[str, asyncio.Task] = {}
+        self._tasks: dict[ClientId, asyncio.Task] = {}
         # sub_orig_id → parent_id  (for response routing)
-        self._sub_to_parent: dict[str, str] = {}
+        self._sub_to_parent: dict[ClientId, ClientId] = {}
         # Structured-logging adapter; refined in on_session_start.
         self._log: Any = get_proxy_logger("kataproxy.middleware.orchestration")
 
@@ -434,7 +435,7 @@ class OrchestrationMiddleware(SessionMiddleware):
         self._tasks.clear()
         self._sub_to_parent.clear()
 
-    def on_query(self, orig_id: str, query: KataGoQuery) -> None:
+    def on_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         """Spawn an orchestration coroutine for this parent query.
 
         Sub-queries (submitted via SessionCapabilities.submit_query
@@ -481,7 +482,7 @@ class OrchestrationMiddleware(SessionMiddleware):
 
     async def _drive_coroutine(
         self,
-        parent_id: str,
+        parent_id: ClientId,
         ctx: OrchestrationContext,
         coro: AsyncIterator[KataGoResponse],
     ) -> None:
@@ -555,7 +556,7 @@ class OrchestrationMiddleware(SessionMiddleware):
 
     async def handle_response(
         self,
-        orig_id: str,
+        orig_id: ClientId,
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:
@@ -618,10 +619,10 @@ class OrchestrationMiddleware(SessionMiddleware):
 
     # ---------------- Framework-internal hooks for OrchestrationContext ----
 
-    def _register_sub_query(self, sub_orig_id: str, parent_id: str) -> None:
+    def _register_sub_query(self, sub_orig_id: ClientId, parent_id: ClientId) -> None:
         self._sub_to_parent[sub_orig_id] = parent_id
 
-    def _unregister_sub_query(self, sub_orig_id: str) -> None:
+    def _unregister_sub_query(self, sub_orig_id: ClientId) -> None:
         self._sub_to_parent.pop(sub_orig_id, None)
 
 
