@@ -280,12 +280,21 @@ def register_query_completion(
 
 def make_katago_link(
     tracker: Optional[CompletionTracker[str, int]] = None,
-) -> ProxyLink[str]:
-    """Assemble a complete KataGo proxy link from reusable components."""
+) -> ProxyLink[str, str]:
+    """Assemble a complete KataGo proxy link from reusable components.
+
+    The `ProxyLink[str, str]` annotation reflects Phase 1 of the
+    identity-type-branding migration (see
+    `proxy/docs/roadmap-identity-type-branding.md`): the framework's
+    ProxyLink is now parameterised on (upstream, downstream) namespace
+    types, but Phase 2 has yet to introduce the NewType brands that
+    would replace `str` here with `ClientId` and `InternalId`
+    respectively. The runtime shape is unchanged from pre-Phase-1.
+    """
     if tracker is None:
         tracker = CompletionTracker[str, int]()
 
-    mapping: IdMapping[str] = IdMapping(generator=katago_id_generator)
+    mapping: IdMapping[str, str] = IdMapping(generator=katago_id_generator)
 
     return ProxyLink(
         mapping=mapping,
