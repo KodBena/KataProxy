@@ -462,81 +462,91 @@ The right test discipline is:
 
 ---
 
-## 7. Open questions
+## 7. Design calls (Phase 1 review)
 
-### 7.1 Where do the NewTypes live?
+The §7.1–§7.4 questions in the original memo were left for
+the Phase 1 design review. Calls made at the start of Phase 1
+implementation, recorded here in-place per the umbrella's
+ADR-0005 Rule 8. **None of these is written in stone** — if
+implementation retrospection or future evolution surfaces a
+better shape, the memo gets re-marked `design-note: revised`
+and the call updated. The proxy's type sanity and code-hygiene
+posture is the load-bearing motivation; specific decisions
+serve that motivation rather than constraining future
+adjustments.
 
-Two candidates:
+### 7.1 NewTypes live in `AbstractProxy/proxy_core.py`
 
-- `AbstractProxy/proxy_core.py` — framework-level. Argument
-  for: the four namespace names are framework concepts; they
-  exist independently of the KataGo protocol. Argument
-  against: NewTypes are protocol-specific concretions; the
-  framework is protocol-agnostic.
-- `katago/katago_proxy.py` — protocol-level. Argument for:
-  matches the existing pattern (the KataGo concrete layer
-  instantiates the framework's TypeVars). Argument against:
-  the four namespace names are universal across whatever
-  protocol; defining them here makes a second-protocol port
-  redefine them.
+**Call:** the four namespace `NewType` declarations
+(`ClientId`, `InternalId`, `CanonicalId`, `WireId`) will live
+in `AbstractProxy/proxy_core.py` alongside the framework's
+generic types they instantiate. Defined in Phase 2; this call
+records the placement decision now so Phase 1's type-variable
+naming aligns with it.
 
-**Lean:** framework-level for the namespace *names* (e.g.,
-`ClientId` is a universal concept), but the concrete `NewType`
-instantiations could live in protocol-specific modules with
-the framework declaring `ClientId` as a generic placeholder via
-`TypeAlias` or `Protocol`. This nuance worth confirming during
-the Phase 1 design review.
+**Rationale:** every protocol proxy that uses this framework
+has these four namespaces — they're framework concepts, not
+KataGo-specific concretions. A second-protocol implementation
+(if one ever materialises) inherits the namespace vocabulary
+unchanged; only the base type underneath the NewTypes might
+need adjusting if a future protocol used `int` or `bytes` ids
+instead of `str`. Protocol-specific concretions (the KataGo
+wire types, the per-protocol prisms) stay in `katago/`; the
+ID namespaces don't.
 
-### 7.2 Does `OrigId` deserve its own NewType?
+### 7.2 `OrigId` unifies with `ClientId`
 
-`orig_id` at the transformer layer is logically the same as
-`client_id` at the wire-receive point. The framework's
-ProxyLink boundary translates `ClientId → InternalId` on the
-downstream side. Transformers run BEFORE this translation for
-queries (per `TransformedChain.translate_downstream` in
-`AbstractProxy/protocol_transformer.py`), so transformer-layer
-`eid` is `ClientId`-shaped.
+**Call:** the `eid` parameter at the transformer / middleware
+layer will be typed `ClientId` in Phase 2. No separate
+`OrigId` NewType. Sub-query synthetic ids (`__orch__<hex>`
+prefix) are `ClientId` values whose prefix discipline lives
+in runtime convention, not the type system.
 
-But: the `OrchestrationMiddleware._sub_to_parent` dict maps
-sub-query orig-ids (synthetic `__orch__<hex>`) to parent
-orig-ids (client-supplied). Both are in the orig namespace,
-but the sub-queries are framework-minted, not client-supplied.
+**Rationale:** `orig_id` at the transformer layer is logically
+a client-namespace identity. The translation from
+client → internal happens at `ProxyLink.translate_downstream`,
+which runs AFTER the transformer chain on the query side and
+BEFORE it on the response side. The orchestration framework's
+sub-query ids are minted in the same namespace because they
+need to be addressable by downstream relabelling logic that's
+client-namespace-aware. NewType composition for sub-namespacing
+(e.g., `SubOrigId` as a sub-type of `OrigId`) is Python-awkward;
+the `__orch__` prefix runtime check at
+`OrchestrationMiddleware._sub_to_parent`'s consumers is the
+right surface for the discipline.
 
-**Option A:** `orig_id: ClientId`. Sub-query synthetic ids are
-just `ClientId` values that happen to have a prefix. Type
-system doesn't enforce the prefix; runtime convention does.
+### 7.3 `WireId` is not parameterised per upstream
 
-**Option B:** `OrigId = NewType('OrigId', str)` with `ClientId`
-as a sub-namespace and `SubOrigId` as another (both unifiable
-to `OrigId`). Type system distinguishes; harder to model in
-Python (NewType doesn't compose nicely).
+**Call:** `WireId` will be a single NewType. Multi-upstream
+routers (RELAY's hash-ring pool, SELECTOR's labelled pool)
+partition their WireIds internally by upstream identity but
+don't expose the partition in the type system.
 
-**Lean:** Option A. The prefix discipline lives in runtime
-checks (the `__orch__` prefix is already a convention; no need
-to hoist it into the type system). Phase 2 confirms.
+**Rationale:** per-upstream isolation is a router-internal
+concern. Consumers of the router (the Hub, the response-
+delivery path) see one canonical → wire boundary; the WireId
+type represents "this is a downstream-of-router id" and that
+suffices. Hoisting per-upstream distinction into the type
+system would expose router-internal partitioning in a way
+that forces every consumer to be aware of routing topology
+— exactly the abstraction leak the framework's three-layer
+model is shaped to prevent.
 
-### 7.3 What about `wire_id` per upstream connection?
+### 7.4 Standard submodule release arc
 
-Multi-upstream routers (RELAY, SELECTOR) maintain separate
-WireId namespaces per upstream LEAF. The framework's current
-shape has each router holding its own IdMapping(s). Should
-WireId be parameterised by upstream identity (e.g.,
-`WireId[upstream_label]`)? The router's existing API doesn't
-expose the per-upstream distinction; the discipline lives in
-the router's internal partitioning.
+**Call:** each phase ships as a proxy-side PR + (optional)
+tag + umbrella pointer bump per `proxy/CLAUDE.md`'s
+"Submodule release arc" section and the umbrella's `CLAUDE.md`
+"On the proxy submodule" section. No deviations anticipated.
 
-**Lean:** Don't parameterise WireId by upstream. The
-per-upstream isolation is a router-internal concern; the
-NewType represents "this is a downstream-of-router id" and
-that's enough for the consumer-facing typecheck.
-
-### 7.4 Phase 2's submodule release arc
-
-Phase 2 ships as a proxy-side PR + tag + umbrella pointer
-bump, per the standard arc documented in
-`proxy/CLAUDE.md`'s "Submodule release arc" section and the
-umbrella's `CLAUDE.md` "On the proxy submodule" section. No
-deviations from the standard pattern anticipated.
+The "optional tag" qualification: Phase 1 is type-only and
+preserves runtime behaviour. The umbrella's pointer can bump
+to the post-merge commit directly without a v1.0.X tag if
+operationally simpler. Tags become useful for Phase 2 and
+Phase 3 where consumer-facing changes (the new NewType
+exports, the typecheck CI gate) become things downstream
+packagers and the umbrella's frontend test harness might
+want to pin against.
 
 ---
 

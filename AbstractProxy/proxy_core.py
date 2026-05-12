@@ -32,6 +32,7 @@ from typing import (
     Protocol,
     Sequence,
     TypeVar,
+    cast,
 )
 
 import logging
@@ -61,10 +62,22 @@ __all__ = [
 # Type variables
 # ---------------------------------------------------------------------------
 
-I = TypeVar("I", bound=Hashable)  # identity representation
+I = TypeVar("I", bound=Hashable)  # identity representation (single namespace)
+U = TypeVar("U", bound=Hashable)  # upstream identity at a link boundary
+D = TypeVar("D", bound=Hashable)  # downstream identity at a link boundary
 P = TypeVar("P")                   # payload
 T = TypeVar("T", bound=Hashable)  # sub-task discriminator (e.g. turn number)
 A = TypeVar("A")                   # abstract-level payload (e.g. KataGoQuery)
+
+# Phase 1 of the identity-type branding migration (see
+# `proxy/docs/roadmap-identity-type-branding.md`) introduces `U` and
+# `D` as the upstream/downstream type variables at the link boundary,
+# where the framework's identity-flow asymmetry lives. Classes that
+# operate at one namespace at a time (CompletionTracker, IdPolicy,
+# ReferentialField, Envelope, ProxyChain) retain the single-parameter
+# `I` shape — the U/D distinction is a property of crossing a
+# boundary, not of holding an identity. Phase 2 introduces NewType
+# brands at the `make_katago_link` instantiation site.
 
 
 # ---------------------------------------------------------------------------
@@ -151,10 +164,17 @@ class ReferentialField(Generic[P, I]):
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class Translation(Generic[I]):
-    """A recorded pair: one upstream ID ↔ one downstream ID."""
-    upstream: I
-    downstream: I
+class Translation(Generic[U, D]):
+    """A recorded pair: one upstream ID ↔ one downstream ID.
+
+    Phase 1 of the identity-type-branding migration parameterises this
+    dataclass on (U, D) to carry the namespace asymmetry that the
+    underlying IdMapping records. Pre-branding instantiations
+    (`Translation[str, str]`) preserve runtime behaviour; Phase 2 will
+    surface the asymmetry as `Translation[ClientId, InternalId]` etc.
+    """
+    upstream: U
+    downstream: D
 
 
 # ---------------------------------------------------------------------------
@@ -174,38 +194,49 @@ class TranslationError(Exception):
 # IdGenerator — pluggable ID minting strategy
 # ---------------------------------------------------------------------------
 
-class IdGenerator(Protocol[I]):
-    """Strategy for generating downstream IDs.
+class IdGenerator(Protocol[U, D]):
+    """Strategy for generating downstream IDs from upstream IDs.
 
     Swapping this is how you get:
       - opaque UUIDs (isolation)
       - prefixed IDs (debuggability)
       - deterministic IDs (reproducibility in tests)
+
+    The two-parameter shape (U: upstream, D: downstream) is the
+    identity-type-branding split introduced in Phase 1. Concrete
+    instantiations may unify U and D (`IdGenerator[str, str]` for the
+    pre-branding KataGo wire form); the branding makes the
+    upstream-vs-downstream asymmetry typecheck-visible.
     """
-    def __call__(self, upstream_id: I) -> I: ...
+    def __call__(self, upstream_id: U) -> D: ...
 
 
 # ---------------------------------------------------------------------------
 # IdMapping
 # ---------------------------------------------------------------------------
 
-class IdMapping(Generic[I]):
-    """Thread-safe bidirectional identity map.
+class IdMapping(Generic[U, D]):
+    """Thread-safe bidirectional identity map between two namespaces.
 
     This is the *state* of a proxy link: two dicts protected by one lock.
 
     The `generator` parameter decouples ID-minting policy from storage,
     enabling load-balancing (tagged IDs) and fanout (prefixed IDs)
     without touching this class.
+
+    Phase 1 of the identity-type-branding migration parameterises this
+    class on (upstream, downstream) rather than a single identity type,
+    so that `register(client_id) -> internal_id` becomes a typecheck-
+    enforceable contract once Phase 2 introduces NewType brands.
     """
 
-    def __init__(self, generator: IdGenerator[I]) -> None:
+    def __init__(self, generator: IdGenerator[U, D]) -> None:
         self._gen = generator
-        self._fwd: dict[I, I] = {}   # upstream → downstream
-        self._rev: dict[I, I] = {}   # downstream → upstream
+        self._fwd: dict[U, D] = {}   # upstream → downstream
+        self._rev: dict[D, U] = {}   # downstream → upstream
         self._lock = threading.Lock()
 
-    def register(self, upstream_id: I) -> I:
+    def register(self, upstream_id: U) -> D:
         """Register an upstream ID, returning the (possibly cached) downstream ID."""
         with self._lock:
             if upstream_id in self._fwd:
@@ -215,17 +246,17 @@ class IdMapping(Generic[I]):
             self._rev[downstream_id] = upstream_id
             return downstream_id
 
-    def forward(self, upstream_id: I) -> Optional[I]:
+    def forward(self, upstream_id: U) -> Optional[D]:
         """Upstream → downstream lookup."""
         with self._lock:
             return self._fwd.get(upstream_id)
 
-    def reverse(self, downstream_id: I) -> Optional[I]:
+    def reverse(self, downstream_id: D) -> Optional[U]:
         """Downstream → upstream lookup."""
         with self._lock:
             return self._rev.get(downstream_id)
 
-    def remove_by_upstream(self, upstream_id: I) -> Optional[Translation[I]]:
+    def remove_by_upstream(self, upstream_id: U) -> Optional[Translation[U, D]]:
         with self._lock:
             downstream_id = self._fwd.pop(upstream_id, None)
             if downstream_id is None:
@@ -233,7 +264,7 @@ class IdMapping(Generic[I]):
             self._rev.pop(downstream_id, None)
             return Translation(upstream_id, downstream_id)
 
-    def remove_by_downstream(self, downstream_id: I) -> Optional[Translation[I]]:
+    def remove_by_downstream(self, downstream_id: D) -> Optional[Translation[U, D]]:
         with self._lock:
             upstream_id = self._rev.pop(downstream_id, None)
             if upstream_id is None:
@@ -241,7 +272,7 @@ class IdMapping(Generic[I]):
             self._fwd.pop(upstream_id, None)
             return Translation(upstream_id, downstream_id)
 
-    def snapshot(self) -> list[Translation[I]]:
+    def snapshot(self) -> list[Translation[U, D]]:
         with self._lock:
             return [Translation(u, d) for u, d in self._fwd.items()]
 
@@ -411,44 +442,72 @@ class Envelope(Generic[I, P]):
 # ProxyLink
 # ---------------------------------------------------------------------------
 
-class ProxyLink(Generic[I]):
+class ProxyLink(Generic[U, D]):
     """One translation boundary: mapping + query policy + response policy.
 
     A link knows nothing about chains, other links, or its position.
-    It translates messages crossing *one* namespace boundary.
+    It translates messages crossing *one* namespace boundary, from the
+    upstream namespace `U` to the downstream namespace `D` on queries
+    and back on responses.
+
+    Phase 1 of the identity-type-branding migration parameterises this
+    class on (U, D). The `query_policy` and `response_policy` types
+    retain the single-parameter `IdPolicy[P, I]` shape — the per-policy
+    `I` is the namespace that policy's referential fields lens into
+    (U-namespace for query payloads pre-translation, D-namespace for
+    response payloads pre-translation). The internal call to
+    `translate_referentials` bridges the two via `cast(...)` because
+    the function's signature uses a single-I shape that cannot encode
+    the U→D asymmetry of `mapping.forward` (or D→U of `mapping.reverse`)
+    at the Python type-system level without restructuring the
+    field/policy machinery, which is out of Phase 1's scope.
     """
 
     def __init__(
         self,
-        mapping: IdMapping[I],
-        query_policy: IdPolicy[Any, I],
-        response_policy: IdPolicy[Any, I],
+        mapping: IdMapping[U, D],
+        query_policy: IdPolicy[Any, U],
+        response_policy: IdPolicy[Any, D],
     ) -> None:
         self.mapping = mapping
         self.query_policy = query_policy
         self.response_policy = response_policy
 
-    def translate_downstream(self, envelope: Envelope[I, Any]) -> Envelope[I, Any]:
+    def translate_downstream(self, envelope: Envelope[U, Any]) -> Envelope[D, Any]:
         """Translate a query flowing toward the engine."""
         policy = self.query_policy
-        downstream_id = self.mapping.register(envelope.id)
+        downstream_id: D = self.mapping.register(envelope.id)
+        # mapping.forward has signature U -> Optional[D]; the lookup
+        # parameter of translate_referentials is typed as
+        # Callable[[I], Optional[I]] for a single I. The runtime call
+        # is correct (U comes in via the field's `get`, D goes out via
+        # `set`), but the type system can't see the asymmetry through
+        # the function's shape. The cast() makes the boundary explicit;
+        # Phase 2/3 may revisit the field-and-policy machinery to remove
+        # it (per ADR-0002 Rule 2's cast-with-justification discipline).
+        lookup = cast(Callable[[Any], Optional[Any]], self.mapping.forward)
         translated_payload = translate_referentials(
             policy.referential_fields,
-            self.mapping.forward,
+            lookup,
             envelope.payload,
         )
         return Envelope(id=downstream_id, payload=translated_payload)
 
-    def translate_upstream(self, envelope: Envelope[I, Any]) -> Envelope[I, Any]:
+    def translate_upstream(self, envelope: Envelope[D, Any]) -> Envelope[U, Any]:
         """Translate a response flowing toward the client."""
         policy = self.response_policy
         upstream_id = self.mapping.reverse(envelope.id)
         if upstream_id is None:
             raise TranslationError("unknown_downstream_id", envelope.id)
 
+        # Same justified cast as translate_downstream — mapping.reverse
+        # is D -> Optional[U], translate_referentials expects single-I
+        # lookup. See translate_downstream's comment for the Phase 2/3
+        # disposition.
+        lookup = cast(Callable[[Any], Optional[Any]], self.mapping.reverse)
         translated_payload = translate_referentials(
             policy.referential_fields,
-            lambda did: self.mapping.reverse(did),
+            lookup,
             envelope.payload,
         )
 
@@ -463,18 +522,29 @@ class ProxyLink(Generic[I]):
 # ---------------------------------------------------------------------------
 
 class ProxyChain(Generic[I]):
-    """A flat, ordered sequence of proxy links.
+    """A flat, ordered sequence of proxy links, all in one namespace.
 
     Downstream: fold left  (link[0] → link[1] → … → link[n]).
     Upstream:   fold right (link[n] → link[n-1] → … → link[0]).
 
     No recursion. No nesting. Each link is independent.
+
+    Phase 1 of the identity-type-branding migration keeps `ProxyChain`
+    homogeneous (`ProxyChain[I]`) rather than splitting it. A chain
+    of links with heterogeneous namespaces — `link[0]: I0 → I1`,
+    `link[1]: I1 → I2`, … — would require a variadic-typed Python
+    generic that the language doesn't ergonomically support. The
+    homogeneous shape is what `make_katago_chain` constructs today
+    (`ProxyChain[str]` with `depth=1` default — effectively one link);
+    a future Phase that genuinely composes multiple links of distinct
+    namespaces would need to revisit this. Single-link instantiation
+    via `ProxyLink[U, D]` directly is the typecheck-meaningful path.
     """
 
-    def __init__(self, links: Sequence[ProxyLink[I]]) -> None:
+    def __init__(self, links: Sequence[ProxyLink[I, I]]) -> None:
         if not links:
             raise ValueError("ProxyChain requires at least one link")
-        self._links: list[ProxyLink[I]] = list(links)
+        self._links: list[ProxyLink[I, I]] = list(links)
 
     def translate_downstream(self, envelope: Envelope[I, Any]) -> Envelope[I, Any]:
         for link in self._links:
