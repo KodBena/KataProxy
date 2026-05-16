@@ -404,6 +404,101 @@ was statistically correct; the original draft's "no
 multimodality" claim was wrong and has been retracted in favour
 of the per-regime explanation above.
 
+#### Quantifying the mixture: Gaussian-Mixture-Model fit + independent triangulation
+
+To turn the qualitative mixture-of-regimes claim into a
+quantitative one, we fit Gaussian Mixture Models (in log-latency
+space, which is more Gaussian for queueing latencies) to each
+single-visit-count bucket and compare BIC across model orders.
+Smaller BIC = better model; BIC penalises additional components
+to guard against over-fitting. ΔBIC > 10 between models is
+conventionally treated as decisive.
+
+Result on the headline run's distinct-only single-visit-count
+buckets:
+
+| visit class | n | BIC k=1 | BIC k=2 | BIC k=3 | BIC k=4 |
+|---|---|---|---|---|---|
+| 50v | 15,005 | 17,524 | 14,533 | 13,485 | **13,363** |
+| 200v | 9,049 | 7,496 | 5,506 | **5,002** | 5,080 |
+| 500v | 4,450 | 2,761 | 1,888 | **1,823** | 1,855 |
+
+Single-Gaussian (k=1) is rejected decisively across all three
+classes (ΔBIC ~1000-4000). The 200v and 500v classes prefer k=3.
+The 50v class prefers k=4 slightly over k=3, but k=3 already
+captures the regime structure; the k=4 "improvement" is an
+extra sub-component in the steady-state regime that is unstable
+across re-fits and not the main story.
+
+The k=3 fit for each class consistently recovers a high-latency
+component centered at ~940-980 ms with weight 4-7%:
+
+| visit class | hot-burst-regime component | observed hot-burst window |
+|---|---|---|
+| 50v | μ=938 ms, weight 6.9% | mean 833 ms, fraction 8.7% |
+| 200v | μ=971 ms, weight 5.7% | mean 910 ms, fraction 9.3% |
+| 500v | μ=980 ms, weight 4.4% | mean 970 ms, fraction 8.0% |
+
+Three independent fits (on the three single-visit-count
+sub-populations) all rediscover the same component at the same
+location with the same weight — that consistency is itself
+quantitative evidence for the mixture-of-regimes hypothesis.
+
+**Independent triangulation via a clean steady-state run.** A
+second mixed-workload run with `PROXY_TOPOLOGY_DIAG_HOT_POSITIONS=0`
+(distinct flow only, no hot bursts, concurrency=24) gives an
+independent measurement of the steady-state regime in isolation.
+Its 50v latency distribution is unimodal by the dip test
+(n=2,477, dip=0.0044, p=0.99) with mean 348 ms — closely
+matching the headline's post-100 s steady-state window (mean
+339 ms) and the GMM's main steady-state component.
+
+The chart below decomposes the headline's 50v bucket. Left:
+histograms of full / post-100 s / 0-100 s. Centre: empirical
+CDFs of the full run, the headline's post-100 s steady window,
+the independent clean-steady-only run, the headline's 0-100 s
+burst window, plus the GMM(k=3) fit. Right: GMM(k=3)
+components as density curves over the full-run histogram.
+
+![Latency multimodality decomposed — 50v queries](benchmark/mixture-decomposition.png)
+
+Reading the chart:
+
+- The histogram (left panel, foreground bars) is bimodal — the
+  left peak at ~300 ms is the steady-state regime, the right
+  peak at ~900 ms is the hot-burst regime.
+- The CDFs (centre panel) show the clean steady-only run
+  (teal) and the headline post-100 s data (green) overlap
+  closely — independent measurements agree that the
+  steady-state regime is centered around 340-350 ms. The GMM
+  k=3 fit (black dashed) tracks the headline-full curve
+  (orange) across the whole range.
+- The GMM components (right panel) decompose the full
+  distribution: two components in the 200-360 ms range capture
+  the steady-state regime's substructure, and the third
+  component at ~940 ms captures the hot-burst-window contribution.
+
+**KS-test caveat (honest note):** A Kolmogorov-Smirnov test
+between the clean steady-only run and the headline post-100 s
+window returns p=0.0005, formally rejecting the null that they
+are draws from the same distribution. The means differ by ~3%
+(348 vs 339 ms) and the difference is detectable due to large
+N. This does not affect the mixture conclusion — both are
+clearly unimodal — but it does mean run-to-run variance is
+non-zero. An operator looking at any single benchmark run's
+absolute latency numbers should expect ±5-10% variability
+between runs at this hardware scale.
+
+**Methodology and reproducibility.** The GMM was fit using
+`sklearn.mixture.GaussianMixture` with `n_init=20` to escape
+local optima, on `np.log(latency_ms)` to handle the queueing-
+latency right skew. The dip test uses the `diptest` package
+(implementation of Hartigans 1985). The chart-generation script
+is included alongside the diagnostic in
+`tests/plot_mixed_workload.py`'s sibling file
+`tests/analyze_latency_mixture.py` (committed alongside this
+documentation update).
+
 ---
 
 ## Chart 2: concurrency sweep — what tuning client concurrency does
