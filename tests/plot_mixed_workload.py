@@ -83,15 +83,24 @@ def _color_for(idx: int) -> Any:
 
 
 def _load(run_dir: Path) -> Dict[str, Any]:
+    """Load summary.json from a run dir.
+
+    Checks for `summary.json` first (the diagnostic's default output);
+    falls back to `summary.json.gz` (the committed benchmark/data/
+    archives use gzipped form to keep the repo small). Either is
+    consumed transparently.
+    """
     p = run_dir / "summary.json"
-    if not p.exists():
-        raise FileNotFoundError(
-            f"{p} not found; did the diagnostic write it?"
-        )
-    # json.loads is typed as Any; cast preserves the structural
-    # contract this function advertises (the diagnostic always
-    # writes a top-level dict).
-    return cast(Dict[str, Any], json.loads(p.read_text()))
+    if p.exists():
+        return cast(Dict[str, Any], json.loads(p.read_text()))
+    pgz = run_dir / "summary.json.gz"
+    if pgz.exists():
+        import gzip
+        with gzip.open(pgz, "rt") as f:
+            return cast(Dict[str, Any], json.load(f))
+    raise FileNotFoundError(
+        f"neither {p} nor {pgz} found; did the diagnostic write it?"
+    )
 
 
 def _parse_ts(s: str) -> datetime:

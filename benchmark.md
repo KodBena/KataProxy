@@ -797,15 +797,54 @@ What follow-up tests would extend confidence:
 
 ## Reproducing the benchmark
 
-All measurements were produced by code in this repository,
-running against the operator's KataGo cluster.
+### Re-render the published charts from the committed raw data
+
+The 16 per-run `summary.json` files behind every chart in this
+document are committed under [`benchmark/data/`](benchmark/data/),
+gzipped to keep the repository compact (~10 MB total across 16
+runs). The plot and analysis scripts auto-detect `summary.json.gz`
+transparently — no extraction step is needed.
 
 ```bash
-# Install dev extras (the diagnostic + plot script need them)
 pip install -e .[dev]
-pip install matplotlib seaborn  # for the plot script
+pip install matplotlib seaborn diptest scikit-learn
 
-# Single-shot headline run (≈ 9 min wall, 8M visits)
+# Re-render headline + concurrency sweep + max_load sweep from
+# committed data
+python -m tests.plot_mixed_workload \
+    --headline       benchmark/data/headline \
+    --sweep          benchmark/data/sweep-c1 benchmark/data/sweep-c2 \
+                     benchmark/data/sweep-c4 benchmark/data/sweep-c8 \
+                     benchmark/data/sweep-c16 benchmark/data/sweep-c32 \
+                     benchmark/data/sweep-c64 benchmark/data/sweep-c128 \
+    --maxload-sweep  benchmark/data/maxload-m1 benchmark/data/maxload-m2 \
+                     benchmark/data/maxload-m4 benchmark/data/maxload-m8 \
+                     benchmark/data/maxload-m16 benchmark/data/maxload-m32 \
+    --output-dir /tmp/regenerated-charts
+
+# Re-run the mixture-decomposition analysis (Hartigans' dip test
+# + GMM per visit-class + triangulation against the clean
+# steady-only run) and re-render the mixture chart
+python -m tests.analyze_latency_mixture \
+    --run         benchmark/data/headline \
+    --steady-only benchmark/data/steady-only \
+    --visit-class 50 \
+    --chart       /tmp/regenerated-charts/mixture-decomposition.png
+```
+
+Operators inspecting the JSON directly can `gunzip -k
+benchmark/data/headline/summary.json.gz` (or use `zcat`) — each
+file contains the run's full per-query records and the extracted
+proxy structured-event records, exactly what the chart pipeline
+consumes.
+
+### Run new measurements against your own cluster
+
+The same scripts work against fresh data captured from your own
+KataGo cluster:
+
+```bash
+# Headline-shaped run (≈ 9 min wall on a 3-LEAF cluster, 8 M visits)
 PROXY_TOPOLOGY_DIAG_LOG_DIR=/tmp/headline \
 PROXY_TOPOLOGY_DIAG_UPSTREAMS=ws://your-leaf-1,ws://your-leaf-2,ws://your-leaf-3 \
 PROXY_TOPOLOGY_DIAG_HOT_POSITIONS=100 \
@@ -816,22 +855,21 @@ PROXY_TOPOLOGY_DIAG_MAX_LOAD=2 \
 PROXY_TOPOLOGY_DIAG_VISIT_PRESET=balanced \
 python -m tests.diagnose_relay_mixed_workload_e2e
 
-# Render the headline chart
 python -m tests.plot_mixed_workload \
     --headline /tmp/headline \
-    --output-dir /tmp/charts
+    --output-dir /tmp/your-charts
 ```
 
 For the concurrency sweep, run the diagnostic eight times with
 `PROXY_TOPOLOGY_DIAG_CONCURRENCY` set to 1, 2, 4, 8, 16, 32, 64,
 128 (and `PROXY_TOPOLOGY_DIAG_HOT_POSITIONS=0` to skip the hot
 phase; each run writes its own JSON to its own `LOG_DIR`). Then
-pass all eight directories to `plot_mixed_workload.py
---sweep`. For the `max_load` sweep, the same shape with
+pass all eight directories to `plot_mixed_workload.py --sweep`.
+For the `max_load` sweep, the same shape with
 `PROXY_TOPOLOGY_DIAG_MAX_LOAD` varying and a fixed concurrency,
 passed to `--maxload-sweep`.
 
-The full benchmark suite costs ~20M visits and ~22 minutes of
+The full benchmark suite costs ~20 M visits and ~22 minutes of
 saturated GPU time on the test cluster. Smaller smoke runs
 (default env-var values) cost much less and produce equivalent
 charts at coarser sample sizes.
