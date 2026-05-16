@@ -789,29 +789,34 @@ async def run_scenario() -> bool:
         # Match client orig_id → cid via subscribe + coalesce events,
         # then attribute the canonical's achieved visits (from the
         # client's response that was the actual subscriber) to that cid.
+        # Note: `cid` is used as a local name here even though a
+        # `for c in coalesces:` loop earlier in this scope bound `c`
+        # to a dict — using `cid`/`orig` avoids the mypy type
+        # mismatch from variable re-binding.
         orig_to_cid: Dict[str, str] = {}
         for ev in subscribes + coalesces:
-            o = ev.get("orig")
-            c = ev.get("cid")
-            if o and c:
-                orig_to_cid[str(o)] = str(c)
+            ev_orig = ev.get("orig")
+            ev_cid = ev.get("cid")
+            if ev_orig and ev_cid:
+                orig_to_cid[str(ev_orig)] = str(ev_cid)
         for r in all_results:
             if r.achieved_visits is None:
                 continue
-            c = orig_to_cid.get(r.client_id)
-            if c is None:
+            cid_for_client = orig_to_cid.get(r.client_id)
+            if cid_for_client is None:
                 continue
             # If multiple clients coalesced onto the same canonical
             # they each report the same achieved_visits; take the
             # max as the canonical's visit count (KataGo may have run
             # slightly fewer or more).
-            achieved_per_cid[c] = max(
-                achieved_per_cid.get(c, 0), r.achieved_visits,
+            achieved_per_cid[cid_for_client] = max(
+                achieved_per_cid.get(cid_for_client, 0),
+                r.achieved_visits,
             )
         total_visits = sum(achieved_per_cid.values())
         per_upstream_visits: Dict[str, int] = defaultdict(int)
-        for c, v in achieved_per_cid.items():
-            up = cid_to_upstream.get(c)
+        for cid_iter, v in achieved_per_cid.items():
+            up = cid_to_upstream.get(cid_iter)
             if up:
                 per_upstream_visits[up] += v
 

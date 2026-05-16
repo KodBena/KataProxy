@@ -52,7 +52,7 @@ import math
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -88,7 +88,10 @@ def _load(run_dir: Path) -> Dict[str, Any]:
         raise FileNotFoundError(
             f"{p} not found; did the diagnostic write it?"
         )
-    return json.loads(p.read_text())
+    # json.loads is typed as Any; cast preserves the structural
+    # contract this function advertises (the diagnostic always
+    # writes a top-level dict).
+    return cast(Dict[str, Any], json.loads(p.read_text()))
 
 
 def _parse_ts(s: str) -> datetime:
@@ -256,14 +259,21 @@ def render_headline(summary: Dict[str, Any], out_path: Path) -> None:
 
     # ---- Panel 2: Latency CDF by visit bucket ----
     ax2 = axes[0, 1]
-    buckets = [
-        ("hot (coalesced)", lambda r: r["kind"] == "hot"),
-        ("quick (≤100v)", lambda r: r["kind"] == "distinct" and r["requested_visits"] <= 100),
-        ("medium (101-500v)", lambda r: r["kind"] == "distinct" and 100 < r["requested_visits"] <= 500),
-        ("deep (501-2000v)", lambda r: r["kind"] == "distinct" and 500 < r["requested_visits"] <= 2000),
-        ("very deep (>2000v)", lambda r: r["kind"] == "distinct" and r["requested_visits"] > 2000),
+    from typing import Callable
+    BucketPred = Callable[[Dict[str, Any]], bool]
+    buckets: List[Tuple[str, BucketPred]] = [
+        ("hot (coalesced)", lambda r: bool(r["kind"] == "hot")),
+        ("quick (≤100v)", lambda r: bool(r["kind"] == "distinct" and r["requested_visits"] <= 100)),
+        ("medium (101-500v)", lambda r: bool(r["kind"] == "distinct" and 100 < r["requested_visits"] <= 500)),
+        ("deep (501-2000v)", lambda r: bool(r["kind"] == "distinct" and 500 < r["requested_visits"] <= 2000)),
+        ("very deep (>2000v)", lambda r: bool(r["kind"] == "distinct" and r["requested_visits"] > 2000)),
     ]
-    bucket_colors = sns.color_palette("viridis", n_colors=len(buckets))
+    # seaborn lacks type stubs; cast to a concrete colour-list type so
+    # the downstream `ax2.plot(color=color, ...)` calls don't get
+    # tainted with the call's Any return.
+    bucket_colors = cast(
+        List[Any], sns.color_palette("viridis", n_colors=len(buckets)),
+    )
     for (label, pred), color in zip(buckets, bucket_colors):
         latencies = sorted(
             r["latency_ms"] for r in summary["queries"]

@@ -182,7 +182,7 @@ async def _send_and_drain(
                     f"{timeout}s"
                 )
             raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            data = json.loads(raw)
+            data: Dict[str, Any] = json.loads(raw)
             if data.get("isDuringSearch") is False:
                 return data
 

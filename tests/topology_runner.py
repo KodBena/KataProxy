@@ -219,6 +219,14 @@ class TopologySpec:
     client_label: str
     client_port: int
     host: str = "127.0.0.1"
+    # Cached topological sort. Computed in __post_init__ from `nodes`;
+    # `init=False` keeps it off the constructor signature, and the
+    # frozen-dataclass setter bypass uses `object.__setattr__`.
+    # Declaring as a field gives mypy the type information so the
+    # `topological_order` property doesn't need a cast.
+    _topo_order: tuple[str, ...] = field(
+        default=(), init=False, compare=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         labels_seen: set[str] = set()
@@ -262,7 +270,7 @@ class TopologySpec:
     @property
     def topological_order(self) -> tuple[str, ...]:
         # Cached in __post_init__ via object.__setattr__.
-        return self._topo_order  # type: ignore[no-any-return]
+        return self._topo_order
 
 
 def _topological_order(nodes: tuple[NodeSpec, ...]) -> tuple[str, ...]:

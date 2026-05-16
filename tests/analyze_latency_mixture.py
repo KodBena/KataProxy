@@ -50,7 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import numpy as np
 
@@ -64,7 +64,7 @@ def _load(run_dir: Path) -> Dict[str, Any]:
     p = run_dir / "summary.json"
     if not p.exists():
         raise FileNotFoundError(f"{p} not found")
-    return json.loads(p.read_text())
+    return cast(Dict[str, Any], json.loads(p.read_text()))
 
 
 def _distinct_lats(
@@ -103,7 +103,10 @@ def dip_test(arr: np.ndarray) -> tuple[float, float]:
     Small p-value = evidence against unimodality.
     """
     import diptest  # lazy import; not all callers need this
-    return diptest.diptest(arr)
+    # diptest lacks type stubs; coerce the documented (float, float)
+    # return so the function's typed contract holds.
+    dip, p = diptest.diptest(arr)
+    return float(dip), float(p)
 
 
 # ---------------------------------------------------------------------------
