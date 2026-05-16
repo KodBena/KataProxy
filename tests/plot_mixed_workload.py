@@ -414,6 +414,177 @@ def _short_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def render_maxload_sweep(sweep_dirs: List[Path], out_path: Path) -> None:
+    """Render the operator-facing `RELAY_MAX_LOAD` tuning chart.
+
+    Four panels, each as a function of `max_load`:
+
+      Top-left:  load-aware fallback rate — the fraction of
+                 dispatches that landed on a non-preferred upstream
+                 because the hash-ring preference was saturated.
+                 Should fall as max_load increases (more capacity →
+                 fewer fallback decisions).
+      Top-right: per-upstream peak in-flight queries — shows how
+                 much capacity each upstream actually used.
+      Bottom-left: dispatch distribution — per-upstream share.
+                 The system holds distribution near uniform across
+                 max_load values; this panel confirms it.
+      Bottom-right: latency percentiles — characterises how the
+                 trade-off plays out for clients.
+    """
+    rows: List[Dict[str, Any]] = []
+    for d in sweep_dirs:
+        s = _load(d)
+        latencies = sorted(
+            r["latency_ms"] for r in s["queries"] if r["error"] is None
+        )
+        if not latencies:
+            continue
+        ts_total = sum(s["summary_stats"]["per_upstream_dispatch_count"].values())
+        rows.append({
+            "max_load": s["config"]["max_load"],
+            "fallback_rate": s["summary_stats"]["fallback_rate"],
+            "per_upstream_peak": s["summary_stats"]["per_upstream_peak_in_flight"],
+            "per_upstream_count": s["summary_stats"]["per_upstream_dispatch_count"],
+            "total_dispatches": ts_total,
+            "p50": _percentile(latencies, 50),
+            "p95": _percentile(latencies, 95),
+            "p99": _percentile(latencies, 99),
+            "vps": s["summary_stats"]["visits_per_sec_total"],
+            "upstreams": s["config"]["upstreams"],
+            "concurrency": s["config"]["concurrency"],
+        })
+    if not rows:
+        print("(no max_load sweep data)")
+        return
+    rows.sort(key=lambda r: r["max_load"])
+    max_loads = [r["max_load"] for r in rows]
+    upstreams = rows[0]["upstreams"]
+    concurrency = rows[0]["concurrency"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Top-left: fallback rate
+    ax = axes[0, 0]
+    fb = [r["fallback_rate"] * 100 for r in rows]
+    ax.plot(
+        max_loads, fb, marker="o", linewidth=2.2,
+        color=_UPSTREAM_PALETTE[3],
+    )
+    for ml, v in zip(max_loads, fb):
+        ax.text(
+            ml, v + 2, f"{v:.1f}%",
+            ha="center", va="bottom", fontsize=9,
+        )
+    ax.set_xlabel("RELAY_MAX_LOAD")
+    ax.set_ylabel("load-aware fallback rate (%)")
+    ax.set_title(
+        "Fallback rate — how often the load-aware walk fires",
+        fontweight="bold",
+    )
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.set_xticks(max_loads)
+    ax.set_xticklabels([str(m) for m in max_loads])
+    ax.set_ylim(bottom=0)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # Top-right: per-upstream peak in-flight
+    ax = axes[0, 1]
+    for idx, url in enumerate(upstreams):
+        peaks = [r["per_upstream_peak"].get(url, 0) for r in rows]
+        ax.plot(
+            max_loads, peaks, marker="o", linewidth=1.8,
+            color=_color_for(idx),
+            label=_short_url(url),
+        )
+    # Reference: the max_load itself (i.e., the threshold the fallback respects).
+    ax.plot(
+        max_loads, max_loads,
+        color="grey", linestyle=":", linewidth=1.2,
+        label="max_load (admission threshold)",
+    )
+    ax.set_xlabel("RELAY_MAX_LOAD")
+    ax.set_ylabel("peak in-flight (per upstream)")
+    ax.set_title(
+        "Peak per-upstream in-flight — capacity used",
+        fontweight="bold",
+    )
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log", base=2)
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.set_xticks(max_loads)
+    ax.set_xticklabels([str(m) for m in max_loads])
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # Bottom-left: per-upstream dispatch share
+    ax = axes[1, 0]
+    ideal_share = 100 / len(upstreams)
+    for idx, url in enumerate(upstreams):
+        shares = [
+            r["per_upstream_count"].get(url, 0) / r["total_dispatches"] * 100
+            for r in rows
+        ]
+        ax.plot(
+            max_loads, shares, marker="o", linewidth=1.8,
+            color=_color_for(idx),
+            label=_short_url(url),
+        )
+    ax.axhline(
+        ideal_share, color="grey", linestyle="--", linewidth=1.2,
+        label=f"ideal uniform ({ideal_share:.1f}%)",
+    )
+    ax.set_xlabel("RELAY_MAX_LOAD")
+    ax.set_ylabel("dispatch share (%)")
+    ax.set_title(
+        "Dispatch distribution — should stay near-uniform",
+        fontweight="bold",
+    )
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.set_xticks(max_loads)
+    ax.set_xticklabels([str(m) for m in max_loads])
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.85)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # Bottom-right: latency percentiles
+    ax = axes[1, 1]
+    for pct, color in [
+        ("p50", _UPSTREAM_PALETTE[0]),
+        ("p95", _UPSTREAM_PALETTE[1]),
+        ("p99", _UPSTREAM_PALETTE[3]),
+    ]:
+        ys = [r[pct] for r in rows]
+        ax.plot(
+            max_loads, ys, marker="o", linewidth=1.8,
+            color=color, label=pct,
+        )
+    ax.set_xlabel("RELAY_MAX_LOAD")
+    ax.set_ylabel("latency (ms)")
+    ax.set_title(
+        "Latency percentiles — client-side observed",
+        fontweight="bold",
+    )
+    ax.set_xscale("log", base=2)
+    ax.set_yscale("log")
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.set_xticks(max_loads)
+    ax.set_xticklabels([str(m) for m in max_loads])
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
+    ax.grid(True, which="both", alpha=0.3)
+
+    fig.suptitle(
+        f"KataProxy RELAY tuning — max_load sweep at "
+        f"concurrency={concurrency}",
+        fontsize=12, fontweight="bold", y=0.995,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {out_path}")
+
+
 def render_sweep(sweep_dirs: List[Path], out_path: Path) -> None:
     rows: List[Dict[str, Any]] = []
     for d in sweep_dirs:
@@ -540,6 +711,10 @@ def main() -> int:
         help="run dirs for the concurrency-sweep figure",
     )
     parser.add_argument(
+        "--maxload-sweep", type=Path, nargs="*", default=None,
+        help="run dirs for the max_load-sweep figure",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, required=True,
         help="directory to write chart PNGs into",
     )
@@ -551,6 +726,11 @@ def main() -> int:
         render_headline(s, args.output_dir / "headline.png")
     if args.sweep:
         render_sweep(list(args.sweep), args.output_dir / "sweep.png")
+    if args.maxload_sweep:
+        render_maxload_sweep(
+            list(args.maxload_sweep),
+            args.output_dir / "maxload-sweep.png",
+        )
     return 0
 
 
