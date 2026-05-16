@@ -70,6 +70,8 @@ _DEFAULT_UPSTREAMS = (
     "ws://192.168.122.1:1236",
     "ws://192.168.122.1:1237",
 )
+_DEFAULT_N_CLIENTS = 2
+_DEFAULT_VISITS = 50
 
 
 def _upstreams_from_env() -> tuple[str, ...]:
@@ -79,13 +81,38 @@ def _upstreams_from_env() -> tuple[str, ...]:
     return tuple(u.strip() for u in raw.split(",") if u.strip())
 
 
+def _n_clients_from_env() -> int:
+    """Number of simultaneous clients issuing the identical query.
+
+    Default 2 is the minimum to observe coalescing. Setting higher
+    (e.g. 50) exercises the hub's subscriber-list management and
+    per-response fan-out at realistic scale; the assertion stays
+    `1 subscribe + (N-1) coalesce + 1 dispatch` regardless of N
+    because coalescing is N-independent at the hub."""
+    raw = os.environ.get("PROXY_TOPOLOGY_DIAG_CLIENTS")
+    if not raw:
+        return _DEFAULT_N_CLIENTS
+    n = int(raw)
+    if n < 2:
+        raise ValueError(
+            f"PROXY_TOPOLOGY_DIAG_CLIENTS must be ≥2 to observe "
+            f"coalescing; got {n}"
+        )
+    return n
+
+
+def _visits_from_env() -> int:
+    raw = os.environ.get("PROXY_TOPOLOGY_DIAG_VISITS")
+    return int(raw) if raw else _DEFAULT_VISITS
+
+
 # ---------------------------------------------------------------------------
 # Test queries
 # ---------------------------------------------------------------------------
 
 
-def _identical_analyze_query(client_id: str) -> Dict[str, Any]:
-    """An analyze query two clients can issue identically (modulo their
+def _identical_analyze_query(client_id: str, visits: int) -> Dict[str, Any]:
+    """An analyze query N clients can issue identically (modulo their
     distinct client-side `id` fields — the hub's coalescing operates
     on content_hash, not on the client `id`)."""
     return {
@@ -97,7 +124,7 @@ def _identical_analyze_query(client_id: str) -> Dict[str, Any]:
         "boardYSize": 19,
         "moves": [["B", "Q4"]],
         "analyzeTurns": [0],
-        "maxVisits": 50,  # fast turnaround; we're not testing strength
+        "maxVisits": visits,
     }
 
 
@@ -197,7 +224,11 @@ async def run_scenario() -> bool:
     print("=" * 72)
 
     upstream_urls = _upstreams_from_env()
-    print(f"\nupstreams: {upstream_urls}")
+    n_clients = _n_clients_from_env()
+    visits = _visits_from_env()
+    print(f"\nupstreams:  {upstream_urls}")
+    print(f"clients:    {n_clients}")
+    print(f"maxVisits:  {visits}")
 
     # Build the topology: N pre-existing LEAFs + a spawned RELAY.
     upstream_nodes = tuple(
@@ -234,48 +265,53 @@ async def run_scenario() -> bool:
         # Brief settle for the broadcast events to land in the log.
         await asyncio.sleep(0.5)
 
-        # Step 2: two clients issue identical analyze queries
-        # near-simultaneously.
-        print("\n--- Step 2: two clients send identical analyze queries ---")
-        ready_a = asyncio.Event()
-        ready_b = asyncio.Event()
+        # Step 2: N clients issue identical analyze queries
+        # near-simultaneously via a ready/go gate.
+        print(
+            f"\n--- Step 2: {n_clients} clients send identical "
+            f"analyze queries ---"
+        )
+        ready_events = [asyncio.Event() for _ in range(n_clients)]
         go = asyncio.Event()
 
         async def launch() -> None:
-            await asyncio.gather(ready_a.wait(), ready_b.wait())
+            await asyncio.gather(*(e.wait() for e in ready_events))
             go.set()
 
         launch_task = asyncio.create_task(launch())
-        client_a_task = asyncio.create_task(
-            _run_client(
-                runner.client_url,
-                _identical_analyze_query("client-A"),
-                ready_event=ready_a, go_event=go,
+        client_tasks = [
+            asyncio.create_task(
+                _run_client(
+                    runner.client_url,
+                    _identical_analyze_query(f"client-{i:03d}", visits),
+                    ready_event=ready_events[i], go_event=go,
+                )
             )
-        )
-        client_b_task = asyncio.create_task(
-            _run_client(
-                runner.client_url,
-                _identical_analyze_query("client-B"),
-                ready_event=ready_b, go_event=go,
-            )
-        )
+            for i in range(n_clients)
+        ]
 
-        responses_a, responses_b = await asyncio.wait_for(
-            asyncio.gather(client_a_task, client_b_task),
-            timeout=30.0,
+        # Timeout scales loosely with N; 30s is the floor for small
+        # N, plus 0.5s per additional client to cover WS-setup
+        # overhead at scale (50 clients on a single loop adds real
+        # connect-time).
+        timeout = 30.0 + max(0, n_clients - 2) * 0.5
+        all_responses = await asyncio.wait_for(
+            asyncio.gather(*client_tasks),
+            timeout=timeout,
         )
         await launch_task
 
+        final_visits = [
+            r[-1].get("rootInfo", {}).get("visits", "?")
+            for r in all_responses
+        ]
+        # Distinct final-visit counts would mean different upstreams
+        # answered different clients — a coalescing failure caught at
+        # the response shape rather than at the dispatch event.
+        unique_visits = set(final_visits)
         print(
-            f"  client A received {len(responses_a)} responses "
-            f"(final visits: "
-            f"{responses_a[-1].get('rootInfo', {}).get('visits', '?')})"
-        )
-        print(
-            f"  client B received {len(responses_b)} responses "
-            f"(final visits: "
-            f"{responses_b[-1].get('rootInfo', {}).get('visits', '?')})"
+            f"  all {n_clients} clients received final responses; "
+            f"final-visit values: {sorted(unique_visits)}"
         )
 
         # Settle: give the proxy a moment to flush log records for the
@@ -299,22 +335,25 @@ async def run_scenario() -> bool:
         print(f"  coalesce(ANALYZE)  events: {len(coalesces)}")
         print(f"  dispatch(ANALYZE)  events: {len(dispatches)}")
 
-        # Contract: 1 subscribe (first client created the slot),
-        # 1 coalesce (second client joined the slot),
-        # 1 dispatch (the single canonical went to one upstream).
+        # Contract:
+        #   1 subscribe   — first client created the slot
+        #   N-1 coalesces — every subsequent client joined the slot
+        #   1 dispatch    — the single canonical went to one upstream
+        expected_coalesces = n_clients - 1
         if len(subscribes) != 1:
             print(
                 f"\n  FAIL: expected exactly 1 subscribe(ANALYZE); "
-                f"got {len(subscribes)}. This means the second "
-                f"identical query did NOT join the existing slot."
+                f"got {len(subscribes)}. The first client didn't "
+                f"create a fresh slot, or multiple clients created "
+                f"slots that didn't share a content_hash."
             )
             return False
-        if len(coalesces) != 1:
+        if len(coalesces) != expected_coalesces:
             print(
-                f"\n  FAIL: expected exactly 1 coalesce(ANALYZE); "
-                f"got {len(coalesces)}. The second client's "
-                f"subscribe didn't see the first's slot — likely a "
-                f"hash-policy regression or a timing problem the "
+                f"\n  FAIL: expected exactly {expected_coalesces} "
+                f"coalesce(ANALYZE); got {len(coalesces)}. "
+                f"Some clients didn't join the existing slot — likely "
+                f"a hash-policy regression or a timing problem the "
                 f"ready/go gate was supposed to prevent."
             )
             return False
@@ -326,25 +365,29 @@ async def run_scenario() -> bool:
             )
             return False
 
-        # Both clients saw the same canonical's responses (relabelled).
-        # Cross-check: the subscribe and coalesce events should share
-        # a cid, and that cid should equal the dispatch's cid.
+        # Cross-check: subscribe, all coalesces, and dispatch should
+        # share the same canonical_id.
         sub_cid = subscribes[0].get("cid")
-        co_cid = coalesces[0].get("cid")
         disp_cid = dispatches[0].get("cid")
-        if not (sub_cid == co_cid == disp_cid):
+        co_cids = {c.get("cid") for c in coalesces}
+        if disp_cid != sub_cid:
             print(
-                f"\n  FAIL: cid mismatch across coalescing events: "
-                f"subscribe.cid={sub_cid!r} "
-                f"coalesce.cid={co_cid!r} "
+                f"\n  FAIL: subscribe.cid={sub_cid!r} != "
                 f"dispatch.cid={disp_cid!r}"
+            )
+            return False
+        if co_cids != {sub_cid}:
+            print(
+                f"\n  FAIL: coalesce events carry mismatched cids: "
+                f"subscribe.cid={sub_cid!r} coalesce.cids={co_cids!r}"
             )
             return False
 
         upstream_target = dispatches[0].get("upstream")
         print(
-            f"\n  PASS: coalescing observed. "
-            f"canonical={sub_cid!r} → upstream={upstream_target!r}"
+            f"\n  PASS: coalescing observed at N={n_clients}. "
+            f"canonical={sub_cid!r} → upstream={upstream_target!r}; "
+            f"{expected_coalesces} subscribers joined the slot."
         )
         return True
 

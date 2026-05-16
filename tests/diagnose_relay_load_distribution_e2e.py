@@ -70,6 +70,9 @@ _DEFAULT_UPSTREAMS = (
     "ws://192.168.122.1:1236",
     "ws://192.168.122.1:1237",
 )
+_DEFAULT_N_QUERIES = 12
+_DEFAULT_CONCURRENCY = 1   # sequential
+_DEFAULT_VISITS = 50
 
 
 def _upstreams_from_env() -> tuple[str, ...]:
@@ -79,40 +82,82 @@ def _upstreams_from_env() -> tuple[str, ...]:
     return tuple(u.strip() for u in raw.split(",") if u.strip())
 
 
-# 12 distinct queries over 3 upstreams gives the ring enough room to
-# distribute; small enough that the test completes quickly even at
-# real-KataGo cost per query (low maxVisits keeps each fast).
-_N_QUERIES = 12
+def _n_queries_from_env() -> int:
+    raw = os.environ.get("PROXY_TOPOLOGY_DIAG_QUERIES")
+    return int(raw) if raw else _DEFAULT_N_QUERIES
+
+
+def _concurrency_from_env() -> int:
+    """Maximum in-flight queries at any moment.
+
+    Default 1 (sequential) for the cheap smoke run. Higher values
+    bound by a semaphore — useful for heavier runs where the wall-
+    clock would otherwise be dominated by per-query KataGo latency.
+    Don't crank too high: each in-flight query is one slot of
+    RelayRouter.max_load on the chosen upstream; saturating that
+    forces the load-aware fallback, which still passes the
+    distribution test but exercises a different branch than the
+    pure hash-ring property."""
+    raw = os.environ.get("PROXY_TOPOLOGY_DIAG_CONCURRENCY")
+    n = int(raw) if raw else _DEFAULT_CONCURRENCY
+    if n < 1:
+        raise ValueError(
+            f"PROXY_TOPOLOGY_DIAG_CONCURRENCY must be ≥1; got {n}"
+        )
+    return n
+
+
+def _visits_from_env() -> int:
+    raw = os.environ.get("PROXY_TOPOLOGY_DIAG_VISITS")
+    return int(raw) if raw else _DEFAULT_VISITS
 
 
 # ---------------------------------------------------------------------------
-# Distinct test queries
+# Distinct test queries — generator scales to ~130k queries
 # ---------------------------------------------------------------------------
 
 
-_DISTINCT_FIRST_MOVES = [
-    ("B", "Q4"),  ("B", "D4"),  ("B", "Q16"), ("B", "D16"),
-    ("B", "K10"), ("B", "Q10"), ("B", "K4"),  ("B", "D10"),
-    ("B", "K16"), ("B", "Q3"),  ("B", "D3"),  ("B", "Q17"),
-]
-assert len(_DISTINCT_FIRST_MOVES) >= _N_QUERIES
+# KataGo's column vocabulary: 19 letters, skipping I (operator
+# convention — easy to confuse with 1 / J on a board).
+_COLS = "ABCDEFGHJKLMNOPQRST"
+_BOARD_SIZE = 19
+_FIRST_MOVE_SPACE = _BOARD_SIZE * _BOARD_SIZE  # 361
 
 
-def _distinct_analyze_query(seq: int) -> Dict[str, Any]:
+def _coord(idx: int) -> str:
+    """Map 0..360 → board coord ('A1'..'T19')."""
+    col = _COLS[idx % _BOARD_SIZE]
+    row = (idx // _BOARD_SIZE) + 1
+    return f"{col}{row}"
+
+
+def _distinct_analyze_query(seq: int, visits: int) -> Dict[str, Any]:
     """An analyze query distinct from every other in this script's
-    sequence, so the hub treats each as a separate canonical
-    (no coalescing)."""
-    move = _DISTINCT_FIRST_MOVES[seq]
+    sequence, so the hub treats each as a separate canonical (no
+    coalescing). The opening-move space is 361; for seq >= 361 we
+    encode the overflow as a second move (W on the next-indexed
+    coordinate), which gives ~130k distinct sequences before
+    repetition."""
+    first_idx = seq % _FIRST_MOVE_SPACE
+    second_seq = (seq // _FIRST_MOVE_SPACE)
+    first = _coord(first_idx)
+    moves = [["B", first]]
+    if second_seq > 0:
+        second_idx = second_seq % _FIRST_MOVE_SPACE
+        if second_idx == first_idx:
+            # Same point would be illegal; bump by one.
+            second_idx = (second_idx + 1) % _FIRST_MOVE_SPACE
+        moves.append(["W", _coord(second_idx)])
     return {
-        "id": f"client-{seq:02d}",
+        "id": f"client-{seq:04d}",
         "action": "analyze",
         "rules": "tromp-taylor",
         "komi": 7.5,
-        "boardXSize": 19,
-        "boardYSize": 19,
-        "moves": [move],
+        "boardXSize": _BOARD_SIZE,
+        "boardYSize": _BOARD_SIZE,
+        "moves": moves,
         "analyzeTurns": [0],
-        "maxVisits": 50,
+        "maxVisits": visits,
     }
 
 
@@ -183,8 +228,13 @@ async def run_scenario() -> bool:
     print("=" * 72)
 
     upstream_urls = _upstreams_from_env()
-    print(f"\nupstreams: {upstream_urls}")
-    print(f"queries:   {_N_QUERIES} distinct")
+    n_queries = _n_queries_from_env()
+    concurrency = _concurrency_from_env()
+    visits = _visits_from_env()
+    print(f"\nupstreams:   {upstream_urls}")
+    print(f"queries:     {n_queries} distinct")
+    print(f"concurrency: {concurrency}")
+    print(f"maxVisits:   {visits}")
 
     upstream_nodes = tuple(
         NodeSpec(
@@ -212,19 +262,40 @@ async def run_scenario() -> bool:
     print(f"RELAY listening on {runner.client_url}")
 
     try:
-        # Step 1: drive N distinct queries sequentially. Sequential
-        # rather than parallel: this test is about ring distribution
-        # over a population of canonicals, not about concurrency, and
-        # serialising keeps the operator log simpler to read.
-        print(f"\n--- Step 1: send {_N_QUERIES} distinct analyze queries ---")
-        for seq in range(_N_QUERIES):
-            query = _distinct_analyze_query(seq)
-            result = await _send_and_drain(runner.client_url, query)
-            visits = result.get("rootInfo", {}).get("visits", "?")
-            print(
-                f"  [{seq + 1:>2}/{_N_QUERIES}] {query['id']!r} → "
-                f"final visits={visits}"
-            )
+        # Step 1: drive N distinct queries with bounded concurrency.
+        # Concurrency=1 is sequential (good for low-N smoke runs and
+        # readable operator output); higher concurrency bounds the
+        # wall-clock when N is in the hundreds. Each in-flight query
+        # consumes one slot of RelayRouter.max_load on its routed
+        # upstream — too-high concurrency forces the load-aware
+        # fallback (a different branch than what we're pinning here),
+        # so the default stays conservative.
+        print(
+            f"\n--- Step 1: send {n_queries} distinct analyze queries "
+            f"(concurrency {concurrency}) ---"
+        )
+        sem = asyncio.Semaphore(concurrency)
+        completed = 0
+        progress_every = max(1, n_queries // 20)  # ~20 progress lines
+
+        async def run_one(seq: int) -> tuple[int, Dict[str, Any]]:
+            nonlocal completed
+            async with sem:
+                query = _distinct_analyze_query(seq, visits)
+                result = await _send_and_drain(runner.client_url, query)
+                completed += 1
+                if completed % progress_every == 0 or completed == n_queries:
+                    rv = result.get("rootInfo", {}).get("visits", "?")
+                    print(
+                        f"  [{completed:>4}/{n_queries}] last: "
+                        f"{query['id']!r} → visits={rv}"
+                    )
+                return seq, result
+
+        t0 = asyncio.get_event_loop().time()
+        await asyncio.gather(*(run_one(i) for i in range(n_queries)))
+        elapsed = asyncio.get_event_loop().time() - t0
+        print(f"  all queries complete in {elapsed:.1f}s")
 
         # Settle: flush the last query's dispatch + forward events.
         await asyncio.sleep(0.5)
@@ -249,9 +320,9 @@ async def run_scenario() -> bool:
 
         # Distinct subscribes: should equal N.
         subscribes = _events_for_action(events, "subscribe", "ANALYZE")
-        if len(subscribes) != _N_QUERIES:
+        if len(subscribes) != n_queries:
             print(
-                f"\n  FAIL: expected {_N_QUERIES} subscribe(ANALYZE); "
+                f"\n  FAIL: expected {n_queries} subscribe(ANALYZE); "
                 f"got {len(subscribes)}. Some queries didn't reach the "
                 f"hub or coalesced unexpectedly."
             )
@@ -259,48 +330,67 @@ async def run_scenario() -> bool:
 
         # Dispatches: should equal N, distributed across upstreams.
         dispatches = _events_for_action(events, "dispatch", "ANALYZE")
-        if len(dispatches) != _N_QUERIES:
+        if len(dispatches) != n_queries:
             print(
-                f"\n  FAIL: expected {_N_QUERIES} dispatch(ANALYZE); "
+                f"\n  FAIL: expected {n_queries} dispatch(ANALYZE); "
                 f"got {len(dispatches)}. Hub coalesced + router "
                 f"dispatched don't agree on cardinality."
             )
             return False
 
         per_upstream = Counter(d.get("upstream") for d in dispatches)
-        print(f"  per-upstream dispatch counts:")
+        # Skew bound is scale-aware: tight at large N (where binomial
+        # variance compresses), loose at small N (where 12 queries
+        # can defensibly land 8/2/2 by chance). Bound chosen as
+        # 1/3 + 5σ at the binomial std dev to stay well clear of
+        # ordinary variance while still catching real skew.
+        #
+        # Cap at 0.75 so the bound is meaningful at small N (where
+        # the formula's 5σ term blows past 1.0). At N=12 the cap
+        # binds → 0.75. At N=100 the formula gives ~0.57 → used
+        # directly. At N=500 ~0.43, at N=1000 ~0.40 — both tight
+        # enough to catch real hash bias.
+        n = n_queries
+        sigma = (n * (1 / 3) * (2 / 3)) ** 0.5
+        skew_bound = min(0.75, (n / 3 + 5 * sigma) / n)
+
+        print(f"  per-upstream dispatch counts (expected mean: {n/3:.1f}):")
         for url in upstream_urls:
             count = per_upstream.get(url, 0)
-            print(f"    {url}: {count}")
+            share = count / n if n else 0.0
+            print(f"    {url}: {count} ({share:.1%})")
+        print(
+            f"  binomial σ: {sigma:.2f}; skew bound: {skew_bound:.1%} "
+            f"(mean + 5σ)"
+        )
 
         # Starvation check.
         for url in upstream_urls:
             if per_upstream.get(url, 0) == 0:
                 print(
                     f"\n  FAIL: upstream {url!r} received 0 of "
-                    f"{_N_QUERIES} dispatches — hash ring is stuck."
+                    f"{n} dispatches — hash ring is stuck."
                 )
                 return False
 
-        # Skew check: no upstream above 75%. With 12 queries / 3
-        # upstreams the expected share is ~33% per upstream; the
-        # 75% bound is loose enough to tolerate variance and tight
-        # enough to catch a ring-bypass regression.
-        max_share = max(per_upstream.values()) / _N_QUERIES
-        if max_share > 0.75:
+        max_share = max(per_upstream.values()) / n
+        if max_share > skew_bound:
             top_url = max(per_upstream, key=lambda u: per_upstream[u])
             print(
                 f"\n  FAIL: upstream {top_url!r} received "
                 f"{max_share:.1%} of dispatches "
-                f"({per_upstream[top_url]}/{_N_QUERIES}) — distribution "
-                f"is strongly skewed."
+                f"({per_upstream[top_url]}/{n}) — exceeds skew bound "
+                f"{skew_bound:.1%}. Hash-ring distribution looks "
+                f"biased (or N is too small for the bound — try a "
+                f"larger PROXY_TOPOLOGY_DIAG_QUERIES)."
             )
             return False
 
         print(
-            f"\n  PASS: {_N_QUERIES} queries distributed across "
+            f"\n  PASS: {n} queries distributed across "
             f"{len(upstream_urls)} upstreams; "
-            f"max share = {max_share:.1%}, no starvation."
+            f"max share = {max_share:.1%} (bound {skew_bound:.1%}), "
+            f"no starvation."
         )
         return True
 
