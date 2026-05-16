@@ -18,6 +18,35 @@ It is designed for go schools, online go services, and individuals who want
 to share a powerful analysis machine across multiple users or front-ends
 without giving each client direct access to the engine.
 
+KataProxy is small (a few thousand lines of Python) but disciplined:
+~280 pytest cases plus a `mypy --strict` CI gate, with the three-layer
+architecture, the ID-namespace translation, and the load-aware fallback
+path covered by in-process unit tests and multi-process end-to-end
+diagnostics exercised against a live KataGo cluster. A reproducible
+benchmark ([benchmark.md](benchmark.md)) characterises throughput,
+latency, coalescing efficiency, dispatch distribution, and the
+operator-facing `RELAY_MAX_LOAD` tuning knob under realistic mixed
+workloads — sustained ~15,000 KataGo visits/sec through a 3-LEAF
+cluster on a single 4-core host, with 100/100 hot positions fully
+coalesced, dispatch distribution within ±0.5% of ideal-uniform, and
+the admission knob shown to have no measurable effect on throughput
+across two orders of magnitude. The analysis methodology (Hartigans'
+dip test, Gaussian-Mixture-Model regime decomposition) and the raw
+data behind every chart are committed alongside the doc so an
+operator can re-run or extend any measurement against their own
+cluster.
+
+To date the proxy has only seen local-cluster use. The benchmark's
+§"Honest assessment" names what was deliberately not tested — upstream
+failure, multi-region deployment, multi-day endurance, chained-proxy
+topologies — and the path from those gaps to characterised behaviour
+runs through actual institutional use. If you're considering
+KataProxy for a go school or shared-analysis service, the
+architectural documents ([`ARCHITECTURE.md`](ARCHITECTURE.md),
+[`FRAMEWORK.md`](FRAMEWORK.md)) explain the design exhaustively, and
+the project would benefit from hearing how it survives contact with
+your workload.
+
 ---
 
 ## Requirements
