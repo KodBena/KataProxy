@@ -50,9 +50,9 @@ import enum
 import os
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,14 @@ class NodeSpec:
     model_path: Optional[Path] = None
     pre_existing_url: Optional[str] = None
     advertise_capabilities: bool = True
+    # Per-node env-var overrides merged into the spawn env AFTER the
+    # role-specific construction. Useful for diagnostics that need to
+    # tune proxy config without amending pyproject (e.g.,
+    # `RELAY_MAX_LOAD=2` to force load-aware fallback under test).
+    # Mapping rather than tuple-of-tuples because NodeSpec doesn't
+    # need to be hashable; the frozen=True keeps reassignment off,
+    # the dict contents are conventionally treated as immutable.
+    extra_env: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def is_spawned(self) -> bool:
@@ -460,6 +468,11 @@ class TopologyRunner:
             env["PROXY_LOG_DEST"] = (
                 f"file:{self._log_dir / f'{node.spec.label}.jsonl'}"
             )
+        # Per-node overrides win: they're applied after role-specific
+        # env so a diagnostic can override anything the substrate set
+        # by default. Caller's responsibility to know what's safe to
+        # override.
+        env.update(node.spec.extra_env)
         return env
 
     def _upstream_url(self, label: str) -> str:
