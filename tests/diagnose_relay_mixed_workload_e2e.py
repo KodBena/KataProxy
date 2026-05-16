@@ -110,21 +110,62 @@ def _upstreams_from_env() -> tuple[str, ...]:
     return tuple(u.strip() for u in raw.split(",") if u.strip())
 
 
+# Visit-distribution presets (visits, weight) — distinct queries
+# sample from one of these (or a custom one via env). The "balanced"
+# preset mimics a realistic Go-study workload: lots of quick "first
+# look" queries, fewer deeper queries, occasional very-deep dives.
+_VISIT_DIST_PRESETS: Dict[str, Tuple[Tuple[int, int], ...]] = {
+    "uniform_fast": ((50, 1),),
+    "fast_slow": ((50, 80), (500, 20)),
+    "balanced": (
+        (50, 50), (200, 30), (500, 15), (1500, 4), (5000, 1),
+    ),
+    "heavy": (
+        (50, 30), (200, 30), (500, 20), (1500, 15), (5000, 5),
+    ),
+}
+
+
+def _parse_visit_dist(raw: str) -> Tuple[Tuple[int, int], ...]:
+    """Parse 'V1:W1,V2:W2,...' into ((V1,W1),(V2,W2),...)."""
+    out: List[Tuple[int, int]] = []
+    for part in raw.split(","):
+        v, _, w = part.strip().partition(":")
+        out.append((int(v), int(w)))
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Config:
     upstreams: tuple[str, ...]
-    hot_positions: int       # H
-    clients_per_hot: int     # K
-    distinct_queries: int    # D
-    concurrency: int         # max in-flight distinct queries
-    max_load: int            # RELAY_MAX_LOAD env override
-    fast_visits: int
-    slow_visits: int
-    slow_ratio: float        # fraction of DISTINCT queries that are slow
-    rng_seed: int            # for reproducible shuffles / hot positions
+    hot_positions: int                          # H
+    clients_per_hot: int                        # K
+    distinct_queries: int                       # D
+    concurrency: int                            # max in-flight distinct queries
+    max_load: int                               # RELAY_MAX_LOAD env override
+    hot_visits: int                             # visits per hot query
+    visit_dist: Tuple[Tuple[int, int], ...]    # (visits, weight) for distinct
+    visit_dist_name: str                        # for reporting
+    rng_seed: int                               # for reproducible shuffles
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Visit distribution: explicit > preset > default-preset.
+        explicit = os.environ.get("PROXY_TOPOLOGY_DIAG_VISIT_DIST")
+        preset_name = os.environ.get(
+            "PROXY_TOPOLOGY_DIAG_VISIT_PRESET", "balanced",
+        )
+        if explicit:
+            dist = _parse_visit_dist(explicit)
+            dist_name = f"explicit({explicit})"
+        else:
+            if preset_name not in _VISIT_DIST_PRESETS:
+                raise ValueError(
+                    f"Unknown visit preset {preset_name!r}; "
+                    f"available: {sorted(_VISIT_DIST_PRESETS)}"
+                )
+            dist = _VISIT_DIST_PRESETS[preset_name]
+            dist_name = preset_name
         return cls(
             upstreams=_upstreams_from_env(),
             hot_positions=_env_int(
@@ -142,19 +183,24 @@ class Config:
             max_load=_env_int(
                 "PROXY_TOPOLOGY_DIAG_MAX_LOAD", 2,
             ),
-            fast_visits=_env_int(
-                "PROXY_TOPOLOGY_DIAG_FAST_VISITS", 50,
+            hot_visits=_env_int(
+                "PROXY_TOPOLOGY_DIAG_HOT_VISITS", 500,
             ),
-            slow_visits=_env_int(
-                "PROXY_TOPOLOGY_DIAG_SLOW_VISITS", 500,
-            ),
-            slow_ratio=_env_float(
-                "PROXY_TOPOLOGY_DIAG_SLOW_RATIO", 0.20,
-            ),
+            visit_dist=dist,
+            visit_dist_name=dist_name,
             rng_seed=_env_int(
                 "PROXY_TOPOLOGY_DIAG_RNG_SEED", 42,
             ),
         )
+
+    @property
+    def mean_distinct_visits(self) -> float:
+        total_w = sum(w for _, w in self.visit_dist)
+        return sum(v * w for v, w in self.visit_dist) / total_w
+
+    @property
+    def expected_distinct_visits(self) -> int:
+        return int(self.distinct_queries * self.mean_distinct_visits)
 
     @property
     def total_clients(self) -> int:
@@ -240,18 +286,31 @@ def _distinct_position_query(seq: int, visits: int) -> Dict[str, Any]:
 
 @dataclass
 class QueryResult:
-    client_id: str         # the wire-level client id we sent
-    kind: str              # "hot" or "distinct"
-    visits_class: str      # "fast" or "slow"
-    submit_t: float        # wall time at send
-    final_t: float         # wall time at last response
+    client_id: str             # the wire-level client id we sent
+    kind: str                  # "hot" or "distinct"
+    requested_visits: int      # what the query asked for
+    submit_t: float            # wall time at send
+    final_t: float             # wall time at last response
     n_responses: int
-    final_visits: Optional[int]
+    achieved_visits: Optional[int]   # what the final response reported
     error: Optional[str] = None
 
     @property
     def latency_ms(self) -> float:
         return (self.final_t - self.submit_t) * 1000.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "client_id": self.client_id,
+            "kind": self.kind,
+            "requested_visits": self.requested_visits,
+            "submit_t": self.submit_t,
+            "final_t": self.final_t,
+            "latency_ms": self.latency_ms,
+            "n_responses": self.n_responses,
+            "achieved_visits": self.achieved_visits,
+            "error": self.error,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -260,39 +319,39 @@ class QueryResult:
 
 
 async def _drive_query(
-    url: str, query: Dict[str, Any], kind: str, visits_class: str,
+    url: str, query: Dict[str, Any], kind: str, requested_visits: int,
 ) -> QueryResult:
     submit_t = time.monotonic()
     n_responses = 0
-    final_visits: Optional[int] = None
+    achieved_visits: Optional[int] = None
     try:
         async with websockets.connect(url, open_timeout=10) as ws:
             await ws.send(json.dumps(query))
             while True:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
+                raw = await asyncio.wait_for(ws.recv(), timeout=120.0)
                 data = json.loads(raw)
                 n_responses += 1
                 if data.get("isDuringSearch") is False:
-                    final_visits = data.get("rootInfo", {}).get("visits")
+                    achieved_visits = data.get("rootInfo", {}).get("visits")
                     break
         return QueryResult(
             client_id=str(query["id"]),
             kind=kind,
-            visits_class=visits_class,
+            requested_visits=requested_visits,
             submit_t=submit_t,
             final_t=time.monotonic(),
             n_responses=n_responses,
-            final_visits=final_visits,
+            achieved_visits=achieved_visits,
         )
     except Exception as exc:
         return QueryResult(
             client_id=str(query["id"]),
             kind=kind,
-            visits_class=visits_class,
+            requested_visits=requested_visits,
             submit_t=submit_t,
             final_t=time.monotonic(),
             n_responses=n_responses,
-            final_visits=None,
+            achieved_visits=None,
             error=f"{type(exc).__name__}: {exc}",
         )
 
@@ -307,40 +366,47 @@ async def _hot_bursts_task(
     coalescing is near-deterministic."""
     results: List[QueryResult] = []
     for hot_idx in range(cfg.hot_positions):
-        # Hot queries always use slow visits so the canonical stays
+        # Hot queries all use `hot_visits` so the canonical stays
         # in-flight long enough for all clients in the burst to land
         # while it's still coalesceable.
         burst_queries = [
-            _hot_position_query(hot_idx, c, cfg.slow_visits)
+            _hot_position_query(hot_idx, c, cfg.hot_visits)
             for c in range(cfg.clients_per_hot)
         ]
         burst_results = await asyncio.gather(*(
-            _drive_query(url, q, "hot", "slow") for q in burst_queries
+            _drive_query(url, q, "hot", cfg.hot_visits)
+            for q in burst_queries
         ))
         results.extend(burst_results)
     return results
 
 
+def _sample_visits(rng: random.Random, dist: Tuple[Tuple[int, int], ...]) -> int:
+    """Weighted-choice from a (visits, weight) discrete distribution."""
+    visits_list = [v for v, _ in dist]
+    weights = [w for _, w in dist]
+    return rng.choices(visits_list, weights=weights, k=1)[0]
+
+
 async def _distinct_flow_task(
     url: str, cfg: Config,
 ) -> List[QueryResult]:
-    """Distinct queries at bounded concurrency. Slow/fast mix is
-    deterministic per the RNG seed so re-runs are reproducible."""
+    """Distinct queries at bounded concurrency. Visit count per query
+    is sampled from `cfg.visit_dist`, deterministic per RNG seed so
+    re-runs are reproducible."""
     rng = random.Random(cfg.rng_seed)
-    visit_classes: List[Tuple[int, str]] = []
-    for _ in range(cfg.distinct_queries):
-        if rng.random() < cfg.slow_ratio:
-            visit_classes.append((cfg.slow_visits, "slow"))
-        else:
-            visit_classes.append((cfg.fast_visits, "fast"))
+    visits_per_query: List[int] = [
+        _sample_visits(rng, cfg.visit_dist)
+        for _ in range(cfg.distinct_queries)
+    ]
 
     sem = asyncio.Semaphore(cfg.concurrency)
 
     async def run_one(seq: int) -> QueryResult:
         async with sem:
-            visits, vclass = visit_classes[seq]
-            q = _distinct_position_query(seq, visits)
-            return await _drive_query(url, q, "distinct", vclass)
+            v = visits_per_query[seq]
+            q = _distinct_position_query(seq, v)
+            return await _drive_query(url, q, "distinct", v)
 
     return await asyncio.gather(*(
         run_one(i) for i in range(cfg.distinct_queries)
@@ -493,15 +559,21 @@ async def run_scenario() -> bool:
     print(
         f"hot:                 {cfg.hot_positions} positions × "
         f"{cfg.clients_per_hot} clients = "
-        f"{cfg.hot_positions * cfg.clients_per_hot} hot queries (slow)"
+        f"{cfg.hot_positions * cfg.clients_per_hot} hot queries "
+        f"(@{cfg.hot_visits}v each)"
     )
     print(
-        f"distinct:            {cfg.distinct_queries} queries "
-        f"({cfg.slow_ratio:.0%} slow / {1 - cfg.slow_ratio:.0%} fast)"
+        f"distinct:            {cfg.distinct_queries} queries; "
+        f"visit dist = {cfg.visit_dist_name}"
+    )
+    print(f"  visit composition: {cfg.visit_dist}")
+    print(
+        f"  mean distinct visits: {cfg.mean_distinct_visits:.1f}  "
+        f"(→ expected distinct compute: "
+        f"{cfg.expected_distinct_visits:,} visits)"
     )
     print(f"concurrency:         {cfg.concurrency}")
     print(f"RELAY_MAX_LOAD:      {cfg.max_load}")
-    print(f"fast/slow maxVisits: {cfg.fast_visits} / {cfg.slow_visits}")
     print(f"RNG seed:            {cfg.rng_seed}")
     print(f"total client queries: {cfg.total_clients}")
 
@@ -526,7 +598,12 @@ async def run_scenario() -> bool:
         client_port=client_port,
     )
 
-    log_dir = Path(tempfile.mkdtemp(prefix="kataproxy-mixed-"))
+    log_dir_override = os.environ.get("PROXY_TOPOLOGY_DIAG_LOG_DIR")
+    if log_dir_override:
+        log_dir = Path(log_dir_override)
+        log_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        log_dir = Path(tempfile.mkdtemp(prefix="kataproxy-mixed-"))
     print(f"log_dir:             {log_dir}")
     runner = TopologyRunner(spec, log_dir=log_dir)
 
@@ -679,38 +756,82 @@ async def run_scenario() -> bool:
             f"least-loaded fallback path)"
         )
 
-        # LATENCY
-        print("\nLatency (client-side, ms)")
-        print(f"  All:                 ")
+        # LATENCY (bucketed by requested_visits since cost varies)
+        print("\nLatency (client-side, ms; buckets are by requested visits)")
+        print(f"  All:                  ")
         print(_format_lat(_latency_summary(all_results)))
-        print(f"  Hot (slow, coalesced):")
+        print(f"  Hot (coalesced):      ")
         print(_format_lat(_latency_summary(
             [r for r in all_results if r.kind == "hot"]
         )))
-        print(f"  Distinct fast:       ")
-        print(_format_lat(_latency_summary(
-            [r for r in all_results
-             if r.kind == "distinct" and r.visits_class == "fast"]
-        )))
-        print(f"  Distinct slow:       ")
-        print(_format_lat(_latency_summary(
-            [r for r in all_results
-             if r.kind == "distinct" and r.visits_class == "slow"]
-        )))
+        for label, lo, hi in [
+            ("Distinct quick (≤100v):  ", 0, 100),
+            ("Distinct medium (≤500v): ", 101, 500),
+            ("Distinct deep (≤2000v):  ", 501, 2000),
+            ("Distinct very deep:      ", 2001, 10_000_000),
+        ]:
+            bucket = [
+                r for r in all_results
+                if r.kind == "distinct"
+                and lo <= r.requested_visits <= hi
+            ]
+            if bucket:
+                print(f"  {label}")
+                print(_format_lat(_latency_summary(bucket)))
 
-        # THROUGHPUT
+        # THROUGHPUT — visits/second is the right unit when query cost
+        # is variable (queries/second misses the work asymmetry).
         print("\nThroughput")
-        total_qps = cfg.total_clients / elapsed if elapsed else 0
+        # Sum achieved visits across all completed queries. Hot
+        # queries' visits are counted once per ACHIEVED canonical
+        # (i.e., the coalesced run), not per client subscriber.
+        achieved_per_cid: Dict[str, int] = {}
+        # Match client orig_id → cid via subscribe + coalesce events,
+        # then attribute the canonical's achieved visits (from the
+        # client's response that was the actual subscriber) to that cid.
+        orig_to_cid: Dict[str, str] = {}
+        for ev in subscribes + coalesces:
+            o = ev.get("orig")
+            c = ev.get("cid")
+            if o and c:
+                orig_to_cid[str(o)] = str(c)
+        for r in all_results:
+            if r.achieved_visits is None:
+                continue
+            c = orig_to_cid.get(r.client_id)
+            if c is None:
+                continue
+            # If multiple clients coalesced onto the same canonical
+            # they each report the same achieved_visits; take the
+            # max as the canonical's visit count (KataGo may have run
+            # slightly fewer or more).
+            achieved_per_cid[c] = max(
+                achieved_per_cid.get(c, 0), r.achieved_visits,
+            )
+        total_visits = sum(achieved_per_cid.values())
+        per_upstream_visits: Dict[str, int] = defaultdict(int)
+        for c, v in achieved_per_cid.items():
+            up = cid_to_upstream.get(c)
+            if up:
+                per_upstream_visits[up] += v
+
+        vps_total = total_visits / elapsed if elapsed else 0
+        qps_client = cfg.total_clients / elapsed if elapsed else 0
         print(
-            f"  total: {cfg.total_clients} client queries / "
-            f"{elapsed:.1f}s = {total_qps:.2f} qps"
+            f"  client queries:  {cfg.total_clients} in {elapsed:.1f}s "
+            f"= {qps_client:.2f} client-qps  "
+            f"(post-coalescing actual KataGo work below)"
         )
-        # Per-upstream throughput: dispatches per upstream / elapsed.
-        print("  per-upstream (dispatches / elapsed):")
+        print(
+            f"  total visits:    {total_visits:,} in {elapsed:.1f}s "
+            f"= {vps_total:,.0f} visits/sec  "
+            f"(actual GPU work delivered)"
+        )
+        print("  per-upstream visits/sec (achieved):")
         for url in cfg.upstreams:
-            count = per_upstream.get(url, 0)
-            qps = count / elapsed if elapsed else 0
-            print(f"    {url}:  {qps:.2f} qps")
+            v = per_upstream_visits.get(url, 0)
+            vps = v / elapsed if elapsed else 0
+            print(f"    {url}:  {v:>10,} visits  =  {vps:>7,.0f} v/s")
 
         # PASS/FAIL CHECKS
         print("\n--- Sanity checks ---")
@@ -748,6 +869,55 @@ async def run_scenario() -> bool:
                 f"  ok: subscribes == dispatches ({len(subscribes)}); "
                 f"every new canonical was dispatched once"
             )
+
+        # JSON OUTPUT — write everything the plotting / analysis side
+        # needs so a single run dir is self-contained.
+        summary_path = log_dir / "summary.json"
+        summary = {
+            "config": {
+                "upstreams": list(cfg.upstreams),
+                "hot_positions": cfg.hot_positions,
+                "clients_per_hot": cfg.clients_per_hot,
+                "distinct_queries": cfg.distinct_queries,
+                "concurrency": cfg.concurrency,
+                "max_load": cfg.max_load,
+                "hot_visits": cfg.hot_visits,
+                "visit_dist": list(cfg.visit_dist),
+                "visit_dist_name": cfg.visit_dist_name,
+                "rng_seed": cfg.rng_seed,
+            },
+            "elapsed_sec": elapsed,
+            "queries": [r.to_dict() for r in all_results],
+            "events": {
+                "subscribes": subscribes,
+                "coalesces": coalesces,
+                "dispatches": dispatches,
+                "completes": completes,
+            },
+            "cid_to_upstream": cid_to_upstream,
+            "summary_stats": {
+                "subscribes": len(subscribes),
+                "coalesces": len(coalesces),
+                "dispatches": len(dispatches),
+                "completes": len(completes),
+                "coalesce_rate": (
+                    len(coalesces) / total_client_subs
+                    if total_client_subs else 0
+                ),
+                "fallback_count": fallback_count,
+                "fallback_rate": (
+                    fallback_count / total_disp if total_disp else 0
+                ),
+                "per_upstream_dispatch_count": dict(per_upstream),
+                "per_upstream_peak_in_flight": peak,
+                "total_visits_achieved": total_visits,
+                "per_upstream_visits_achieved": dict(per_upstream_visits),
+                "visits_per_sec_total": vps_total,
+                "client_qps": qps_client,
+            },
+        }
+        summary_path.write_text(json.dumps(summary, indent=2))
+        print(f"\nsummary JSON written to: {summary_path}")
 
         return success
 
