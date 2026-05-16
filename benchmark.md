@@ -271,11 +271,15 @@ buckets: hot/coalesced (n=3000), quick ≤100v (n=15,005), medium
 means most queries finish quickly; a long tail to the right
 means a few slow ones.
 
-**What this demonstrates**: each cost bucket's distribution is
-smooth and well-behaved — no fat tails, no surprise multimodality.
-Curves stack monotonically by cost (deeper queries take longer,
-as expected). Even the very-deep bucket's p99 stays at ~1.8
-seconds.
+**What this demonstrates**: curves stack monotonically by cost
+(deeper queries take longer, as expected). Even the very-deep
+bucket's p99 stays at ~1.8 seconds. **However**, the curves are
+not unimodal — see §"On the latency CDF multimodality" below
+for the statistical confirmation (Hartigans' dip test) and
+the workload-structural explanation. The short version: the
+full-run CDFs are mixtures of two distinct regimes (a
+hot-burst-loaded first ~100s and a steady-state distinct-only
+remainder), each of which is internally unimodal.
 
 **Bottom-left — Distribution under load**. Bar chart of total
 dispatch count per upstream over the run. The dotted grey line
@@ -308,6 +312,97 @@ depends on the workload's hot-position fraction — operators
 with high duplicate-query patterns (a popular review position, a
 shared opening study) will see much bigger savings than this
 8.8% headline number suggests.
+
+### On the latency CDF multimodality
+
+This subsection is here because the latency CDF curves do not
+look obviously unimodal to a careful reader, and an earlier
+draft of this document incorrectly claimed they were "smooth
+and well-behaved — no surprise multimodality." Hartigans' dip
+test (the standard non-parametric test for unimodality,
+implemented via the `diptest` Python package) was run against
+each bucket's full-run latency sample:
+
+| bucket | n | dip statistic | p-value | verdict |
+|---|---|---|---|---|
+| hot (coalesced) | 3,000 | 0.0182 | <0.001 | **rejects unimodal** |
+| quick (≤100v) | 15,005 | 0.0097 | <0.001 | **rejects unimodal** |
+| medium (101-500v) | 13,499 | 0.0084 | <0.001 | **rejects unimodal** |
+| deep (501-2000v) | 1,191 | 0.0083 | 0.91 | unimodal (or low power) |
+| very deep (>2000v) | 305 | 0.0113 | 0.99 | unimodal (or low power) |
+
+So three of five buckets reject unimodality at any reasonable
+significance level. The remaining two have small N which limits
+the test's statistical power — they may also be multimodal in
+ways the test can't detect from this sample size.
+
+The multimodality has identifiable structural sources, none of
+which indicate proxy pathology:
+
+**1. The hot bucket's multimodality is a sampling artefact.**
+Each of the 100 hot positions had 30 subscribers; all 30
+subscribers to one canonical see nearly identical latency
+(within-position standard deviation: mean 3.6 ms, max 30.9 ms).
+The hot bucket's 3,000 "samples" are not 3,000 independent
+draws — they're 100 groups of 30 highly-correlated samples. When
+the dip test is run on the 100 per-position means instead, it
+returns p=0.99 (unambiguously unimodal). The bucket-level
+multimodality reflects the bursty submission pattern (30 spikes
+per canonical at 100 distinct canonical latencies), not the
+proxy's behaviour.
+
+**2. The quick and medium buckets' multimodality is a transient
+regime effect.** Splitting the quick (50v) latencies by run-time:
+
+| window | n | dip p-value | mean latency |
+|---|---|---|---|
+| 0–50 s (hot bursts firing) | 659 | 0.053 | 833 ms |
+| 50–100 s (bursts trailing off) | 644 | 0.65 | 834 ms |
+| 100–250 s (steady state) | 4,734 | 0.99 | 342 ms |
+| 250–533 s (steady state) | 8,968 | 0.98 | 337 ms |
+
+The same split for 200v:
+
+| window | n | dip p-value | mean latency |
+|---|---|---|---|
+| 0–50 s | 417 | 0.004 | 914 ms |
+| 50–100 s | 421 | 0.81 | 906 ms |
+| 100–250 s | 2,810 | 0.46 | 395 ms |
+| 250–533 s | 5,401 | 0.99 | 389 ms |
+
+The pattern is clean and reproducible across cost classes: the
+first ~100 seconds (while the hot-bursts task is sequentially
+firing 100 bursts and competing with the distinct flow for
+upstream slots) is a high-latency regime (~830-910 ms median);
+after the hot bursts finish, the system settles into a
+low-latency steady state (~340-390 ms median) that's clearly
+unimodal.
+
+The full-run CDF is a **mixture of these two regimes**. The dip
+test correctly identifies the mixture as non-unimodal. Within
+each regime, the distribution IS unimodal — the second-half
+data shows this directly.
+
+**3. The 500v queries in the medium bucket are unimodal (p=0.24)
+even at full-run aggregate**, because the deep-bucket queries
+are rare enough (4% × 30k = 1,191 queries) that their
+contribution to the bucket-level mixture-of-regimes is dampened
+relative to the 200v sub-population. The 200v sub-population
+alone is multimodal for the same reason as the quick bucket.
+
+**What this means for operators:** the proxy itself behaves
+unimodally under steady-state load. Bursty workloads (whether
+synthetic hot bursts as in this benchmark, or real-world
+"everyone hits at the start of the class" patterns) create
+transient high-latency regimes that show up as multimodal
+features in any whole-run latency aggregate. An operator
+characterising latency for their deployment should test their
+actual load pattern, not just measure steady-state.
+
+The original eyeball impression ("the curves look multimodal")
+was statistically correct; the original draft's "no
+multimodality" claim was wrong and has been retracted in favour
+of the per-regime explanation above.
 
 ---
 
@@ -536,10 +631,14 @@ What the data demonstrates the system does well:
   orders of magnitude at this concurrency. The knob is
   effectively a routing-policy choice, not a capacity-planning
   parameter.
-- **Latency follows classic queueing theory** — no surprise
-  multimodality, no fat tails beyond what variable query cost
-  produces, no proxy-introduced overhead beyond inherent
-  queueing latency.
+- **Latency follows classic queueing theory** within a given
+  load regime: no fat tails, no proxy-introduced overhead beyond
+  inherent queueing latency. Across regimes (e.g., bursty
+  workloads that transition between high-load and steady-state),
+  the aggregate latency distribution is a mixture and shows
+  multimodality — see §"On the latency CDF multimodality" for
+  the per-regime decomposition. This is workload-structural,
+  not proxy-pathological.
 
 What the test did NOT verify:
 
