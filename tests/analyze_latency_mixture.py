@@ -61,10 +61,17 @@ import numpy as np
 
 
 def _load(run_dir: Path) -> Dict[str, Any]:
+    """Load summary.json from a run dir; falls back to summary.json.gz
+    so the committed benchmark/data/ archives work transparently."""
     p = run_dir / "summary.json"
-    if not p.exists():
-        raise FileNotFoundError(f"{p} not found")
-    return cast(Dict[str, Any], json.loads(p.read_text()))
+    if p.exists():
+        return cast(Dict[str, Any], json.loads(p.read_text()))
+    pgz = run_dir / "summary.json.gz"
+    if pgz.exists():
+        import gzip
+        with gzip.open(pgz, "rt") as f:
+            return cast(Dict[str, Any], json.load(f))
+    raise FileNotFoundError(f"neither {p} nor {pgz} found")
 
 
 def _distinct_lats(
