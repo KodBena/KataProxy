@@ -508,9 +508,11 @@ class AdaptiveState:
         *,
         worst_pairs: Optional[list[tuple[Color, MoveIndex]]] = None,
         deepening_turns: set[TurnIndex],
+        worst_selector_value: Optional[float] = None,
     ) -> None:
-        """Finalize a round: increment round counters and update
-        per-unit deepened counts.
+        """Finalize a round: increment round counters, update per-unit
+        deepened counts, and populate framework-default metric
+        trajectories.
 
         For move-axis rounds: pass `worst_pairs` (the move-level
         worst-set before window expansion) to update per-move
@@ -522,9 +524,19 @@ class AdaptiveState:
         per-turn deepened counts and to record the round's deepening
         set for jaccard-style trajectories.
 
-        Framework-default metric trajectories (worst_selector_value,
-        worst_set_jaccard_to_previous) are populated here in
-        commit 5.
+        `worst_selector_value` is the minimum selector value across
+        this round's worst-set entries (None if not provided —
+        unit-level callers that don't compute scores can omit it).
+        Appended to `_metric_trajectories["worst_selector_value"]`
+        for convergence checks.
+
+        `_metric_trajectories["worst_set_jaccard_to_previous"]` is
+        populated from round 2 onwards (Jaccard similarity of this
+        round's `deepening_turns` against the prior round's). Round
+        1 has no previous round, so the trajectory grows from round
+        2; convergence checks against this metric with lookback=1
+        thus require at least 3 rounds to fire (2 jaccard entries
+        needed for a single delta).
         """
         self.rounds_completed += 1
         self._round_deepen_sets.append(set(deepening_turns))
@@ -537,6 +549,19 @@ class AdaptiveState:
                 self._deepened_counts_move[(color, m)] = (
                     self._deepened_counts_move.get((color, m), 0) + 1
                 )
+        if worst_selector_value is not None:
+            self._metric_trajectories.setdefault(
+                "worst_selector_value", [],
+            ).append(worst_selector_value)
+        if len(self._round_deepen_sets) >= 2:
+            prev_set = self._round_deepen_sets[-2]
+            curr_set = self._round_deepen_sets[-1]
+            union = prev_set | curr_set
+            inter = prev_set & curr_set
+            jaccard = (len(inter) / len(union)) if union else 1.0
+            self._metric_trajectories.setdefault(
+                "worst_set_jaccard_to_previous", [],
+            ).append(jaccard)
 
     def record_visits(self, visits: int) -> None:
         """Increment `total_visits_spent` by this round's deeper-query
@@ -1412,11 +1437,16 @@ def _dispatch_deepening_round(
     analysis_config: Optional[dict[str, Any]],
     window_size: int,
     all_turns: set[TurnIndex],
-) -> tuple[set[TurnIndex], Optional[list[tuple[Color, MoveIndex]]]]:
+) -> tuple[
+    set[TurnIndex],
+    Optional[list[tuple[Color, MoveIndex]]],
+    Optional[float],
+]:
     """Run one round's select-and-deepen dispatch against the current
-    state and return the deepening turn-set + move-level worst-set.
+    state and return the deepening turn-set + move-level worst-set
+    + worst-set's minimum selector value.
 
-    Returns (deepening_turns, worst_pairs):
+    Returns (deepening_turns, worst_pairs, worst_selector_value):
       - deepening_turns: the set of turns to deepen this round
         (after window expansion for move-axis; identity-with-
         all_turns-mask for turn-axis).
@@ -1424,6 +1454,11 @@ def _dispatch_deepening_round(
         window expansion); None for turn-axis. The caller passes
         worst_pairs to state.record_round to update per-move
         deepened counts.
+      - worst_selector_value: the minimum selector value across the
+        round's worst-set entries (worst-of-the-worst, lower=worse
+        convention). None when the worst-set is empty. Threaded into
+        state.record_round for the framework's `worst_selector_value`
+        metric trajectory.
 
     Side effect: records this round's per-unit scoring into state
     via state.record_round_scores_move/turn so subsequent rounds'
@@ -1454,10 +1489,15 @@ def _dispatch_deepening_round(
             ]
             worst_pairs = _apply_selection_policy_move(scored, cap_meta)
         state.record_round_scores_move(scored)
+        worst_pair_set = set(worst_pairs)
+        worst_value_move: Optional[float] = min(
+            (s for (c, m, s) in scored if (c, m) in worst_pair_set),
+            default=None,
+        )
         deepening = _expand_window_same_color(
             worst_pairs, all_turns, window_size,
         )
-        return deepening, worst_pairs
+        return deepening, worst_pairs, worst_value_move
 
     # axis == "turn" — user binding required (axis resolution enforces).
     assert user_selector is not None
@@ -1467,8 +1507,13 @@ def _dispatch_deepening_round(
     ]
     state.record_round_scores_turn(scored_t)
     worst_turns_list = _apply_selection_policy_turn(scored_t, cap_meta)
+    worst_turn_set = set(worst_turns_list)
+    worst_value_turn: Optional[float] = min(
+        (s for (t, s) in scored_t if t in worst_turn_set),
+        default=None,
+    )
     deepening = set(worst_turns_list) & all_turns
-    return deepening, None
+    return deepening, None, worst_value_turn
 
 
 def _dispatch_deepening_set(
@@ -1489,7 +1534,7 @@ def _dispatch_deepening_set(
     state = AdaptiveState()
     for f in finals:
         state.observe(f)
-    deepening, _ = _dispatch_deepening_round(
+    deepening, _worst_pairs, _worst_value = _dispatch_deepening_round(
         finals=finals,
         state=state,
         cap_meta=cap_meta,
@@ -1607,7 +1652,7 @@ def adaptive_reevaluate(
         # Termination: budget exhausted (any constraint) OR empty
         # worst-set ("no more adaptation warranted").
         while budget.has_capacity(state):
-            deepen, worst_pairs = _dispatch_deepening_round(
+            deepen, worst_pairs, worst_value = _dispatch_deepening_round(
                 finals=finals,
                 state=state,
                 cap_meta=cap_meta_for_dispatch,
@@ -1649,6 +1694,7 @@ def adaptive_reevaluate(
             state.record_round(
                 worst_pairs=worst_pairs,
                 deepening_turns=deepen,
+                worst_selector_value=worst_value,
             )
             state.record_visits(budget.visits_for_round())
 
