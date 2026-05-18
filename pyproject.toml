@@ -20,6 +20,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Phase 3.5 learned value-function (v1.0.26). The proxy still runs
+# without lightgbm; the learned-VF capability simply isn't advertised
+# in that case. Operators who want the proxy-hosted learned predictor
+# install with `pip install kataproxy[learned-vf]`.
+learned-vf = [
+    "lightgbm>=4.0",
+]
 # Development tooling.
 dev = [
     "pytest>=8.0",
