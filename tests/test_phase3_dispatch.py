@@ -507,7 +507,208 @@ class TestAllocationDriveDispatch:
 
 
 # ===========================================================================
-# 3. Eager include validation
+# 3. Finalization composition under Phase 3
+# ===========================================================================
+
+
+class TestPhase3FinalizationComposition:
+    """Pins the v1.0.24 finalization stage's composition with the
+    Phase 3 N-parallel-spawn dispatch. Per §6 of the roadmap, no code
+    change is expected — Phase 3's per-round observations land in
+    state.last_packet via state.observe, and finalization emits one
+    `is_during_search=False` per analyzed turn regardless of how many
+    spawn sources contributed.
+
+    Three properties:
+
+      - Multi-round Phase 3 (max_rounds=2): each round spawns its
+        own N parallel sub-queries; finalisation emits exactly one
+        auth per turn at end-of-loop.
+      - Latest-payload provenance ACROSS rounds: a turn deepened in
+        round 1 AND round 2 carries the round-2 payload in its
+        finalisation, not the round-1 payload.
+      - Mid-loop invariant under Phase 3: previews stream during the
+        loop; no authoritatives until all rounds complete.
+    """
+
+    @pytest.mark.asyncio
+    async def test_multi_round_phase3_emits_one_auth_per_turn(self) -> None:
+        """Two rounds of Phase 3 dispatch; finalisation emits one
+        authoritative per analyzed turn."""
+        c, caps = _make_caps()
+        m = adaptive_reevaluate(window_size=1)()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1, 2, 3, 4, 5],
+            opaque={
+                "rules": "tromp-taylor", "komi": 7.5,
+                "boardXSize": 19, "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 100,
+                "capabilities": {"adaptive_reevaluate":
+                    _phase3_capabilities(extra_visits=300, max_rounds=2)},
+                "analysis_config": _phase3_analysis_config(expression="1.0"),
+            },
+        )
+        m.on_query(ClientId("eid-1"), q)
+
+        all_yields: List[Tuple[ClientId, KataGoResponse]] = []
+        for turn in range(6):
+            all_yields += await _drive(
+                m, ClientId("eid-1"),
+                _bad_final(0) if turn == 0 else _neutral_final(turn),
+            )
+
+        # Round 1: 3 parallel spawns; drive their finals.
+        assert await _wait_for_spawn_count(c, 3)
+        round1_spawns = list(c.submitted)
+        for spawn_oid, spawn_q in round1_spawns:
+            turn = int(spawn_q.analyze_turns[0])
+            all_yields += await _drive(
+                m, spawn_oid, _spawn_final(turn, marker="round1"),
+            )
+
+        # Round 2: another 3 parallel spawns (worst-set stable under
+        # constant value_fn → same candidates).
+        assert await _wait_for_spawn_count(c, 6)
+        round2_spawns = c.submitted[len(round1_spawns):]
+        for spawn_oid, spawn_q in round2_spawns:
+            turn = int(spawn_q.analyze_turns[0])
+            all_yields += await _drive(
+                m, spawn_oid, _spawn_final(turn, marker="round2"),
+            )
+
+        all_yields += await _settle_and_drain(m, ClientId("eid-1"))
+
+        # Finalisation invariant: exactly one auth per turn.
+        auths = [
+            r for _, r in all_yields
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        ]
+        auth_turns = sorted(r.turn_number for r in auths)
+        assert auth_turns == [0, 1, 2, 3, 4, 5], (
+            f"multi-round Phase 3 should emit one auth per turn at end-of-"
+            f"loop; got auth_turns={auth_turns}"
+        )
+
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_finalization_payload_is_latest_observed(self) -> None:
+        """A turn deepened in round 1 AND round 2 carries round 2's
+        payload in finalisation — `state.observe` overwrites
+        `last_packet` on each call, so the latest spawn's response
+        wins."""
+        c, caps = _make_caps()
+        m = adaptive_reevaluate(window_size=1)()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1, 2, 3, 4, 5],
+            opaque={
+                "rules": "tromp-taylor", "komi": 7.5,
+                "boardXSize": 19, "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 100,
+                "capabilities": {"adaptive_reevaluate":
+                    _phase3_capabilities(extra_visits=300, max_rounds=2)},
+                "analysis_config": _phase3_analysis_config(expression="1.0"),
+            },
+        )
+        m.on_query(ClientId("eid-1"), q)
+
+        for turn in range(6):
+            await _drive(
+                m, ClientId("eid-1"),
+                _bad_final(0) if turn == 0 else _neutral_final(turn),
+            )
+
+        # Round 1: drive spawn finals with marker="round1".
+        assert await _wait_for_spawn_count(c, 3)
+        for spawn_oid, spawn_q in list(c.submitted):
+            turn = int(spawn_q.analyze_turns[0])
+            await _drive(
+                m, spawn_oid, _spawn_final(turn, marker="round1"),
+            )
+
+        # Round 2: drive spawn finals with marker="round2".
+        assert await _wait_for_spawn_count(c, 6)
+        for spawn_oid, spawn_q in c.submitted[3:]:
+            turn = int(spawn_q.analyze_turns[0])
+            await _drive(
+                m, spawn_oid, _spawn_final(turn, marker="round2"),
+            )
+
+        finalisation = await _settle_and_drain(m, ClientId("eid-1"))
+        auths = {
+            r.turn_number: r for _, r in finalisation
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        }
+        # Deepened turns (0, 1, 2) carry the round-2 marker; non-
+        # deepened turns (3, 4, 5) carry the original (no marker).
+        for turn in (0, 1, 2):
+            assert auths[turn].opaque.get("marker") == "round2", (
+                f"turn {turn}'s finalisation should carry the latest "
+                f"round's payload (round2); got {auths[turn].opaque}"
+            )
+        for turn in (3, 4, 5):
+            assert "marker" not in auths[turn].opaque
+
+        m.on_session_end()
+
+    @pytest.mark.asyncio
+    async def test_mid_loop_emits_only_previews_under_phase3(self) -> None:
+        """v1.0.24's mid-loop invariant carries through Phase 3:
+        while the multi-round loop is in flight, every emission is
+        a preview; authoritative emissions occur only at end-of-loop
+        finalisation."""
+        c, caps = _make_caps()
+        m = adaptive_reevaluate(window_size=1)()
+        m.on_session_start(caps)
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=[0, 1, 2, 3, 4, 5],
+            opaque={
+                "rules": "tromp-taylor", "komi": 7.5,
+                "boardXSize": 19, "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 100,
+                "capabilities": {"adaptive_reevaluate":
+                    _phase3_capabilities(extra_visits=300, max_rounds=2)},
+                "analysis_config": _phase3_analysis_config(expression="1.0"),
+            },
+        )
+        m.on_query(ClientId("eid-1"), q)
+
+        pre_finalisation_yields: List[Tuple[ClientId, KataGoResponse]] = []
+        for turn in range(6):
+            pre_finalisation_yields += await _drive(
+                m, ClientId("eid-1"),
+                _bad_final(0) if turn == 0 else _neutral_final(turn),
+            )
+        # Drive round-1 spawn finals only — round 2 hasn't started
+        # yet.
+        assert await _wait_for_spawn_count(c, 3)
+        for spawn_oid, spawn_q in list(c.submitted):
+            turn = int(spawn_q.analyze_turns[0])
+            pre_finalisation_yields += await _drive(
+                m, spawn_oid, _spawn_final(turn, marker="round1"),
+            )
+
+        # At this point the loop should be poised to enter round 2
+        # (max_rounds=2 still has capacity). No authoritatives yet.
+        auth_emissions = [
+            r for _, r in pre_finalisation_yields
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        ]
+        assert auth_emissions == [], (
+            f"mid-loop should emit only previews under Phase 3; got "
+            f"{len(auth_emissions)} authoritative(s) before finalisation"
+        )
+
+        m.on_session_end()
+
+
+# ===========================================================================
+# 4. Eager include validation
 # ===========================================================================
 
 
