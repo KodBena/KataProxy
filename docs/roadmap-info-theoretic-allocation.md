@@ -502,6 +502,286 @@ those 10. The per-candidate average is `budget / 10` visits —
 this is the relevant comparison to v1.0.24's uniform-extras
 shape.
 
+### 3.6 KataGo field grounding — what the response actually carries
+
+The substrate sketched in §§3.1-3.5 is abstract: a value function
+returns a per-turn scalar; a visit-scaling model returns expected
+gain from V extra visits. Both interfaces consume a `TurnView`
+whose `packet` field is the latest KataGo `AnalyzeResponse` for
+that turn. This section pins down what information that packet
+actually carries — what fields are available, which are
+opt-in-gated, and how they ground concrete value functions and
+visit-scaling models.
+
+The data here was collected by submitting a probe analysis (one
+SGF, four turns, `maxVisits=200`, every information-rich optional
+field enabled) against a live KataGo SELECTOR. Field shapes are
+recorded verbatim from the response.
+
+#### 3.6.1 Field census
+
+The response is a dict with five top-level information-bearing
+keys, gated by per-query opt-in flags. Quantities marked
+**always-on** ship without opt-in; **opt-in** require the named
+field on the parent query.
+
+```
+rootInfo  (always-on, ~18 keys)
+  currentPlayer            str        "B" | "W"
+  winrate                  float      Post-search winrate estimate.
+  rawWinrate               float      Pre-search (NN one-shot) winrate.
+  scoreLead                float      Post-search expected score margin.
+  rawLead                  float      Pre-search expected lead.
+  scoreSelfplay            float      Score-from-selfplay-utility.
+  rawScoreSelfplay         float      Pre-search version.
+  scoreStdev               float      Post-search score standard deviation.
+  rawScoreSelfplayStdev    float      Pre-search score stdev (NN's own SE).
+  rawStScoreError          float      NN's one-shot score-estimate SE.
+  rawStWrError             float      NN's one-shot winrate-estimate SE.
+  rawNoResultValue         float      Pre-search no-result probability.
+  rawVarTimeLeft           float      Expected game length variance.
+  utility                  float      Composite KataGo utility.
+  utilityLcb               float      LCB on utility.
+  visits                   int        Total visits this position got.
+  weight                   float      Aggregated visit-weight (soft).
+  symHash, thisHash        str        For transposition-equivalence checks.
+
+moveInfos  (always-on, list[dict], one per candidate move)
+  move                     str        GTP-style (e.g. "Q16", "pass").
+  order                    int        Rank by playSelectionValue (0=best).
+  prior                    float      NN policy prior for this move.
+  visits / edgeVisits      int        Visits / weighted-edge visits.
+  weight / edgeWeight      float      Soft visit aggregates.
+  playSelectionValue       float      KataGo's own move-selection score.
+  winrate / scoreLead      float      Searched estimates for this move.
+  scoreMean / scoreStdev   float      Per-move score moments.
+  scoreSelfplay            float      Selfplay-utility score.
+  utility / utilityLcb     float      Composite utility + LCB.
+  lcb                      float      Winrate LCB.
+  noResultValue            float      No-result probability under this move.
+  pv                       list[str]  Principal variation, up to ~6 moves.
+  pvVisits / pvEdgeVisits  list[int]  Visit counts at each PV depth.
+  ownership                list[361]  Opt-in via includeMovesOwnership.
+  ownershipStdev           list[361]  Opt-in via includeMovesOwnershipStdev.
+
+ownership          (opt-in: includeOwnership)
+  list[float, 361]            Per-board-point E[ownership in [-1, +1]].
+
+ownershipStdev     (opt-in: includeOwnershipStdev)
+  list[float, 361]            Per-board-point search-pooled stdev.
+
+policy             (opt-in: includePolicy)
+  list[float, 362]            NN raw policy distribution (361 board + pass).
+```
+
+The probe's observed numerics at turn 0 of a 19×19 game,
+`maxVisits=200`:
+
+```
+rootInfo.scoreStdev               = 14.53     (post-search)
+rootInfo.rawScoreSelfplayStdev    = 16.03     (pre-search, NN one-shot)
+rootInfo.rawStScoreError          = 0.63      (NN's own SE estimate)
+rootInfo.winrate                  = 0.5215
+rootInfo.rawWinrate               = 0.5188
+rootInfo.visits                   = 215       (KataGo overshoots maxVisits)
+ownershipStdev                    sum=36.99, mean=0.103, max=0.54  (361 points)
+policy                            len=362, Shannon entropy = 4.19 bits
+moveInfos                         len=362, top-4 visits = [43, 43, 43, 43]
+moveInfos[0].pvVisits             = [43, 19, 7, 3, 2, 1]
+```
+
+The visit distribution at turn 0 is unusual (the four corner
+moves are symmetric under board hash, so visits split exactly
+evenly across them — verifiable via `symHash == thisHash` and
+the `pv` first-move pattern). Real mid-game turns produce more
+skewed distributions; the substrate handles both.
+
+#### 3.6.2 Concrete value-function expressions
+
+Three natural information measures the user can author against
+KataGo's field surface:
+
+**(a) Policy entropy** — `H(policy)` over the 362-dim distribution.
+Directly answers "is the NN uncertain about the best move?"
+
+```yaml
+bindings:
+  value_fn: policy_entropy
+symbols:
+  policy_entropy: |
+    sum([-p * log2(p) for p in extra.policy if p > 0])
+```
+
+Requires `includePolicy=true` on the parent query. Cheap to
+compute; the 362-float list adds ~3KB per turn to the response.
+
+**(b) Total ownership uncertainty** — sum of per-point stdev.
+Answers "how unresolved is the territorial picture?"
+
+```yaml
+bindings:
+  value_fn: ownership_total_uncertainty
+symbols:
+  ownership_total_uncertainty: |
+    sum(extra.ownershipStdev)
+```
+
+Requires `includeOwnership=true` and `includeOwnershipStdev=true`.
+Same byte cost as policy_entropy (~3KB per turn for the stdev
+list).
+
+**(c) LCB-spread top-K** — variance of the top-K candidates'
+`utilityLcb` values. Answers "do the top candidates disagree on
+who's best?"
+
+```yaml
+bindings:
+  value_fn: top5_lcb_spread
+symbols:
+  top5_lcb_spread: |
+    max(m.utilityLcb for m in moveInfos[:5])
+      - min(m.utilityLcb for m in moveInfos[:5])
+```
+
+Always-on (no opt-in needed). The classic decision-uncertainty
+proxy; this is also what informs the v1.0.23 default selector's
+intuition.
+
+Composite value functions naturally combine these:
+
+```yaml
+bindings:
+  value_fn: composite_uncertainty
+symbols:
+  composite_uncertainty: |
+    0.5 * sum([-p * log2(p) for p in extra.policy if p > 0])
+      + 0.3 * sum(extra.ownershipStdev) / 361
+      + 0.2 * (max(m.utilityLcb for m in moveInfos[:5])
+              - min(m.utilityLcb for m in moveInfos[:5]))
+```
+
+The proxy substrate doesn't prescribe which measure to use —
+each captures a different facet of "what does the user want
+clarified." The user authoring against their workflow names the
+relevant blend.
+
+#### 3.6.3 Concrete visit-scaling model grounding
+
+The naive `monte_carlo_sqrt` model from §3.1 uses `1/√V` scaling
+with an unspecified prefactor. KataGo's response gives that
+prefactor empirically: `rootInfo.scoreStdev` is the
+search-aggregated stdev at the current visit count. The natural
+visit-scaling model is then:
+
+```
+gain(turn, V_current, V_extra)
+  = packet.rootInfo.scoreStdev * (1/√V_current − 1/√(V_current + V_extra))
+```
+
+Translation: the stdev *across MCTS samples* at the current
+position is `scoreStdev`; the standard error of the mean (the
+proxy's actual handle on "where this turn's score will settle")
+scales as `scoreStdev / √V`. Adding `V_extra` reduces the SEM
+from `scoreStdev/√V_current` to `scoreStdev/√(V_current + V_extra)`;
+the gain is the difference.
+
+This is **`monte_carlo_sqrt` parametrised per-turn from KataGo's
+own variance estimate** — no calibration arc needed, no
+empirical curve-fit. The substrate ships this as the curated
+`monte_carlo_sqrt` model's implementation.
+
+A secondary anchor: `rootInfo.rawStScoreError` (the NN's
+one-shot pre-search SE) provides the V=1 baseline. Comparing
+`scoreStdev/√V_current` against `rawStScoreError` tells the
+operator whether the search has already reduced variance below
+the NN-prior baseline (the typical state for any well-searched
+position) — informative for diagnostics but not directly needed
+by the model.
+
+The ownership analogue: `ownershipStdev` per-point also scales
+as 1/√V. A territory-uncertainty-oriented visit-scaling model
+sums per-point variance reduction:
+
+```
+gain(turn, V_current, V_extra)
+  = sum(packet.ownershipStdev) * (1/√V_current − 1/√(V_current + V_extra))
+```
+
+Same shape; the prefactor is the integrated ownership stdev
+instead of `scoreStdev`. Useful when the user's value function
+is ownership-driven (case (b) above) — the prefactor matches
+the value-function units.
+
+The substrate ships **`monte_carlo_sqrt`** (with `scoreStdev`
+prefactor; the default) and **`diminishing_returns_log`** (the
+non-`1/√V` baseline for sanity-checking). A future research arc
+calibrates an empirical model against the gap between
+`scoreStdev/√V_current` and the actual fluctuation observed
+when V is bumped to `V_current + V_extra` — this is the kind of
+question the substrate makes answerable but doesn't itself answer.
+
+#### 3.6.4 Wire-shape implications
+
+The optional `include*` flags are KataGo-native — they pass
+through the proxy unchanged via the existing wire-shape strip
+mechanics. The Phase 3 substrate doesn't need to introduce
+proxy-side equivalents; it just consumes the fields when present.
+
+But: **a value function authored against an opt-in field requires
+the parent query to opt in.** A `value_fn` reading
+`extra.ownershipStdev` against a query without
+`includeOwnershipStdev=true` produces a runtime error in the
+binding evaluation. Two design options for handling this:
+
+- **Cheap option** — let the binding fail at evaluation time;
+  the failure surfaces via the registry interpreter's own error
+  path.
+- **Eager option** — at `_is_phase3_engaged` check time, parse
+  the value-function expression for field references and verify
+  the parent query's opt-in flags match. Refuse with
+  `AdaptiveConfigurationError(code="allocation_invalid",
+  detail={"missing_includes": [...]})` if not.
+
+The eager option matches the cost-asymmetry calibration (§7) —
+better to refuse at construction with a structured error than
+to spawn a multi-round adaptive run that fails on the first
+round's value evaluation. **The roadmap prescribes the eager
+option** (commit 5's `_is_phase3_engaged` validation gains
+this check); it's a substrate decision worth pinning in the
+design phase.
+
+The cost of opt-in is non-trivial: `includeMovesOwnership` adds
+`361 * len(moveInfos)` floats per response — at a typical
+`maxVisits=1000` with 60-80 candidate moves, this is ~25K
+floats ≈ 200KB per turn. Range queries multiply by N turns;
+multi-round multiplies again by K rounds. The user opting into
+`includeMovesOwnership` is opting into a real per-query byte
+cost. The substrate doesn't enforce a budget on this (KataGo's
+own protocol does the work); the roadmap surfaces the cost as
+a documentation note rather than a substrate restriction.
+
+#### 3.6.5 Summary — fields the substrate consumes
+
+For the canonical Phase 3 path (the three plug points operating
+on `TurnView.packet`):
+
+- **Visit-scaling model** consumes
+  `packet.rootInfo.scoreStdev` (or `ownershipStdev` sum,
+  depending on the model), `packet.rootInfo.visits` (current
+  visit count anchor).
+- **Value function** consumes whatever fields its
+  user-authored expression names — typically `policy`,
+  `ownershipStdev`, `moveInfos[*].utilityLcb`,
+  `moveInfos[*].prior`, or `rootInfo.scoreStdev`.
+- **Allocation algorithm** is field-agnostic — it consumes only
+  the model + value function outputs.
+
+The substrate is field-aware only at the visit-scaling-model
+implementation level and at the eager-validation step in
+`_is_phase3_engaged`. The `AllocationAlgorithm` Protocol stays
+agnostic; user-authored value functions are free to read any
+field the parent query has opted into.
+
 ---
 
 ## 4. Wire shape
@@ -1111,6 +1391,52 @@ emission from any source.
 **Alternative:** Coalesce per-turn previews — only emit the
 latest preview per turn, suppressing intermediate updates.
 Adds buffering; v1.0.20's "no buffering" discipline forbids.
+
+### 11.10 Eager vs lazy field-availability checks
+
+**Question:** Should the substrate parse the user's value-function
+expression at engagement time and verify that the parent query's
+`include*` flags match the fields the expression reads
+(eager), or let the binding evaluation fail at first use
+(lazy)?
+
+**Proposed default:** Eager. The cost-asymmetry argument (§7)
+applies — a malformed Phase 3 configuration can burn many
+rounds × many candidates of compute before lazy evaluation
+surfaces the issue. Eager validation matches v1.0.23's
+`AdaptiveConfigurationError` discipline.
+
+**Alternative:** Lazy. Simpler substrate (no expression parsing);
+defers field-reference detection to the user's authoring
+discipline.
+
+The §3.6.4 prose currently prescribes eager; this open question
+makes the choice explicit for user review.
+
+### 11.11 Visit-scaling model — `scoreStdev` prefactor vs constant
+
+**Question:** Should `monte_carlo_sqrt` use
+`packet.rootInfo.scoreStdev` as its prefactor (per-turn
+empirical, per §3.6.3), or a constant magnitude prefactor
+(value-function-relative)?
+
+**Proposed default:** `scoreStdev` prefactor. The natural
+empirical grounding from KataGo's own variance estimate; means
+the value-function output is in score-equivalent units.
+
+**Alternative:** Constant prefactor (e.g., 1.0). The
+visit-scaling model's output becomes a dimensionless gain factor
+that the allocation algorithm scales by the value function. The
+total EIG units become value-function-dependent (whatever the
+user's expression returns). More flexibility for unusual
+value-function units (e.g., bit-valued policy entropy) at the
+cost of less-natural empirical grounding.
+
+If `monte_carlo_sqrt` consumes `scoreStdev`, users with
+information-theoretic value functions (e.g., policy entropy in
+bits) get a mixed-units EIG. Workable — the allocation
+algorithm consumes ratios, not absolutes — but worth being
+explicit about.
 
 ---
 
