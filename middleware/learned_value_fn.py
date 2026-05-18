@@ -65,7 +65,13 @@ try:
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
-    lgb = None  # type: ignore[assignment]
+    # `assignment` if lightgbm is installed (lgb has the module type;
+    # assigning None is a real type error worth silencing). `unused-
+    # ignore` for CI where lightgbm isn't installed under the
+    # `[dev]` extras — `ignore_missing_imports` makes lgb `Any` and
+    # the assignment is fine without the ignore. The combined pragma
+    # silences both cases regardless of which environment mypy runs in.
+    lgb = None  # type: ignore[assignment, unused-ignore]
 
 
 # ---------------------------------------------------------------------------

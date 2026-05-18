@@ -1227,7 +1227,7 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
     # no learned predictors; SPA hides the option. See
     # docs/dispatch/proxy-to-frontend-learned-vf.md for the wire shape.
     try:
-        from middleware.learned_value_fn import get_registry  # type: ignore[import-not-found]
+        from middleware.learned_value_fn import get_registry
         versions = get_registry().available_versions()
         if versions:
             advertised["adaptive_reevaluate"]["available_value_bindings"] = versions
