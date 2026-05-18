@@ -1221,6 +1221,21 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
         "delta_analysis": {},
         "adaptive_reevaluate": {},
     }
+    # v1.0.26 — enumerate proxy-hosted learned-VF versions for the SPA
+    # to discover and offer in its value-function dropdown. Empty
+    # (or absent if lightgbm isn't installed) means the proxy has
+    # no learned predictors; SPA hides the option. See
+    # docs/dispatch/proxy-to-frontend-learned-vf.md for the wire shape.
+    try:
+        from middleware.learned_value_fn import get_registry  # type: ignore[import-not-found]
+        versions = get_registry().available_versions()
+        if versions:
+            advertised["adaptive_reevaluate"]["available_value_bindings"] = versions
+    except Exception:
+        # Registry construction failure (e.g., directory permissions
+        # at startup) should not block server startup. The learned VF
+        # is simply unavailable for this run; advertisement omits it.
+        pass
     try:
         import go_transposition  # noqa: F401
         advertised["transposition"] = {}

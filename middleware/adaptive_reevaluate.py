@@ -1681,6 +1681,65 @@ def _engage_phase3(
     """
     algo = _parse_allocation_algorithm(cap_meta)
 
+    value_binding = cap_meta.get("value_binding")
+    if not isinstance(value_binding, str) or not value_binding:
+        raise AdaptiveConfigurationError(
+            code="allocation_invalid",
+            detail={
+                "value_binding": value_binding,
+                "expected": (
+                    "non-empty string naming a value_fn symbol in "
+                    "analysis_config.symbols, OR a `learned_*` "
+                    "proxy-hosted predictor name"
+                ),
+            },
+        )
+
+    # v1.0.26 — learned_* namespace bypasses the analysis_config /
+    # RegistryInterpreter lookup entirely. The value_fn is a
+    # proxy-hosted LightGBM predictor loaded at startup; the
+    # capability advertisement names available versions in
+    # query_version's adaptive_reevaluate.available_value_bindings.
+    if value_binding.startswith("learned_"):
+        from middleware.learned_value_fn import get_registry  # noqa: PLC0415
+        registry = get_registry()
+        predictor = registry.get(value_binding)
+        if predictor is None:
+            raise AdaptiveConfigurationError(
+                code="allocation_invalid",
+                detail={
+                    "value_binding": value_binding,
+                    "issue": (
+                        "proxy does not advertise this learned predictor; "
+                        "check query_version.capabilities."
+                        "adaptive_reevaluate.available_value_bindings"
+                    ),
+                    "available": registry.available_versions(),
+                },
+            )
+        # The learned VF must be paired with the learned_piecewise
+        # allocator. Single-VF algorithms can't use the predict_int
+        # side of the paired prediction.
+        algo_name = cap_meta.get("allocation_algorithm")
+        if algo_name != "learned_piecewise":
+            raise AdaptiveConfigurationError(
+                code="allocation_invalid",
+                detail={
+                    "value_binding": value_binding,
+                    "allocation_algorithm": algo_name,
+                    "issue": (
+                        "learned_* value bindings require "
+                        "allocation_algorithm: \"learned_piecewise\""
+                    ),
+                },
+            )
+        # visit_scaling_model is optional under learned_piecewise;
+        # accept whatever's there (or absent) for backward compat,
+        # but the allocator ignores it.
+        from middleware.visit_scaling import MonteCarloSqrtModel  # noqa: PLC0415
+        return algo, MonteCarloSqrtModel(), predictor
+
+    # Hand-crafted single-VF path (unchanged from v1.0.25).
     model_name = cap_meta.get("visit_scaling_model")
     if not isinstance(model_name, str) or not model_name:
         raise AdaptiveConfigurationError(
@@ -1692,19 +1751,6 @@ def _engage_phase3(
             },
         )
     model = _parse_visit_scaling_model(model_name)
-
-    value_binding = cap_meta.get("value_binding")
-    if not isinstance(value_binding, str) or not value_binding:
-        raise AdaptiveConfigurationError(
-            code="allocation_invalid",
-            detail={
-                "value_binding": value_binding,
-                "expected": (
-                    "non-empty string naming a value_fn symbol in "
-                    "analysis_config.symbols"
-                ),
-            },
-        )
 
     interp = _try_build_interpreter(analysis_config)
     if interp is None:

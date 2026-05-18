@@ -447,6 +447,7 @@ class TestParseAllocationAlgorithm:
         assert isinstance(valid, list)
         assert set(valid) == {
             "greedy_eig", "knowledge_gradient", "thompson_sampling", "ucb",
+            "learned_piecewise",
         }
 
     def test_missing_algorithm_name_raises(self) -> None:
@@ -532,5 +533,6 @@ class TestParseAllocationAlgorithm:
         names = _registered_algorithm_names()
         assert set(names) == {
             "greedy_eig", "knowledge_gradient", "thompson_sampling", "ucb",
+            "learned_piecewise",
         }
         assert names == sorted(names)

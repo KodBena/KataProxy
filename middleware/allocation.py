@@ -366,6 +366,153 @@ class UCBAlgorithm:
 
 
 # ---------------------------------------------------------------------------
+# learned_piecewise (v1.0.26 — paired-prediction allocator)
+# ---------------------------------------------------------------------------
+
+
+class LearnedPiecewiseAllocator:
+    """Segment-based water-fill allocator for paired-prediction value
+    functions (the Phase 3.5 learned VF).
+
+    Unlike the four single-VF algorithms above, this allocator requires
+    `value_fn` to be a `LearnedValueFn` instance (or any object
+    exposing both `__call__(turn_view) -> float` returning r_full
+    AND `predict_int(turn_view) -> float` returning r_int).
+    The substrate's dispatch enforces the pairing: this algorithm is
+    only resolved when `value_binding` starts with `learned_`.
+
+    Algorithm:
+
+      For each candidate turn t, the model predicts two info-gain
+      values:
+        r_int(t)  ≈ V=pre → V=intermediate entropy reduction
+        r_full(t) ≈ V=pre → V=oracle entropy reduction
+
+      These anchor a piecewise-linear curve with two segments:
+        seg1: slope = r_int(t) / V_int_extra,    cap = V_int_extra
+        seg2: slope = (r_full(t) − r_int(t)) / (V_full_extra − V_int_extra),
+              cap  = V_full_extra − V_int_extra
+
+      where V_int_extra and V_full_extra come from the model's
+      training metadata (default V_pre=200, V_int=1000, V_oracle=5000
+      → V_int_extra=800, V_full_extra=4800). These are exposed on the
+      `LearnedValueFn` instance.
+
+      Optimal allocation is global water-fill: collect all (turn,
+      segment) pieces, sort by slope desc, greedy-fill until the
+      budget is exhausted. Allocates fractional visits per piece;
+      discretises to integers preserving the budget sum.
+
+    No `visit_scaling_model` parameter; the piecewise curve is
+    empirically anchored at the model's two prediction points and
+    needs no parametric scaling assumption. The substrate accepts a
+    visit_scaling_model field for backward compatibility but ignores
+    it under this algorithm.
+    """
+
+    def allocate(
+        self,
+        candidates: list["TurnView"],
+        value_fn: ValueFn,
+        visit_scaling_model: "VisitScalingModel",
+        budget_visits: int,
+        rng: Optional[random.Random] = None,
+    ) -> Allocation:
+        if budget_visits <= 0 or not candidates:
+            return {}
+        # Duck-type the predict_int presence — the substrate's
+        # dispatch enforces this in the validation path, but a
+        # defensive check here surfaces test-bench misuse loudly.
+        predict_int = getattr(value_fn, "predict_int", None)
+        if predict_int is None:
+            raise TypeError(
+                "LearnedPiecewiseAllocator requires a value_fn with "
+                "a predict_int method (i.e., a LearnedValueFn). "
+                "Got: " + type(value_fn).__name__
+            )
+        # V_int_extra and V_full_extra from the model metadata, with
+        # defaults matching the Phase 3.5 training configuration.
+        v_int_extra = float(getattr(value_fn, "v_int_extra", 800))
+        v_full_extra = float(getattr(value_fn, "v_full_extra", 4800))
+        if v_int_extra <= 0 or v_full_extra <= v_int_extra:
+            # Defensive — metadata corruption would surface here.
+            return {}
+
+        # Call prepare() if the predictor exposes it (LearnedValueFn does).
+        # This pre-computes per-turn + range-level features once before
+        # the per-turn predictions.
+        prepare = getattr(value_fn, "prepare", None)
+        if prepare is not None:
+            prepare(candidates)
+
+        # Per-turn predictions.
+        r_full: dict[Any, float] = {c.turn_index: value_fn(c) for c in candidates}
+        r_int: dict[Any, float] = {c.turn_index: predict_int(c) for c in candidates}
+
+        # Build segments. Each entry: (slope, capacity, turn_index, seg_id).
+        segments: list[tuple[float, float, Any, int]] = []
+        for c in candidates:
+            t = c.turn_index
+            ri = max(0.0, r_int.get(t, 0.0))
+            rf = max(0.0, r_full.get(t, 0.0))
+            s1 = ri / v_int_extra
+            if s1 > 0:
+                segments.append((s1, v_int_extra, t, 1))
+            s2 = max(0.0, (rf - ri)) / max(1.0, v_full_extra - v_int_extra)
+            if s2 > 0:
+                segments.append(
+                    (s2, v_full_extra - v_int_extra, t, 2),
+                )
+        if not segments:
+            # All predictions zero (or negative); fall back to uniform.
+            return _uniform_fallback(candidates, budget_visits)
+
+        segments.sort(key=lambda x: -x[0])
+
+        # Greedy water-fill, accumulating per-turn fractional allocations.
+        per_turn_alloc: dict[Any, float] = {c.turn_index: 0.0 for c in candidates}
+        remaining = float(budget_visits)
+        for slope, cap, t, _seg_id in segments:
+            if remaining <= 0:
+                break
+            spend = min(cap, remaining)
+            per_turn_alloc[t] += spend
+            remaining -= spend
+
+        # Discretise while preserving the budget sum. Each per-turn
+        # allocation gets rounded down; the remainder is distributed
+        # to the turns with the largest fractional parts.
+        int_alloc: dict[Any, int] = {t: int(v) for t, v in per_turn_alloc.items()}
+        remainder = budget_visits - sum(int_alloc.values())
+        if remainder > 0:
+            frac_ordered = sorted(
+                per_turn_alloc.items(),
+                key=lambda kv: -(kv[1] - int_alloc[kv[0]]),
+            )
+            for t, _v in frac_ordered[:remainder]:
+                int_alloc[t] += 1
+        return _filter_positive(int_alloc)
+
+
+def _uniform_fallback(
+    candidates: list["TurnView"], budget_visits: int,
+) -> Allocation:
+    """Round-robin distribution when the learned predictor returns
+    all-zero outputs (rare but possible on positions the model is
+    very uncertain about). Mirrors v1.0.24's uniform-extras shape.
+    """
+    if not candidates or budget_visits <= 0:
+        return {}
+    n = len(candidates)
+    base = budget_visits // n
+    extra = budget_visits - base * n
+    alloc = {c.turn_index: base for c in candidates}
+    for c in candidates[:extra]:
+        alloc[c.turn_index] += 1
+    return _filter_positive(alloc)
+
+
+# ---------------------------------------------------------------------------
 # Curated registry + factory
 # ---------------------------------------------------------------------------
 
@@ -379,6 +526,10 @@ _REGISTERED_ALGORITHM_NAMES: frozenset[str] = frozenset({
     "knowledge_gradient",
     "thompson_sampling",
     "ucb",
+    # v1.0.26 — paired-prediction allocator for the learned VF.
+    # Requires `value_binding` to be a `learned_*` name; refuses
+    # otherwise (the substrate's dispatch enforces the pairing).
+    "learned_piecewise",
 })
 
 
@@ -387,6 +538,7 @@ _VALID_ALLOCATION_PARAM_FIELDS: dict[str, frozenset[str]] = {
     "knowledge_gradient": frozenset(),
     "thompson_sampling": frozenset({"ts_seed"}),
     "ucb": frozenset({"ucb_kappa"}),
+    "learned_piecewise": frozenset(),
 }
 
 
@@ -474,6 +626,8 @@ def _parse_allocation_algorithm(cap_meta: dict[str, Any]) -> AllocationAlgorithm
                 },
             )
         return UCBAlgorithm(kappa=float(kappa))
+    if name == "learned_piecewise":
+        return LearnedPiecewiseAllocator()
 
     # Defensive: reachable only if _REGISTERED_ALGORITHM_NAMES drifts
     # from the branch set above. The membership check at the top
