@@ -551,6 +551,393 @@ class AdaptiveState:
 
 
 # ---------------------------------------------------------------------------
+# Budget abstraction (v1.0.24 commit 2)
+#
+# Composable per-query budget with four constraint shapes:
+#   - max_rounds            (terminate after N rounds)
+#   - total_extra_visits    (terminate when cumulative deeper-query
+#                            extras exhaust)
+#   - wall_clock_seconds    (terminate after elapsed time)
+#   - convergence           (terminate when a named metric trajectory
+#                            stabilises per the four-form tolerance shape)
+#
+# Multiple constraints AND-compose: terminate when ANY exhausts. A
+# Budget consisting only of convergence (no compute cap) is valid —
+# the loop runs until the metric stabilises.
+#
+# Three context profiles (`review-tight`, `range-generous`,
+# `loop-aggressive`) provide named per-context tuning; resolved by
+# `_parse_budget` at coroutine entry. Per-query `extra_visits` overrides
+# `per_round_extra_visits` on profile lookup.
+#
+# Configuration-consistency refusal: `_parse_budget` raises
+# `AdaptiveConfigurationError(code="budget_invalid")` on malformed
+# input per §11.4's cost-asymmetry calibration.
+#
+# See docs/roadmap-multi-round-adaptation.md §3 for the full contract.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConvergenceCheck:
+    """Single tolerance-style convergence check on a named metric.
+
+    Four standard tolerance forms map to the (metric, scale,
+    lookback) tuple:
+      - Absolute on iterate: scale="absolute", metric=an iterate
+        trajectory.
+      - Relative on iterate: scale="relative".
+      - Absolute on objective: scale="absolute", metric=a named
+        objective trajectory.
+      - Patience (no improvement for N rounds): lookback=N,
+        metric=a best-observed trajectory.
+
+    `is_converged(state)` returns True when the metric's trajectory
+    has stabilised within `tolerance` over the last `lookback`
+    rounds. Returns False when the trajectory is too short to
+    evaluate (< lookback + 1 entries).
+    """
+
+    metric: str
+    tolerance: float
+    lookback: int = 1
+    scale: Literal["absolute", "relative"] = "absolute"
+
+    def is_converged(self, state: AdaptiveState) -> bool:
+        history = state.metric_trajectory(self.metric)
+        if len(history) < self.lookback + 1:
+            return False
+        current = history[-1]
+        prior = history[-1 - self.lookback]
+        delta = abs(current - prior)
+        if self.scale == "absolute":
+            return delta < self.tolerance
+        # scale == "relative"
+        return delta / max(abs(prior), 1e-9) < self.tolerance
+
+
+@dataclass(frozen=True)
+class CombinedConvergence:
+    """`all_of` / `any_of` combinator over multiple ConvergenceChecks.
+
+    `all_of`: converged when every check is converged.
+    `any_of`: converged when any check is converged.
+
+    Nested combinators (CombinedConvergence within CombinedConvergence)
+    are out of scope for v1.0.24; checks must be ConvergenceCheck.
+    """
+
+    mode: Literal["all_of", "any_of"]
+    checks: tuple[ConvergenceCheck, ...]
+
+    def is_converged(self, state: AdaptiveState) -> bool:
+        if self.mode == "all_of":
+            return all(c.is_converged(state) for c in self.checks)
+        return any(c.is_converged(state) for c in self.checks)
+
+
+@dataclass(frozen=True)
+class Budget:
+    """Per-query budget with up to four AND-composable constraints.
+
+    `has_capacity(state)` returns True iff every non-None
+    constraint still has room. The multi-round loop terminates
+    when has_capacity returns False (any constraint exhausted) OR
+    when the per-round dispatch returns an empty deepening set
+    (no adaptation warranted).
+    """
+
+    max_rounds: Optional[int] = None
+    total_extra_visits: Optional[int] = None
+    wall_clock_seconds: Optional[float] = None
+    convergence: Optional[ConvergenceCheck | CombinedConvergence] = None
+    # Per-round extra-visits — added to the deeper-query's maxVisits
+    # each round. Defaults to the per-query `extra_visits` field
+    # (legacy v1.0.23 knob). Phase 3 may replace this with an
+    # allocation-algorithm-driven per-round visit count.
+    per_round_extra_visits: int = 800
+
+    def has_capacity(self, state: AdaptiveState) -> bool:
+        if self.max_rounds is not None and state.rounds_completed >= self.max_rounds:
+            return False
+        if (
+            self.total_extra_visits is not None
+            and state.total_visits_spent >= self.total_extra_visits
+        ):
+            return False
+        if (
+            self.wall_clock_seconds is not None
+            and state.wall_clock_elapsed_s >= self.wall_clock_seconds
+        ):
+            return False
+        if self.convergence is not None and self.convergence.is_converged(state):
+            return False
+        return True
+
+    def visits_for_round(self) -> int:
+        """Visits to add to the deeper-query's maxVisits this round.
+
+        Defaults to per_round_extra_visits. Phase 3 may replace this
+        with allocation-algorithm-driven per-round visit counts.
+        """
+        return self.per_round_extra_visits
+
+
+# Three context profiles — named per-context tuning over Budget.
+# Looked up by string name in `_parse_budget` when the wire field
+# `capabilities.adaptive_reevaluate.budget` is a string.
+
+_BUDGET_PROFILES: dict[str, Budget] = {
+    "review-tight": Budget(max_rounds=1),
+    "range-generous": Budget(
+        max_rounds=5,
+        total_extra_visits=3000,
+        convergence=ConvergenceCheck(
+            metric="worst_set_jaccard_to_previous",
+            tolerance=0.1,
+            lookback=1,
+            scale="absolute",
+        ),
+    ),
+    "loop-aggressive": Budget(
+        max_rounds=20,
+        total_extra_visits=10000,
+        wall_clock_seconds=60.0,
+        convergence=ConvergenceCheck(
+            metric="worst_set_jaccard_to_previous",
+            tolerance=0.1,
+            lookback=1,
+            scale="absolute",
+        ),
+    ),
+}
+
+
+_VALID_BUDGET_FIELDS: frozenset[str] = frozenset({
+    "max_rounds", "total_extra_visits", "wall_clock_seconds", "convergence",
+})
+_VALID_CONVERGENCE_FIELDS: frozenset[str] = frozenset({
+    "metric", "tolerance", "lookback", "scale",
+})
+
+
+def _parse_budget(cap_meta: dict[str, Any]) -> Budget:
+    """Parse `capabilities.adaptive_reevaluate.budget` into a Budget.
+
+    Accepts a profile name (string) or a raw object with the four
+    constraint fields. The `extra_visits` field on the capability
+    metadata flows through as `per_round_extra_visits`.
+
+    Raises AdaptiveConfigurationError(code="budget_invalid") on:
+      - Unknown profile name.
+      - Wrong type for `budget` (neither string nor object).
+      - Unknown field in the budget object.
+      - Wrong type / out-of-range value for any constraint.
+      - Malformed convergence shape (missing required fields,
+        invalid scale value, conflicting combinator usage).
+    """
+    raw = cap_meta.get("budget")
+    extra_visits = int(cap_meta.get("extra_visits", 800))
+
+    # Absent budget → default to single-round (matches v1.0.23 semantic).
+    if raw is None:
+        return Budget(max_rounds=1, per_round_extra_visits=extra_visits)
+
+    if isinstance(raw, str):
+        profile = _BUDGET_PROFILES.get(raw)
+        if profile is None:
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={
+                    "budget": raw,
+                    "valid_profiles": sorted(_BUDGET_PROFILES.keys()),
+                },
+            )
+        return replace(profile, per_round_extra_visits=extra_visits)
+
+    if not isinstance(raw, dict):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "budget": raw,
+                "expected": "string profile name or budget object",
+            },
+        )
+
+    return _parse_budget_dict(raw, extra_visits)
+
+
+def _parse_budget_dict(raw: dict[str, Any], extra_visits: int) -> Budget:
+    """Parse a raw budget object into a Budget. Validates every field."""
+    unknown = set(raw.keys()) - _VALID_BUDGET_FIELDS
+    if unknown:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "unknown_fields": sorted(unknown),
+                "valid_fields": sorted(_VALID_BUDGET_FIELDS),
+            },
+        )
+
+    max_rounds = raw.get("max_rounds")
+    if max_rounds is not None and (
+        not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1
+    ):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"max_rounds": max_rounds, "expected": "positive int"},
+        )
+
+    total_extra_visits = raw.get("total_extra_visits")
+    if total_extra_visits is not None and (
+        not isinstance(total_extra_visits, int)
+        or isinstance(total_extra_visits, bool)
+        or total_extra_visits < 1
+    ):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "total_extra_visits": total_extra_visits,
+                "expected": "positive int",
+            },
+        )
+
+    wall_clock_seconds_raw = raw.get("wall_clock_seconds")
+    wall_clock_seconds: Optional[float] = None
+    if wall_clock_seconds_raw is not None:
+        if (
+            not isinstance(wall_clock_seconds_raw, (int, float))
+            or isinstance(wall_clock_seconds_raw, bool)
+            or wall_clock_seconds_raw <= 0
+        ):
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={
+                    "wall_clock_seconds": wall_clock_seconds_raw,
+                    "expected": "positive number",
+                },
+            )
+        wall_clock_seconds = float(wall_clock_seconds_raw)
+
+    convergence_raw = raw.get("convergence")
+    convergence: Optional[ConvergenceCheck | CombinedConvergence] = None
+    if convergence_raw is not None:
+        convergence = _parse_convergence(convergence_raw)
+
+    return Budget(
+        max_rounds=max_rounds,
+        total_extra_visits=total_extra_visits,
+        wall_clock_seconds=wall_clock_seconds,
+        convergence=convergence,
+        per_round_extra_visits=extra_visits,
+    )
+
+
+def _parse_convergence(
+    raw: Any,
+) -> ConvergenceCheck | CombinedConvergence:
+    """Parse a convergence sub-object into ConvergenceCheck or
+    CombinedConvergence. Raises on malformed shapes."""
+    if not isinstance(raw, dict):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence": raw, "expected": "object"},
+        )
+
+    has_all_of = "all_of" in raw
+    has_any_of = "any_of" in raw
+
+    if has_all_of and has_any_of:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence": "cannot have both all_of and any_of"},
+        )
+
+    if has_all_of or has_any_of:
+        mode: Literal["all_of", "any_of"] = "all_of" if has_all_of else "any_of"
+        checks_raw = raw[mode]
+        if not isinstance(checks_raw, list):
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={f"convergence.{mode}": "expected list of checks"},
+            )
+        # Disallow extra fields alongside the combinator.
+        extra = set(raw.keys()) - {mode}
+        if extra:
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={
+                    f"convergence.{mode}": f"unexpected sibling fields: {sorted(extra)}",
+                },
+            )
+        checks = tuple(_parse_single_convergence(c) for c in checks_raw)
+        return CombinedConvergence(mode=mode, checks=checks)
+
+    return _parse_single_convergence(raw)
+
+
+def _parse_single_convergence(raw: Any) -> ConvergenceCheck:
+    """Parse a single convergence check object into ConvergenceCheck."""
+    if not isinstance(raw, dict):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence check": raw, "expected": "object"},
+        )
+
+    unknown = set(raw.keys()) - _VALID_CONVERGENCE_FIELDS
+    if unknown:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "convergence_check_unknown_fields": sorted(unknown),
+                "valid_fields": sorted(_VALID_CONVERGENCE_FIELDS),
+            },
+        )
+
+    metric = raw.get("metric")
+    if not isinstance(metric, str) or not metric:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence.metric": metric, "expected": "non-empty string"},
+        )
+
+    tolerance = raw.get("tolerance")
+    if (
+        not isinstance(tolerance, (int, float))
+        or isinstance(tolerance, bool)
+        or tolerance <= 0
+    ):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence.tolerance": tolerance, "expected": "positive number"},
+        )
+
+    lookback = raw.get("lookback", 1)
+    if not isinstance(lookback, int) or isinstance(lookback, bool) or lookback < 1:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence.lookback": lookback, "expected": "positive int"},
+        )
+
+    scale = raw.get("scale", "absolute")
+    if scale not in ("absolute", "relative"):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "convergence.scale": scale,
+                "expected": "'absolute' or 'relative'",
+            },
+        )
+
+    return ConvergenceCheck(
+        metric=metric,
+        tolerance=float(tolerance),
+        lookback=lookback,
+        scale=scale,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers (runtime behaviour unchanged since the pre-v1.0.16 imperative
 # impl; signatures brand-threaded in v1.0.22; refactored in v1.0.23 to use
 # the selector substrate above while preserving the legacy-path behaviour
