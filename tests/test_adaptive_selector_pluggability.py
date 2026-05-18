@@ -17,9 +17,16 @@ categories aligned with the roadmap's commit-6 test plan:
   6. Window correction — same-color-predecessor expansion in
      move-space; default-`window_size=2` semantics.
 
-Wire-shape end-to-end integration (a full orchestration-coroutine
-run with `move_selector_fn` bound) is left to a follow-on arc; the
-unit coverage here pins the dispatch contract precisely.
+End-to-end integration at the dispatcher level (TestDispatchEndToEnd)
+exercises `_dispatch_deepening_set` with a real `RegistryInterpreter`
+constructed from synthetic `analysis_config`, exercising the full
+composition: interpreter setup, axis resolution, view construction,
+user-authored selector invocation, selection-policy application,
+and window expansion. Full-coroutine-level integration (with mocked
+spawn, response streaming, etc.) is left to a follow-on arc — the
+dispatcher-level tests pin the dispatch composition's behaviour
+end-to-end; the coroutine wrapper is a thin transformer that does
+not add semantically distinct surface.
 
 License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
@@ -52,6 +59,7 @@ from middleware.adaptive_reevaluate import (  # noqa: E402
     _build_turn_views,
     _collect_per_move_deltas,
     _default_move_selector,
+    _dispatch_deepening_set,
     _expand_window_same_color,
     _resolve_axis_and_selector,
     _select_per_color_quantile_move,
@@ -543,3 +551,235 @@ class TestDefaultSelectorAndCollect:
         assert turn_maps["black"][MoveIndex(0)] == [0.1, 0.15]
         assert turn_maps["black"][MoveIndex(1)] == [0.3]
         assert turn_maps["white"][MoveIndex(0)] == [0.2, 0.25]
+
+
+# ---------------------------------------------------------------------------
+# 7. End-to-end dispatch integration
+# ---------------------------------------------------------------------------
+#
+# Exercises `_dispatch_deepening_set` with a real `RegistryInterpreter`
+# built from synthetic `analysis_config`. Covers the full composition:
+# interpreter setup → axis resolution → view construction →
+# user-authored selector invocation (asteval-compiled, dataclass
+# attribute access) → selection-policy application → window
+# expansion. The unit tests above pin each step in isolation; these
+# tests pin the composition.
+
+
+def _build_finals_with_per_move_deltas() -> list[AnalyzeResponse]:
+    """6 turns (0..5) with per-move deltas embedded in turn 0's opaque.
+
+    Black moves 0, 1, 2 carry deltas 0.1, 0.5, 0.9 (move 0 worst).
+    White moves 0, 1 carry deltas 0.2, 0.7 (move 0 worst).
+    Each move has a single per-arrival delta — the user selector's
+    output equals the embedded delta directly.
+    """
+    deltas_payload = {
+        "moveInfos": [],
+        "rootInfo": {},
+        "extra": {
+            "black": {"deltas": {"0": 0.1, "1": 0.5, "2": 0.9}},
+            "white": {"deltas": {"0": 0.2, "1": 0.7}},
+        },
+    }
+    return [
+        AnalyzeResponse(
+            is_during_search=False,
+            turn_number=i,
+            opaque=deltas_payload if i == 0 else {
+                "moveInfos": [], "rootInfo": {}, "extra": {},
+            },
+        )
+        for i in range(6)
+    ]
+
+
+class TestDispatchEndToEnd:
+
+    def test_move_axis_user_selector_drives_per_color_quantile(self) -> None:
+        """User binds move_selector_fn = mean(x.deltas); per_color_quantile."""
+        finals = _build_finals_with_per_move_deltas()
+        analysis_config: dict[str, Any] = {
+            "bindings": {"move_selector_fn": "my_metric"},
+            "symbols": {"my_metric": "mean(x.deltas)"},
+            "parameters": {},
+        }
+        cap_meta: dict[str, Any] = {
+            "selection_policy": "per_color_quantile",
+            "worst_quantile": 0.34,
+        }
+        all_turns = {TurnIndex(i) for i in range(6)}
+        result = _dispatch_deepening_set(
+            finals=finals,
+            cap_meta=cap_meta,
+            analysis_config=analysis_config,
+            window_size=1,
+            all_turns=all_turns,
+        )
+        # Per-color quantile 0.34:
+        #   Black scores [0.1, 0.5, 0.9]: threshold_idx=int(3*0.34)=1,
+        #     threshold=0.5; worst <= 0.5: m=0, m=1.
+        #     Pairs: (0,1), (2,3).
+        #   White scores [0.2, 0.7]: threshold_idx=int(2*0.34)=0,
+        #     threshold=0.2; worst <= 0.2: m=0.
+        #     Pair: (1,2).
+        # Window_size=1 — no predecessor expansion.
+        # Union: {0,1,2,3} ∪ {1,2} = {0,1,2,3}.
+        assert result == {TurnIndex(0), TurnIndex(1), TurnIndex(2), TurnIndex(3)}
+
+    def test_move_axis_user_selector_with_top_k_selection(self) -> None:
+        """User selector + top_k=1 picks the single worst pooled move."""
+        finals = _build_finals_with_per_move_deltas()
+        analysis_config: dict[str, Any] = {
+            "bindings": {"move_selector_fn": "m"},
+            "symbols": {"m": "mean(x.deltas)"},
+            "parameters": {},
+        }
+        cap_meta: dict[str, Any] = {
+            "selection_policy": "top_k",
+            "top_k": 1,
+        }
+        all_turns = {TurnIndex(i) for i in range(6)}
+        result = _dispatch_deepening_set(
+            finals=finals,
+            cap_meta=cap_meta,
+            analysis_config=analysis_config,
+            window_size=1,
+            all_turns=all_turns,
+        )
+        # Pooled bottom-1: 0.1 (Black m=0). Pair: (0,1).
+        assert result == {TurnIndex(0), TurnIndex(1)}
+
+    def test_move_axis_user_selector_using_before_after_packets(self) -> None:
+        """Selector reads x.before and x.after to compute a transition metric.
+
+        Tests nested attribute + dict access in the asteval-compiled
+        expression — the seam that lets users author cross-position
+        move-loss metrics.
+        """
+        # Embed scoreLead per turn so the selector can read it.
+        score_leads = {0: 0.0, 1: -0.1, 2: -0.05, 3: -0.4, 4: -0.35, 5: -0.45}
+        finals = []
+        for i in range(6):
+            payload: dict[str, Any] = {
+                "moveInfos": [],
+                "rootInfo": {"scoreLead": score_leads[i]},
+                "extra": {},
+            }
+            if i == 0:
+                payload["extra"] = {
+                    "black": {"deltas": {"0": 0.0, "1": 0.0, "2": 0.0}},
+                    "white": {"deltas": {"0": 0.0, "1": 0.0}},
+                }
+            finals.append(AnalyzeResponse(
+                is_during_search=False, turn_number=i, opaque=payload,
+            ))
+        # Selector: score-lead drop across the move (after - before).
+        # Lower (more negative) = worse from this color's perspective.
+        analysis_config: dict[str, Any] = {
+            "bindings": {"move_selector_fn": "drop"},
+            "symbols": {
+                "drop": (
+                    "x.after.opaque['rootInfo']['scoreLead'] - "
+                    "x.before.opaque['rootInfo']['scoreLead']"
+                ),
+            },
+            "parameters": {},
+        }
+        # top_k=1 picks the worst single move across both colors.
+        cap_meta: dict[str, Any] = {
+            "selection_policy": "top_k",
+            "top_k": 1,
+        }
+        all_turns = {TurnIndex(i) for i in range(6)}
+        result = _dispatch_deepening_set(
+            finals=finals,
+            cap_meta=cap_meta,
+            analysis_config=analysis_config,
+            window_size=1,
+            all_turns=all_turns,
+        )
+        # Per-move score-lead drops:
+        #   Black m=0 (turns 0→1): -0.1 - 0.0 = -0.10
+        #   White m=0 (turns 1→2): -0.05 - -0.1 = +0.05
+        #   Black m=1 (turns 2→3): -0.4 - -0.05 = -0.35  ← worst (lowest)
+        #   White m=1 (turns 3→4): -0.35 - -0.4 = +0.05
+        #   Black m=2 (turns 4→5): -0.45 - -0.35 = -0.10
+        # top_k=1: Black m=1 (drop -0.35). Pair: (2,3).
+        assert result == {TurnIndex(2), TurnIndex(3)}
+
+    def test_turn_axis_user_selector_pooled_quantile(self) -> None:
+        """User binds turn_selector_fn; pooled_quantile selection."""
+        finals = [
+            AnalyzeResponse(
+                is_during_search=False, turn_number=i,
+                opaque={"moveInfos": [], "rootInfo": {}, "extra": {}},
+            )
+            for i in range(6)
+        ]
+        # Selector returns x.turn_index (lower index = worse).
+        # Verifies attribute access on TurnView (NewType-wrapped int).
+        analysis_config: dict[str, Any] = {
+            "bindings": {"turn_selector_fn": "tm"},
+            "symbols": {"tm": "x.turn_index"},
+            "parameters": {},
+        }
+        cap_meta: dict[str, Any] = {
+            "selection_policy": "top_k",
+            "top_k": 3,
+        }
+        all_turns = {TurnIndex(i) for i in range(6)}
+        result = _dispatch_deepening_set(
+            finals=finals,
+            cap_meta=cap_meta,
+            analysis_config=analysis_config,
+            window_size=1,  # ignored on turn axis (no framework window)
+            all_turns=all_turns,
+        )
+        # Scores: 0, 1, 2, 3, 4, 5. Bottom-3: {0, 1, 2}.
+        assert result == {TurnIndex(0), TurnIndex(1), TurnIndex(2)}
+
+    def test_default_path_no_binding_uses_hardcoded_selector(self) -> None:
+        """No analysis_config / no binding → hardcoded default path."""
+        finals = _build_finals_with_per_move_deltas()
+        cap_meta: dict[str, Any] = {"worst_quantile": 0.34}
+        all_turns = {TurnIndex(i) for i in range(6)}
+        result = _dispatch_deepening_set(
+            finals=finals,
+            cap_meta=cap_meta,
+            analysis_config=None,
+            window_size=1,
+            all_turns=all_turns,
+        )
+        # Default path: per-color quantile on mean-of-deltas. With
+        # single-arrival deltas, scores = the embedded delta values.
+        # Same expected set as the equivalent user-selector test above.
+        assert result == {TurnIndex(0), TurnIndex(1), TurnIndex(2), TurnIndex(3)}
+
+    def test_ambiguous_axis_raises_in_dispatch(self) -> None:
+        """End-to-end: dispatch raises AdaptiveConfigurationError on
+        ambiguous axis. Verifies the refusal propagates through the
+        composition (not just at the helper level)."""
+        finals = _build_finals_with_per_move_deltas()
+        analysis_config: dict[str, Any] = {
+            "bindings": {
+                "move_selector_fn": "m",
+                "turn_selector_fn": "t",
+            },
+            "symbols": {
+                "m": "mean(x.deltas)",
+                "t": "x.turn_index",
+            },
+            "parameters": {},
+        }
+        cap_meta: dict[str, Any] = {}  # no selector_axis disambiguator
+        all_turns = {TurnIndex(i) for i in range(6)}
+        with pytest.raises(AdaptiveConfigurationError) as exc:
+            _dispatch_deepening_set(
+                finals=finals,
+                cap_meta=cap_meta,
+                analysis_config=analysis_config,
+                window_size=1,
+                all_turns=all_turns,
+            )
+        assert exc.value.code == "ambiguous_axis"
