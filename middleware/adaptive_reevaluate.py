@@ -68,9 +68,10 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     AsyncIterator,
@@ -155,6 +156,67 @@ class AdaptiveConfigurationError(RuntimeError):
 _COLORS: tuple[Color, Color] = ("black", "white")
 
 
+# Per-unit history surfaced to user-authored selectors via the
+# round_history field on MoveView / TurnView. Defined here (before the
+# views that reference them) for forward-reference cleanliness.
+# Populated by `_build_move_views` / `_build_turn_views` from the
+# active AdaptiveState (commit 3); empty/zero in round 1 and at the
+# legacy single-round dispatch entry. See
+# docs/roadmap-multi-round-adaptation.md §2.3.
+
+@dataclass(frozen=True)
+class MoveRoundHistory:
+    """Per-move history surfaced to a `move_selector_fn` via
+    `x.round_history`.
+
+    Empty in round 1 (selector_values=[], deepened=0,
+    previous_packet=None, rounds_completed=0); populated as
+    rounds progress. User selectors that don't access
+    round_history are unaffected by the field's presence.
+    """
+
+    selector_values: list[float]
+    deepened: int
+    previous_packet: Optional[AnalyzeResponse]
+    rounds_completed: int
+
+
+@dataclass(frozen=True)
+class TurnRoundHistory:
+    """Per-turn history surfaced to a `turn_selector_fn` via
+    `x.round_history`. Same shape as MoveRoundHistory.
+    """
+
+    selector_values: list[float]
+    deepened: int
+    previous_packet: Optional[AnalyzeResponse]
+    rounds_completed: int
+
+
+def _empty_move_round_history() -> MoveRoundHistory:
+    """Default round_history for newly constructed MoveViews — empty
+    selector_values list, zero deepened count, no previous packet,
+    zero rounds completed. Matches what `_build_move_views` would
+    construct from an empty AdaptiveState.
+    """
+    return MoveRoundHistory(
+        selector_values=[],
+        deepened=0,
+        previous_packet=None,
+        rounds_completed=0,
+    )
+
+
+def _empty_turn_round_history() -> TurnRoundHistory:
+    """Default round_history for newly constructed TurnViews."""
+    return TurnRoundHistory(
+        selector_values=[],
+        deepened=0,
+        previous_packet=None,
+        rounds_completed=0,
+    )
+
+
 @dataclass(frozen=True)
 class MoveView:
     """The per-move view a `move_selector_fn` binding receives.
@@ -171,6 +233,9 @@ class MoveView:
     deltas: list[float]
     before: AnalyzeResponse
     after: AnalyzeResponse
+    round_history: MoveRoundHistory = field(
+        default_factory=_empty_move_round_history,
+    )
 
 
 @dataclass(frozen=True)
@@ -186,6 +251,9 @@ class TurnView:
     turn_index: TurnIndex
     to_play: Color
     packet: AnalyzeResponse
+    round_history: TurnRoundHistory = field(
+        default_factory=_empty_turn_round_history,
+    )
 
 
 # Selection-policy primitives — move-axis
@@ -305,6 +373,632 @@ def _default_move_selector(deltas: list[float]) -> float:
     binding is active.
     """
     return float(np.mean(deltas))
+
+
+# ---------------------------------------------------------------------------
+# Adaptive state — across-iteration accumulator (v1.0.24 commit 1)
+#
+# Framework-owned object accumulating per-round per-unit data across the
+# multi-round loop. Read-only from selectors / value functions / budget
+# objects; populated by the coroutine and the framework via the
+# `observe` / `record_*` methods.
+#
+# Consumers (introduced in subsequent commits):
+#   - The finalization stage at end-of-loop reads `last_packet(turn)` to
+#     emit each turn's authoritative is_during_search=False response
+#     (commit 4).
+#   - The round_history field on MoveView / TurnView reads
+#     `selector_history_*` and `deepened_count_*` to surface per-unit
+#     history to user-authored selectors (commit 3).
+#   - Budget objects read `rounds_completed`, `total_visits_spent`,
+#     `wall_clock_elapsed_s`, and `metric_trajectory(name)` to evaluate
+#     termination (commit 2 introduces Budget; commit 6 wires wall
+#     clock).
+#   - Framework-default metric trajectories (worst_selector_value,
+#     worst_set_jaccard_to_previous) populated by `record_round` in
+#     commit 5.
+#
+# See docs/roadmap-multi-round-adaptation.md §2.2 for the contract.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AdaptiveState:
+    """Across-iteration accumulator for adaptive's multi-round loop.
+
+    Lifetime: one per parent query, constructed at coroutine entry,
+    discarded at coroutine completion. The state is the source of
+    truth for:
+
+    - **Latest per-turn observed response** (`last_packet`). Updated
+      by `observe(resp)` for every KataGo final the proxy receives
+      (originals in Stage 1 and deeper-query responses in the
+      multi-round loop). Consumed by the finalization stage to
+      emit each turn's authoritative.
+    - **Per-unit history** (`selector_history_*`,
+      `deepened_count_*`). Updated by `record_round_scores_*` and
+      `record_round`. Surfaced to selectors via
+      MoveView/TurnView's round_history field.
+    - **Round-level aggregates** (`rounds_completed`,
+      `total_visits_spent`, `wall_clock_elapsed_s`). Consumed by
+      Budget objects via `has_capacity(state)`.
+    - **Named metric trajectories** (`metric_trajectory(name)`).
+      Populated by `record_round` for framework defaults
+      (worst_selector_value, worst_set_jaccard_to_previous) in
+      commit 5. Consumed by ConvergenceCheck objects.
+    """
+
+    rounds_completed: int = 0
+    total_visits_spent: int = 0
+    wall_clock_elapsed_s: float = 0.0
+
+    # Per-turn latest observed final (populated by observe()).
+    _last_packet_by_turn: dict[TurnIndex, AnalyzeResponse] = field(
+        default_factory=dict,
+    )
+
+    # Per-unit selector histories (populated by
+    # record_round_scores_*).
+    _selector_history_move: dict[tuple[Color, MoveIndex], list[float]] = field(
+        default_factory=dict,
+    )
+    _selector_history_turn: dict[TurnIndex, list[float]] = field(
+        default_factory=dict,
+    )
+
+    # Per-unit deepened counts (populated by record_round).
+    _deepened_counts_move: dict[tuple[Color, MoveIndex], int] = field(
+        default_factory=dict,
+    )
+    _deepened_counts_turn: dict[TurnIndex, int] = field(
+        default_factory=dict,
+    )
+
+    # Per-round deepening turn-sets (kept for jaccard-style
+    # trajectories that compare to the previous round).
+    _round_deepen_sets: list[set[TurnIndex]] = field(
+        default_factory=list,
+    )
+
+    # Named metric trajectories. Framework-default trajectories
+    # populated by record_round in commit 5.
+    _metric_trajectories: dict[str, list[float]] = field(
+        default_factory=dict,
+    )
+
+    # ─── Framework-side mutation methods ───
+
+    def observe(self, resp: AnalyzeResponse) -> None:
+        """Record a KataGo final as the latest for its turn.
+
+        Called for every is_during_search=False response observed by
+        the coroutine (originals from Stage 1 and deeper-query
+        responses from the multi-round loop). The finalization stage
+        at end-of-loop reads `last_packet(turn)` to emit each turn's
+        authoritative emission with is_during_search=False edited in.
+        """
+        self._last_packet_by_turn[TurnIndex(resp.turn_number)] = resp
+
+    def record_round_scores_move(
+        self,
+        scored: list[tuple[Color, MoveIndex, float]],
+    ) -> None:
+        """Append per-move selector scores for the current round.
+
+        Move-axis only. The score list reflects every move scored in
+        this round (not just the worst-set); selector_history_move
+        returns the full per-round trajectory of selector values per
+        (color, move) for selectors that want it.
+        """
+        for color, m, scalar in scored:
+            self._selector_history_move.setdefault((color, m), []).append(scalar)
+
+    def record_round_scores_turn(
+        self,
+        scored: list[tuple[TurnIndex, float]],
+    ) -> None:
+        """Append per-turn selector scores for the current round.
+
+        Turn-axis only; symmetric to record_round_scores_move.
+        """
+        for t, scalar in scored:
+            self._selector_history_turn.setdefault(t, []).append(scalar)
+
+    def record_round(
+        self,
+        *,
+        worst_pairs: Optional[list[tuple[Color, MoveIndex]]] = None,
+        deepening_turns: set[TurnIndex],
+        worst_selector_value: Optional[float] = None,
+    ) -> None:
+        """Finalize a round: increment round counters, update per-unit
+        deepened counts, and populate framework-default metric
+        trajectories.
+
+        For move-axis rounds: pass `worst_pairs` (the move-level
+        worst-set before window expansion) to update per-move
+        deepened counts. For turn-axis rounds: omit `worst_pairs`
+        (per-turn deepened counts track via `deepening_turns`).
+
+        `deepening_turns` is the round's full deepening turn-set
+        (post-window-expansion on move-axis); used to update
+        per-turn deepened counts and to record the round's deepening
+        set for jaccard-style trajectories.
+
+        `worst_selector_value` is the minimum selector value across
+        this round's worst-set entries (None if not provided —
+        unit-level callers that don't compute scores can omit it).
+        Appended to `_metric_trajectories["worst_selector_value"]`
+        for convergence checks.
+
+        `_metric_trajectories["worst_set_jaccard_to_previous"]` is
+        populated from round 2 onwards (Jaccard similarity of this
+        round's `deepening_turns` against the prior round's). Round
+        1 has no previous round, so the trajectory grows from round
+        2; convergence checks against this metric with lookback=1
+        thus require at least 3 rounds to fire (2 jaccard entries
+        needed for a single delta).
+        """
+        self.rounds_completed += 1
+        self._round_deepen_sets.append(set(deepening_turns))
+        for turn in deepening_turns:
+            self._deepened_counts_turn[turn] = (
+                self._deepened_counts_turn.get(turn, 0) + 1
+            )
+        if worst_pairs is not None:
+            for color, m in worst_pairs:
+                self._deepened_counts_move[(color, m)] = (
+                    self._deepened_counts_move.get((color, m), 0) + 1
+                )
+        if worst_selector_value is not None:
+            self._metric_trajectories.setdefault(
+                "worst_selector_value", [],
+            ).append(worst_selector_value)
+        if len(self._round_deepen_sets) >= 2:
+            prev_set = self._round_deepen_sets[-2]
+            curr_set = self._round_deepen_sets[-1]
+            union = prev_set | curr_set
+            inter = prev_set & curr_set
+            jaccard = (len(inter) / len(union)) if union else 1.0
+            self._metric_trajectories.setdefault(
+                "worst_set_jaccard_to_previous", [],
+            ).append(jaccard)
+
+    def record_visits(self, visits: int) -> None:
+        """Increment `total_visits_spent` by this round's deeper-query
+        extra_visits (the amount the round added to KataGo's
+        maxVisits over the original)."""
+        self.total_visits_spent += visits
+
+    def record_wall_clock(self, elapsed_s: float) -> None:
+        """Update `wall_clock_elapsed_s` to the cumulative elapsed
+        time since coroutine entry. Populated by the coroutine
+        sampling time.monotonic() at round boundaries; consumed by
+        wall-clock budget shapes (commit 6)."""
+        self.wall_clock_elapsed_s = elapsed_s
+
+    # ─── Queryable surface (read-only from external callers) ───
+
+    def last_packet(self, t: TurnIndex) -> Optional[AnalyzeResponse]:
+        """Most recent KataGo final observed for this turn, or
+        None if the proxy has not yet observed any final for this
+        turn. Consumed by the finalization stage to emit each turn's
+        authoritative."""
+        return self._last_packet_by_turn.get(t)
+
+    def selector_history_move(
+        self, color: Color, m: MoveIndex,
+    ) -> list[float]:
+        """Per-move selector scalars across rounds (move-axis).
+
+        Returns a copy of the trajectory so callers can't mutate
+        framework-owned state by side-effect.
+        """
+        return list(self._selector_history_move.get((color, m), []))
+
+    def selector_history_turn(self, t: TurnIndex) -> list[float]:
+        """Per-turn selector scalars across rounds (turn-axis)."""
+        return list(self._selector_history_turn.get(t, []))
+
+    def deepened_count_move(self, color: Color, m: MoveIndex) -> int:
+        """Number of rounds this move was in the worst-set (move-axis)."""
+        return self._deepened_counts_move.get((color, m), 0)
+
+    def deepened_count_turn(self, t: TurnIndex) -> int:
+        """Number of rounds this turn was in the deepening set."""
+        return self._deepened_counts_turn.get(t, 0)
+
+    def metric_trajectory(self, name: str) -> list[float]:
+        """Named metric's per-round values. Returns an empty list if
+        the metric isn't tracked."""
+        return list(self._metric_trajectories.get(name, []))
+
+
+# ---------------------------------------------------------------------------
+# Budget abstraction (v1.0.24 commit 2)
+#
+# Composable per-query budget with four constraint shapes:
+#   - max_rounds            (terminate after N rounds)
+#   - total_extra_visits    (terminate when cumulative deeper-query
+#                            extras exhaust)
+#   - wall_clock_seconds    (terminate after elapsed time)
+#   - convergence           (terminate when a named metric trajectory
+#                            stabilises per the four-form tolerance shape)
+#
+# Multiple constraints AND-compose: terminate when ANY exhausts. A
+# Budget consisting only of convergence (no compute cap) is valid —
+# the loop runs until the metric stabilises.
+#
+# Three context profiles (`review-tight`, `range-generous`,
+# `loop-aggressive`) provide named per-context tuning; resolved by
+# `_parse_budget` at coroutine entry. Per-query `extra_visits` overrides
+# `per_round_extra_visits` on profile lookup.
+#
+# Configuration-consistency refusal: `_parse_budget` raises
+# `AdaptiveConfigurationError(code="budget_invalid")` on malformed
+# input per §11.4's cost-asymmetry calibration.
+#
+# See docs/roadmap-multi-round-adaptation.md §3 for the full contract.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConvergenceCheck:
+    """Single tolerance-style convergence check on a named metric.
+
+    Four standard tolerance forms map to the (metric, scale,
+    lookback) tuple:
+      - Absolute on iterate: scale="absolute", metric=an iterate
+        trajectory.
+      - Relative on iterate: scale="relative".
+      - Absolute on objective: scale="absolute", metric=a named
+        objective trajectory.
+      - Patience (no improvement for N rounds): lookback=N,
+        metric=a best-observed trajectory.
+
+    `is_converged(state)` returns True when the metric's trajectory
+    has stabilised within `tolerance` over the last `lookback`
+    rounds. Returns False when the trajectory is too short to
+    evaluate (< lookback + 1 entries).
+    """
+
+    metric: str
+    tolerance: float
+    lookback: int = 1
+    scale: Literal["absolute", "relative"] = "absolute"
+
+    def is_converged(self, state: AdaptiveState) -> bool:
+        history = state.metric_trajectory(self.metric)
+        if len(history) < self.lookback + 1:
+            return False
+        current = history[-1]
+        prior = history[-1 - self.lookback]
+        delta = abs(current - prior)
+        if self.scale == "absolute":
+            return delta < self.tolerance
+        # scale == "relative"
+        return delta / max(abs(prior), 1e-9) < self.tolerance
+
+
+@dataclass(frozen=True)
+class CombinedConvergence:
+    """`all_of` / `any_of` combinator over multiple ConvergenceChecks.
+
+    `all_of`: converged when every check is converged.
+    `any_of`: converged when any check is converged.
+
+    Nested combinators (CombinedConvergence within CombinedConvergence)
+    are out of scope for v1.0.24; checks must be ConvergenceCheck.
+    """
+
+    mode: Literal["all_of", "any_of"]
+    checks: tuple[ConvergenceCheck, ...]
+
+    def is_converged(self, state: AdaptiveState) -> bool:
+        if self.mode == "all_of":
+            return all(c.is_converged(state) for c in self.checks)
+        return any(c.is_converged(state) for c in self.checks)
+
+
+@dataclass(frozen=True)
+class Budget:
+    """Per-query budget with up to four AND-composable constraints.
+
+    `has_capacity(state)` returns True iff every non-None
+    constraint still has room. The multi-round loop terminates
+    when has_capacity returns False (any constraint exhausted) OR
+    when the per-round dispatch returns an empty deepening set
+    (no adaptation warranted).
+    """
+
+    max_rounds: Optional[int] = None
+    total_extra_visits: Optional[int] = None
+    wall_clock_seconds: Optional[float] = None
+    convergence: Optional[ConvergenceCheck | CombinedConvergence] = None
+    # Per-round extra-visits — added to the deeper-query's maxVisits
+    # each round. Defaults to the per-query `extra_visits` field
+    # (legacy v1.0.23 knob). Phase 3 may replace this with an
+    # allocation-algorithm-driven per-round visit count.
+    per_round_extra_visits: int = 800
+
+    def has_capacity(self, state: AdaptiveState) -> bool:
+        if self.max_rounds is not None and state.rounds_completed >= self.max_rounds:
+            return False
+        if (
+            self.total_extra_visits is not None
+            and state.total_visits_spent >= self.total_extra_visits
+        ):
+            return False
+        if (
+            self.wall_clock_seconds is not None
+            and state.wall_clock_elapsed_s >= self.wall_clock_seconds
+        ):
+            return False
+        if self.convergence is not None and self.convergence.is_converged(state):
+            return False
+        return True
+
+    def visits_for_round(self) -> int:
+        """Visits to add to the deeper-query's maxVisits this round.
+
+        Defaults to per_round_extra_visits. Phase 3 may replace this
+        with allocation-algorithm-driven per-round visit counts.
+        """
+        return self.per_round_extra_visits
+
+
+# Three context profiles — named per-context tuning over Budget.
+# Looked up by string name in `_parse_budget` when the wire field
+# `capabilities.adaptive_reevaluate.budget` is a string.
+
+_BUDGET_PROFILES: dict[str, Budget] = {
+    "review-tight": Budget(max_rounds=1),
+    "range-generous": Budget(
+        max_rounds=5,
+        total_extra_visits=3000,
+        convergence=ConvergenceCheck(
+            metric="worst_set_jaccard_to_previous",
+            tolerance=0.1,
+            lookback=1,
+            scale="absolute",
+        ),
+    ),
+    "loop-aggressive": Budget(
+        max_rounds=20,
+        total_extra_visits=10000,
+        wall_clock_seconds=60.0,
+        convergence=ConvergenceCheck(
+            metric="worst_set_jaccard_to_previous",
+            tolerance=0.1,
+            lookback=1,
+            scale="absolute",
+        ),
+    ),
+}
+
+
+_VALID_BUDGET_FIELDS: frozenset[str] = frozenset({
+    "max_rounds", "total_extra_visits", "wall_clock_seconds", "convergence",
+})
+_VALID_CONVERGENCE_FIELDS: frozenset[str] = frozenset({
+    "metric", "tolerance", "lookback", "scale",
+})
+
+
+def _parse_budget(cap_meta: dict[str, Any]) -> Budget:
+    """Parse `capabilities.adaptive_reevaluate.budget` into a Budget.
+
+    Accepts a profile name (string) or a raw object with the four
+    constraint fields. The `extra_visits` field on the capability
+    metadata flows through as `per_round_extra_visits`.
+
+    Raises AdaptiveConfigurationError(code="budget_invalid") on:
+      - Unknown profile name.
+      - Wrong type for `budget` (neither string nor object).
+      - Unknown field in the budget object.
+      - Wrong type / out-of-range value for any constraint.
+      - Malformed convergence shape (missing required fields,
+        invalid scale value, conflicting combinator usage).
+    """
+    raw = cap_meta.get("budget")
+    extra_visits = int(cap_meta.get("extra_visits", 800))
+
+    # Absent budget → default to single-round (matches v1.0.23 semantic).
+    if raw is None:
+        return Budget(max_rounds=1, per_round_extra_visits=extra_visits)
+
+    if isinstance(raw, str):
+        profile = _BUDGET_PROFILES.get(raw)
+        if profile is None:
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={
+                    "budget": raw,
+                    "valid_profiles": sorted(_BUDGET_PROFILES.keys()),
+                },
+            )
+        return replace(profile, per_round_extra_visits=extra_visits)
+
+    if not isinstance(raw, dict):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "budget": raw,
+                "expected": "string profile name or budget object",
+            },
+        )
+
+    return _parse_budget_dict(raw, extra_visits)
+
+
+def _parse_budget_dict(raw: dict[str, Any], extra_visits: int) -> Budget:
+    """Parse a raw budget object into a Budget. Validates every field."""
+    unknown = set(raw.keys()) - _VALID_BUDGET_FIELDS
+    if unknown:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "unknown_fields": sorted(unknown),
+                "valid_fields": sorted(_VALID_BUDGET_FIELDS),
+            },
+        )
+
+    max_rounds = raw.get("max_rounds")
+    if max_rounds is not None and (
+        not isinstance(max_rounds, int) or isinstance(max_rounds, bool) or max_rounds < 1
+    ):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"max_rounds": max_rounds, "expected": "positive int"},
+        )
+
+    total_extra_visits = raw.get("total_extra_visits")
+    if total_extra_visits is not None and (
+        not isinstance(total_extra_visits, int)
+        or isinstance(total_extra_visits, bool)
+        or total_extra_visits < 1
+    ):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "total_extra_visits": total_extra_visits,
+                "expected": "positive int",
+            },
+        )
+
+    wall_clock_seconds_raw = raw.get("wall_clock_seconds")
+    wall_clock_seconds: Optional[float] = None
+    if wall_clock_seconds_raw is not None:
+        if (
+            not isinstance(wall_clock_seconds_raw, (int, float))
+            or isinstance(wall_clock_seconds_raw, bool)
+            or wall_clock_seconds_raw <= 0
+        ):
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={
+                    "wall_clock_seconds": wall_clock_seconds_raw,
+                    "expected": "positive number",
+                },
+            )
+        wall_clock_seconds = float(wall_clock_seconds_raw)
+
+    convergence_raw = raw.get("convergence")
+    convergence: Optional[ConvergenceCheck | CombinedConvergence] = None
+    if convergence_raw is not None:
+        convergence = _parse_convergence(convergence_raw)
+
+    return Budget(
+        max_rounds=max_rounds,
+        total_extra_visits=total_extra_visits,
+        wall_clock_seconds=wall_clock_seconds,
+        convergence=convergence,
+        per_round_extra_visits=extra_visits,
+    )
+
+
+def _parse_convergence(
+    raw: Any,
+) -> ConvergenceCheck | CombinedConvergence:
+    """Parse a convergence sub-object into ConvergenceCheck or
+    CombinedConvergence. Raises on malformed shapes."""
+    if not isinstance(raw, dict):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence": raw, "expected": "object"},
+        )
+
+    has_all_of = "all_of" in raw
+    has_any_of = "any_of" in raw
+
+    if has_all_of and has_any_of:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence": "cannot have both all_of and any_of"},
+        )
+
+    if has_all_of or has_any_of:
+        mode: Literal["all_of", "any_of"] = "all_of" if has_all_of else "any_of"
+        checks_raw = raw[mode]
+        if not isinstance(checks_raw, list):
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={f"convergence.{mode}": "expected list of checks"},
+            )
+        # Disallow extra fields alongside the combinator.
+        extra = set(raw.keys()) - {mode}
+        if extra:
+            raise AdaptiveConfigurationError(
+                code="budget_invalid",
+                detail={
+                    f"convergence.{mode}": f"unexpected sibling fields: {sorted(extra)}",
+                },
+            )
+        checks = tuple(_parse_single_convergence(c) for c in checks_raw)
+        return CombinedConvergence(mode=mode, checks=checks)
+
+    return _parse_single_convergence(raw)
+
+
+def _parse_single_convergence(raw: Any) -> ConvergenceCheck:
+    """Parse a single convergence check object into ConvergenceCheck."""
+    if not isinstance(raw, dict):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence check": raw, "expected": "object"},
+        )
+
+    unknown = set(raw.keys()) - _VALID_CONVERGENCE_FIELDS
+    if unknown:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "convergence_check_unknown_fields": sorted(unknown),
+                "valid_fields": sorted(_VALID_CONVERGENCE_FIELDS),
+            },
+        )
+
+    metric = raw.get("metric")
+    if not isinstance(metric, str) or not metric:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence.metric": metric, "expected": "non-empty string"},
+        )
+
+    tolerance = raw.get("tolerance")
+    if (
+        not isinstance(tolerance, (int, float))
+        or isinstance(tolerance, bool)
+        or tolerance <= 0
+    ):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence.tolerance": tolerance, "expected": "positive number"},
+        )
+
+    lookback = raw.get("lookback", 1)
+    if not isinstance(lookback, int) or isinstance(lookback, bool) or lookback < 1:
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={"convergence.lookback": lookback, "expected": "positive int"},
+        )
+
+    scale = raw.get("scale", "absolute")
+    if scale not in ("absolute", "relative"):
+        raise AdaptiveConfigurationError(
+            code="budget_invalid",
+            detail={
+                "convergence.scale": scale,
+                "expected": "'absolute' or 'relative'",
+            },
+        )
+
+    return ConvergenceCheck(
+        metric=metric,
+        tolerance=float(tolerance),
+        lookback=lookback,
+        scale=scale,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +1354,7 @@ def _apply_selection_policy_turn(
 def _build_move_views(
     finals: List[AnalyzeResponse],
     turn_maps: dict[Color, dict[MoveIndex, list[float]]],
+    state: AdaptiveState,
 ) -> list[MoveView]:
     """Construct a MoveView for each (color, move) with deltas, when
     both endpoint AnalyzeResponses are available.
@@ -667,6 +1362,13 @@ def _build_move_views(
     Moves at game edges (or any move whose before/after turn isn't in
     the final-response set) are skipped — the user selector cannot
     operate on them without complete view data.
+
+    The `round_history` field on each view is constructed from the
+    active AdaptiveState — selector_history_move per (color, m),
+    deepened_count_move per (color, m), the move's after-position's
+    latest observed packet via state.last_packet, and the global
+    rounds_completed counter. In round 1 (or when the dispatch is
+    state-empty), the fields are empty/zero.
     """
     by_turn: dict[TurnIndex, AnalyzeResponse] = {
         TurnIndex(f.turn_number): f for f in finals
@@ -679,31 +1381,140 @@ def _build_move_views(
             after_packet = by_turn.get(after_idx)
             if before_packet is None or after_packet is None:
                 continue
+            round_history = MoveRoundHistory(
+                selector_values=state.selector_history_move(color, m),
+                deepened=state.deepened_count_move(color, m),
+                previous_packet=state.last_packet(after_idx),
+                rounds_completed=state.rounds_completed,
+            )
             views.append(MoveView(
                 color=color,
                 move_index=m,
                 deltas=list(deltas),
                 before=before_packet,
                 after=after_packet,
+                round_history=round_history,
             ))
     return views
 
 
 def _build_turn_views(
     finals: List[AnalyzeResponse],
+    state: AdaptiveState,
 ) -> list[TurnView]:
     """Construct a TurnView for each final AnalyzeResponse.
 
     Side-to-play at turn t: Black at even turns (0, 2, 4, …), White
     at odd turns. The convention follows KataGo's analyze_turns
     indexing where turn 0 is the root.
+
+    The `round_history` field is constructed from the active
+    AdaptiveState — selector_history_turn, deepened_count_turn,
+    state.last_packet(turn), and rounds_completed.
     """
     views: list[TurnView] = []
     for f in finals:
         turn = TurnIndex(f.turn_number)
         to_play: Color = "black" if int(turn) % 2 == 0 else "white"
-        views.append(TurnView(turn_index=turn, to_play=to_play, packet=f))
+        round_history = TurnRoundHistory(
+            selector_values=state.selector_history_turn(turn),
+            deepened=state.deepened_count_turn(turn),
+            previous_packet=state.last_packet(turn),
+            rounds_completed=state.rounds_completed,
+        )
+        views.append(TurnView(
+            turn_index=turn,
+            to_play=to_play,
+            packet=f,
+            round_history=round_history,
+        ))
     return views
+
+
+def _dispatch_deepening_round(
+    finals: List[AnalyzeResponse],
+    state: AdaptiveState,
+    cap_meta: dict[str, Any],
+    analysis_config: Optional[dict[str, Any]],
+    window_size: int,
+    all_turns: set[TurnIndex],
+) -> tuple[
+    set[TurnIndex],
+    Optional[list[tuple[Color, MoveIndex]]],
+    Optional[float],
+]:
+    """Run one round's select-and-deepen dispatch against the current
+    state and return the deepening turn-set + move-level worst-set
+    + worst-set's minimum selector value.
+
+    Returns (deepening_turns, worst_pairs, worst_selector_value):
+      - deepening_turns: the set of turns to deepen this round
+        (after window expansion for move-axis; identity-with-
+        all_turns-mask for turn-axis).
+      - worst_pairs: move-level worst-set for move-axis (before
+        window expansion); None for turn-axis. The caller passes
+        worst_pairs to state.record_round to update per-move
+        deepened counts.
+      - worst_selector_value: the minimum selector value across the
+        round's worst-set entries (worst-of-the-worst, lower=worse
+        convention). None when the worst-set is empty. Threaded into
+        state.record_round for the framework's `worst_selector_value`
+        metric trajectory.
+
+    Side effect: records this round's per-unit scoring into state
+    via state.record_round_scores_move/turn so subsequent rounds'
+    view round_history reflects this round's selector values.
+    """
+    interpreter = _try_build_interpreter(analysis_config)
+    axis, user_selector = _resolve_axis_and_selector(interpreter, cap_meta)
+
+    if axis == "move":
+        turn_maps = _collect_per_move_deltas(finals)
+        worst_pairs: list[tuple[Color, MoveIndex]]
+        scored: list[tuple[Color, MoveIndex, float]]
+        if user_selector is None:
+            scored = [
+                (color, m, _default_move_selector(ds))
+                for color in _COLORS
+                for m, ds in turn_maps[color].items()
+            ]
+            worst_pairs = _select_per_color_quantile_move(
+                scored,
+                worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
+            )
+        else:
+            views_m = _build_move_views(finals, turn_maps, state)
+            scored = [
+                (v.color, v.move_index, float(user_selector(v)))
+                for v in views_m
+            ]
+            worst_pairs = _apply_selection_policy_move(scored, cap_meta)
+        state.record_round_scores_move(scored)
+        worst_pair_set = set(worst_pairs)
+        worst_value_move: Optional[float] = min(
+            (s for (c, m, s) in scored if (c, m) in worst_pair_set),
+            default=None,
+        )
+        deepening = _expand_window_same_color(
+            worst_pairs, all_turns, window_size,
+        )
+        return deepening, worst_pairs, worst_value_move
+
+    # axis == "turn" — user binding required (axis resolution enforces).
+    assert user_selector is not None
+    views_t = _build_turn_views(finals, state)
+    scored_t: list[tuple[TurnIndex, float]] = [
+        (v.turn_index, float(user_selector(v))) for v in views_t
+    ]
+    state.record_round_scores_turn(scored_t)
+    worst_turns_list = _apply_selection_policy_turn(scored_t, cap_meta)
+    worst_turn_set = set(worst_turns_list)
+    worst_value_turn: Optional[float] = min(
+        (s for (t, s) in scored_t if t in worst_turn_set),
+        default=None,
+    )
+    deepening = set(worst_turns_list) & all_turns
+    return deepening, None, worst_value_turn
 
 
 def _dispatch_deepening_set(
@@ -713,53 +1524,26 @@ def _dispatch_deepening_set(
     window_size: int,
     all_turns: set[TurnIndex],
 ) -> set[TurnIndex]:
-    """Resolve dispatch and produce the deepening-turn set.
+    """Single-round convenience wrapper around _dispatch_deepening_round.
 
-    Move-axis path: worst-set is expanded via `_expand_window`
-    (turn-space symmetric; same-color-predecessor in commit 5).
-    Turn-axis path: worst-set IS the deepening set (no framework
-    window expansion in v1.0.23; selector authors any cross-turn
-    aggregation via `apply_window` in the expression substrate).
+    Constructs a fresh AdaptiveState, observes finals, and dispatches
+    one round. Returns the deepening turn-set. Preserved for the
+    v1.0.23-style tests that exercise dispatch in isolation; the
+    multi-round coroutine uses _dispatch_deepening_round directly
+    with a persistent state.
     """
-    interpreter = _try_build_interpreter(analysis_config)
-    axis, user_selector = _resolve_axis_and_selector(interpreter, cap_meta)
-
-    if axis == "move":
-        # Score the per-color moves — either via the hardcoded default
-        # (no user binding) or the user-authored selector. The default
-        # path preserves the legacy "mean policy delta + per-color
-        # quantile" shape; the window correction (move-space same-color
-        # predecessor expansion) is the one wire-visible behaviour
-        # change post-v1.0.23 on this path.
-        turn_maps = _collect_per_move_deltas(finals)
-        worst_pairs: list[tuple[Color, MoveIndex]]
-        if user_selector is None:
-            scored_default: list[tuple[Color, MoveIndex, float]] = [
-                (color, m, _default_move_selector(ds))
-                for color in _COLORS
-                for m, ds in turn_maps[color].items()
-            ]
-            worst_pairs = _select_per_color_quantile_move(
-                scored_default,
-                worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
-            )
-        else:
-            views_m = _build_move_views(finals, turn_maps)
-            scored_m: list[tuple[Color, MoveIndex, float]] = [
-                (v.color, v.move_index, float(user_selector(v)))
-                for v in views_m
-            ]
-            worst_pairs = _apply_selection_policy_move(scored_m, cap_meta)
-        return _expand_window_same_color(worst_pairs, all_turns, window_size)
-
-    # axis == "turn" — user binding required (axis resolution enforces).
-    assert user_selector is not None
-    views_t = _build_turn_views(finals)
-    scored_t: list[tuple[TurnIndex, float]] = [
-        (v.turn_index, float(user_selector(v))) for v in views_t
-    ]
-    worst_turns_list = _apply_selection_policy_turn(scored_t, cap_meta)
-    return set(worst_turns_list) & all_turns
+    state = AdaptiveState()
+    for f in finals:
+        state.observe(f)
+    deepening, _worst_pairs, _worst_value = _dispatch_deepening_round(
+        finals=finals,
+        state=state,
+        cap_meta=cap_meta,
+        analysis_config=analysis_config,
+        window_size=window_size,
+        all_turns=all_turns,
+    )
+    return deepening
 
 
 # ---------------------------------------------------------------------------
@@ -815,91 +1599,123 @@ def adaptive_reevaluate(
         q_quantile = cap_meta.get("worst_quantile", worst_quantile)
         q_extra = cap_meta.get("extra_visits", extra_visits)
 
-        # Stage 1: forward partials and metadata immediately. For each
-        # original final that arrives, buffer it for Stage 2's worst-
-        # quantile decision AND emit it immediately as a preview
-        # (is_during_search=True). The preview lets the SPA render the
-        # turn's data the moment KataGo finishes it; the authoritative
-        # is_during_search=False follows in Stage 3 (non-deepened turns)
-        # or Stage 4 (deepened turns, via the spawn sub-query).
-        # The framework signals end-of-stream via original_stream()
-        # exhaustion once all expected finals have arrived.
+        # Mirror closure defaults into cap_meta so dispatch + budget
+        # parsing read uniformly. cap_meta_for_dispatch is the single
+        # source for per-query knobs across the multi-round loop.
+        cap_meta_for_dispatch: dict[str, Any] = dict(cap_meta)
+        cap_meta_for_dispatch.setdefault("worst_quantile", q_quantile)
+        cap_meta_for_dispatch.setdefault("extra_visits", q_extra)
+
+        # v1.0.24: AdaptiveState constructed at coroutine entry; lives
+        # for the duration of the query. Tracks each turn's latest
+        # observed final (for the finalization stage) plus per-unit
+        # history and round-level aggregates for selectors / budget.
+        state = AdaptiveState()
+        # Wall-clock origin for the wall_clock_seconds budget shape;
+        # sampled at coroutine entry (Stage 1 + finalization both count
+        # toward the elapsed total per §3.1's "from coroutine entry to
+        # has_capacity check" calibration). Updated after each round
+        # so budget.has_capacity reads the most recent elapsed time.
+        wall_clock_origin = time.monotonic()
+
+        # Stage 1: forward partials + metadata immediately; record
+        # each original final into state AND emit a preview to the
+        # client. The original packet (is_during_search=False from
+        # KataGo) is edited to a preview (is_during_search=True) on
+        # the wire; the finalization stage at end-of-loop emits the
+        # authoritative is_during_search=False per turn.
         finals: List[AnalyzeResponse] = []
         async for resp in ctx.original_stream():
             if isinstance(resp, MetadataResponse):
-                # adaptive is analyze-shaped end-to-end, but metadata
-                # responses (e.g., error responses) can still arrive
-                # for analyze queries; pass them through.
                 yield resp
                 continue
             if resp.is_during_search:
                 yield resp
                 continue
             finals.append(resp)
+            state.observe(resp)
             yield replace(resp, is_during_search=True)
 
         if not finals:
             return
 
-        # Stage 2: decide on adaptation. Dispatch into the
-        # selector + selection-policy substrate; either the
-        # hardcoded default (no user binding) or the user-authored
-        # selector path runs, with configuration inconsistencies
-        # hard-refusing per AdaptiveConfigurationError. The cap_meta
-        # already carries worst_quantile / window_size / etc.; the
-        # coroutine's closure-default scalars are present as keys via
-        # the legacy-default scaffolding so the dispatch reads
-        # uniformly.
+        # Stage 2: budget parsing + multi-round adaptive loop.
         all_turns: set[TurnIndex] = {TurnIndex(f.turn_number) for f in finals}
         raw_config = parent.opaque.get("analysis_config")
         analysis_config: Optional[dict[str, Any]] = (
             raw_config if isinstance(raw_config, dict) else None
         )
-        # Ensure cap_meta carries the resolved scalar defaults
-        # (closure capture + per-query overrides). The dispatch
-        # helpers read cap_meta as the single source for these
-        # scalars; mirror them in so the call site is uniform.
-        cap_meta_for_dispatch: dict[str, Any] = dict(cap_meta)
-        cap_meta_for_dispatch.setdefault("worst_quantile", q_quantile)
-        deepen = _dispatch_deepening_set(
-            finals=finals,
-            cap_meta=cap_meta_for_dispatch,
-            analysis_config=analysis_config,
-            window_size=window_size,
-            all_turns=all_turns,
-        )
 
-        if not deepen:
-            # No adaptation warranted; promote each preview to the
-            # authoritative final (is_during_search=False).
-            for f in finals:
-                yield f
-            return
+        budget = _parse_budget(cap_meta_for_dispatch)
 
-        _log.info(
-            Event.DIAGNOSTIC,
-            cid=ctx.parent_id,
-            msg=(
-                f"adaptive: orig_id={ctx.parent_id!r} "
-                f"deepening turns={sorted(deepen)} "
-                f"quantile={q_quantile} extra_visits={q_extra}"
-            ),
-        )
+        # Multi-round loop. Each iteration:
+        #   1. Compute this round's worst-set from current state
+        #      (can re-include already-deepened turns; can include
+        #      newly-worst turns whose state shifted).
+        #   2. Spawn deeper query; each KataGo final is recorded in
+        #      state AND emitted as a preview (is_during_search=True).
+        #   3. record_round finalizes the round (counters, deepening
+        #      sets, per-unit deepened counts).
+        # Termination: budget exhausted (any constraint) OR empty
+        # worst-set ("no more adaptation warranted").
+        while budget.has_capacity(state):
+            deepen, worst_pairs, worst_value = _dispatch_deepening_round(
+                finals=finals,
+                state=state,
+                cap_meta=cap_meta_for_dispatch,
+                analysis_config=analysis_config,
+                window_size=window_size,
+                all_turns=all_turns,
+            )
+            if not deepen:
+                break
 
-        # Stage 3: promote previews to authoritative for non-deepened
-        # turns only. Deepened turns already streamed as previews in
-        # Stage 1; their authoritative is_during_search=False arrives
-        # via the spawn sub-query (Stage 4), relabelled onto the
-        # parent's orig_id by the orchestration framework.
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=ctx.parent_id,
+                msg=(
+                    f"adaptive: orig_id={ctx.parent_id!r} "
+                    f"round={state.rounds_completed + 1} "
+                    f"deepening turns={sorted(deepen)} "
+                    f"quantile={q_quantile} extra_visits={q_extra}"
+                ),
+            )
+
+            # Spawn deeper; emit each final as a preview, observe in
+            # state. The deeper query carries its own internal id
+            # but the orchestration framework relabels responses onto
+            # the parent's orig_id before they reach the client.
+            deeper = _build_deeper_query(
+                parent, sorted(deepen), budget.visits_for_round(),
+            )
+            async for resp in ctx.spawn(deeper):
+                if isinstance(resp, MetadataResponse):
+                    yield resp
+                    continue
+                if resp.is_during_search:
+                    yield resp
+                    continue
+                state.observe(resp)
+                yield replace(resp, is_during_search=True)
+
+            state.record_round(
+                worst_pairs=worst_pairs,
+                deepening_turns=deepen,
+                worst_selector_value=worst_value,
+            )
+            state.record_visits(budget.visits_for_round())
+            state.record_wall_clock(time.monotonic() - wall_clock_origin)
+
+        # Stage 3 — finalization. Emit each turn's latest observed
+        # response with is_during_search=False. The single
+        # authoritative emission per turn the KataGo protocol contract
+        # requires. Duplicates the latest preview emission for that
+        # turn modulo the flag (per §8.3 of the roadmap); the SPA's
+        # rendering of analysis data from previews handles the
+        # intermediate state.
         for f in finals:
-            if TurnIndex(f.turn_number) not in deepen:
-                yield f
-
-        # Stage 4: spawn the deeper analysis; yield its responses.
-        # The framework auto-relabels them onto the parent's orig_id
-        # via the OrchestrationMiddleware's handle_response.
-        deeper = _build_deeper_query(parent, sorted(deepen), q_extra)
-        async for resp in ctx.spawn(deeper):
-            yield resp
+            turn = TurnIndex(f.turn_number)
+            latest = state.last_packet(turn) or f
+            yield replace(latest, is_during_search=False)
 
     return coro
