@@ -615,3 +615,65 @@ class RegistryInterpreter:
             for label, symbol_name in mapping.items()
             if symbol_name in self.aeval.symtable
         }
+
+    # ------------------------------------------------------------------
+    # Selector-binding accessors (v1.0.23)
+    # ------------------------------------------------------------------
+    # Adaptive's selector bindings (`move_selector_fn` /
+    # `turn_selector_fn`) need a different fallback discipline than
+    # the existing `delta_fn` / `summary_fn` accessors. Adaptive's
+    # dispatch must distinguish "user didn't bind anything" (use the
+    # hardcoded default policy) from "user bound something" (use the
+    # user's expression). The zero-stub fallback used by
+    # ``resolve_binding`` collapses both cases into a single callable
+    # returning 0, which would mis-signal "user wants every move
+    # scored at zero" for the absent-binding case.
+    #
+    # The accessors below return ``None`` on absent binding. They also
+    # return ``None`` on present-but-broken binding (binding names a
+    # symbol that did not compile or was not declared), matching the
+    # existing analysis-pipeline posture of "warn and proceed without
+    # enrichment" — adaptive's dispatch treats both as "use the
+    # hardcoded default" so a malformed analysis_config does not
+    # block the query.
+    #
+    # See docs/roadmap-adaptive-selector-pluggability.md §4.
+
+    def get_move_selector_fn(self) -> Optional[Callable[[Any], Any]]:
+        """Return the user-authored move-selector function, or None.
+
+        Returns ``None`` when ``bindings['move_selector_fn']`` is
+        absent OR when the named symbol is not in the symtable. The
+        latter case logs a warning so the configuration error is
+        visible; adaptive's dispatch site falls back to the hardcoded
+        default in either case.
+        """
+        return self._resolve_optional_binding("move_selector_fn")
+
+    def get_turn_selector_fn(self) -> Optional[Callable[[Any], Any]]:
+        """Return the user-authored turn-selector function, or None.
+
+        See `get_move_selector_fn` for the None-vs-stub rationale.
+        """
+        return self._resolve_optional_binding("turn_selector_fn")
+
+    def _resolve_optional_binding(
+        self, key: str,
+    ) -> Optional[Callable[[Any], Any]]:
+        """Shared resolution shape for selector-binding accessors.
+
+        Differs from ``resolve_binding`` in returning ``None`` rather
+        than the zero-stub fallback. Caller distinguishes "absent" /
+        "broken" from "bound" via the None vs. Callable return.
+        """
+        symbol_name = self.bindings.get(key)
+        if symbol_name is None:
+            return None
+        if symbol_name in self.aeval.symtable:
+            fn: Callable[[Any], Any] = self.aeval.symtable[symbol_name]
+            return fn
+        logger.warning(
+            f"binding key={key!r} names symbol={symbol_name!r} which is "
+            f"not in the symtable; selector falls back to default."
+        )
+        return None
