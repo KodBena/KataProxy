@@ -155,6 +155,67 @@ class AdaptiveConfigurationError(RuntimeError):
 _COLORS: tuple[Color, Color] = ("black", "white")
 
 
+# Per-unit history surfaced to user-authored selectors via the
+# round_history field on MoveView / TurnView. Defined here (before the
+# views that reference them) for forward-reference cleanliness.
+# Populated by `_build_move_views` / `_build_turn_views` from the
+# active AdaptiveState (commit 3); empty/zero in round 1 and at the
+# legacy single-round dispatch entry. See
+# docs/roadmap-multi-round-adaptation.md §2.3.
+
+@dataclass(frozen=True)
+class MoveRoundHistory:
+    """Per-move history surfaced to a `move_selector_fn` via
+    `x.round_history`.
+
+    Empty in round 1 (selector_values=[], deepened=0,
+    previous_packet=None, rounds_completed=0); populated as
+    rounds progress. User selectors that don't access
+    round_history are unaffected by the field's presence.
+    """
+
+    selector_values: list[float]
+    deepened: int
+    previous_packet: Optional[AnalyzeResponse]
+    rounds_completed: int
+
+
+@dataclass(frozen=True)
+class TurnRoundHistory:
+    """Per-turn history surfaced to a `turn_selector_fn` via
+    `x.round_history`. Same shape as MoveRoundHistory.
+    """
+
+    selector_values: list[float]
+    deepened: int
+    previous_packet: Optional[AnalyzeResponse]
+    rounds_completed: int
+
+
+def _empty_move_round_history() -> MoveRoundHistory:
+    """Default round_history for newly constructed MoveViews — empty
+    selector_values list, zero deepened count, no previous packet,
+    zero rounds completed. Matches what `_build_move_views` would
+    construct from an empty AdaptiveState.
+    """
+    return MoveRoundHistory(
+        selector_values=[],
+        deepened=0,
+        previous_packet=None,
+        rounds_completed=0,
+    )
+
+
+def _empty_turn_round_history() -> TurnRoundHistory:
+    """Default round_history for newly constructed TurnViews."""
+    return TurnRoundHistory(
+        selector_values=[],
+        deepened=0,
+        previous_packet=None,
+        rounds_completed=0,
+    )
+
+
 @dataclass(frozen=True)
 class MoveView:
     """The per-move view a `move_selector_fn` binding receives.
@@ -171,6 +232,9 @@ class MoveView:
     deltas: list[float]
     before: AnalyzeResponse
     after: AnalyzeResponse
+    round_history: MoveRoundHistory = field(
+        default_factory=_empty_move_round_history,
+    )
 
 
 @dataclass(frozen=True)
@@ -186,6 +250,9 @@ class TurnView:
     turn_index: TurnIndex
     to_play: Color
     packet: AnalyzeResponse
+    round_history: TurnRoundHistory = field(
+        default_factory=_empty_turn_round_history,
+    )
 
 
 # Selection-policy primitives — move-axis
@@ -332,35 +399,6 @@ def _default_move_selector(deltas: list[float]) -> float:
 #
 # See docs/roadmap-multi-round-adaptation.md §2.2 for the contract.
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class MoveRoundHistory:
-    """Per-move history surfaced to a `move_selector_fn` via
-    `x.round_history`.
-
-    Empty in round 1 (selector_values=[], deepened=0,
-    previous_packet=None, rounds_completed=0); populated as
-    rounds progress. User selectors that don't access
-    round_history are unaffected by the field's presence.
-    """
-
-    selector_values: list[float]
-    deepened: int
-    previous_packet: Optional[AnalyzeResponse]
-    rounds_completed: int
-
-
-@dataclass(frozen=True)
-class TurnRoundHistory:
-    """Per-turn history surfaced to a `turn_selector_fn` via
-    `x.round_history`. Same shape as MoveRoundHistory.
-    """
-
-    selector_values: list[float]
-    deepened: int
-    previous_packet: Optional[AnalyzeResponse]
-    rounds_completed: int
 
 
 @dataclass
@@ -1290,6 +1328,7 @@ def _apply_selection_policy_turn(
 def _build_move_views(
     finals: List[AnalyzeResponse],
     turn_maps: dict[Color, dict[MoveIndex, list[float]]],
+    state: AdaptiveState,
 ) -> list[MoveView]:
     """Construct a MoveView for each (color, move) with deltas, when
     both endpoint AnalyzeResponses are available.
@@ -1297,6 +1336,13 @@ def _build_move_views(
     Moves at game edges (or any move whose before/after turn isn't in
     the final-response set) are skipped — the user selector cannot
     operate on them without complete view data.
+
+    The `round_history` field on each view is constructed from the
+    active AdaptiveState — selector_history_move per (color, m),
+    deepened_count_move per (color, m), the move's after-position's
+    latest observed packet via state.last_packet, and the global
+    rounds_completed counter. In round 1 (or when the dispatch is
+    state-empty), the fields are empty/zero.
     """
     by_turn: dict[TurnIndex, AnalyzeResponse] = {
         TurnIndex(f.turn_number): f for f in finals
@@ -1309,30 +1355,53 @@ def _build_move_views(
             after_packet = by_turn.get(after_idx)
             if before_packet is None or after_packet is None:
                 continue
+            round_history = MoveRoundHistory(
+                selector_values=state.selector_history_move(color, m),
+                deepened=state.deepened_count_move(color, m),
+                previous_packet=state.last_packet(after_idx),
+                rounds_completed=state.rounds_completed,
+            )
             views.append(MoveView(
                 color=color,
                 move_index=m,
                 deltas=list(deltas),
                 before=before_packet,
                 after=after_packet,
+                round_history=round_history,
             ))
     return views
 
 
 def _build_turn_views(
     finals: List[AnalyzeResponse],
+    state: AdaptiveState,
 ) -> list[TurnView]:
     """Construct a TurnView for each final AnalyzeResponse.
 
     Side-to-play at turn t: Black at even turns (0, 2, 4, …), White
     at odd turns. The convention follows KataGo's analyze_turns
     indexing where turn 0 is the root.
+
+    The `round_history` field is constructed from the active
+    AdaptiveState — selector_history_turn, deepened_count_turn,
+    state.last_packet(turn), and rounds_completed.
     """
     views: list[TurnView] = []
     for f in finals:
         turn = TurnIndex(f.turn_number)
         to_play: Color = "black" if int(turn) % 2 == 0 else "white"
-        views.append(TurnView(turn_index=turn, to_play=to_play, packet=f))
+        round_history = TurnRoundHistory(
+            selector_values=state.selector_history_turn(turn),
+            deepened=state.deepened_count_turn(turn),
+            previous_packet=state.last_packet(turn),
+            rounds_completed=state.rounds_completed,
+        )
+        views.append(TurnView(
+            turn_index=turn,
+            to_play=to_play,
+            packet=f,
+            round_history=round_history,
+        ))
     return views
 
 
@@ -1354,6 +1423,16 @@ def _dispatch_deepening_set(
     interpreter = _try_build_interpreter(analysis_config)
     axis, user_selector = _resolve_axis_and_selector(interpreter, cap_meta)
 
+    # v1.0.24 commit 3: construct an AdaptiveState for view round_history
+    # population. In the single-round dispatch (this function's pre-
+    # commit-4 shape), the state is freshly empty — round_history
+    # fields on every view are zero/empty. Commit 4 lifts state
+    # management to the coroutine so the multi-round loop's per-round
+    # state evolution drives view round_history.
+    state = AdaptiveState()
+    for f in finals:
+        state.observe(f)
+
     if axis == "move":
         # Score the per-color moves — either via the hardcoded default
         # (no user binding) or the user-authored selector. The default
@@ -1374,7 +1453,7 @@ def _dispatch_deepening_set(
                 worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
             )
         else:
-            views_m = _build_move_views(finals, turn_maps)
+            views_m = _build_move_views(finals, turn_maps, state)
             scored_m: list[tuple[Color, MoveIndex, float]] = [
                 (v.color, v.move_index, float(user_selector(v)))
                 for v in views_m
@@ -1384,7 +1463,7 @@ def _dispatch_deepening_set(
 
     # axis == "turn" — user binding required (axis resolution enforces).
     assert user_selector is not None
-    views_t = _build_turn_views(finals)
+    views_t = _build_turn_views(finals, state)
     scored_t: list[tuple[TurnIndex, float]] = [
         (v.turn_index, float(user_selector(v))) for v in views_t
     ]

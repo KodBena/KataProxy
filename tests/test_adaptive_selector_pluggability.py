@@ -51,6 +51,7 @@ from katago import (  # noqa: E402
 )
 from middleware.adaptive_reevaluate import (  # noqa: E402
     AdaptiveConfigurationError,
+    AdaptiveState,
     MoveView,
     TurnView,
     _apply_selection_policy_move,
@@ -136,7 +137,7 @@ class TestViewConstruction:
             "black": {MoveIndex(0): [0.1, 0.15]},
             "white": {MoveIndex(0): [0.2]},
         }
-        views = _build_move_views(finals, turn_maps)
+        views = _build_move_views(finals, turn_maps, AdaptiveState())
         assert len(views) == 2
         black_view = next(v for v in views if v.color == "black")
         assert int(black_view.move_index) == 0
@@ -156,12 +157,12 @@ class TestViewConstruction:
             "black": {MoveIndex(0): [0.1]},
             "white": {MoveIndex(0): [0.2]},
         }
-        views = _build_move_views(finals, turn_maps)
+        views = _build_move_views(finals, turn_maps, AdaptiveState())
         assert views == []
 
     def test_build_turn_views_assigns_to_play(self) -> None:
         finals = [_make_packet(0), _make_packet(1), _make_packet(2)]
-        views = _build_turn_views(finals)
+        views = _build_turn_views(finals, AdaptiveState())
         assert len(views) == 3
         by_turn = {int(v.turn_index): v for v in views}
         assert by_turn[0].to_play == "black"  # Black plays from turn 0
