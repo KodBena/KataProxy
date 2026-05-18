@@ -20,19 +20,23 @@
 
 This arc widens `adaptive_reevaluate` from a single-shot
 select-and-deepen into a multi-round loop with a typed budget
-abstraction and an across-iteration state object. v1.0.23's
-selector pluggability + window correction stay in place; this arc
-wraps them in a loop and exposes round-history to user selectors
-via the view object's `round_history` field.
+abstraction, an across-iteration state object, and a finalization
+stage that emits each turn's authoritative final at end-of-loop.
+v1.0.23's selector pluggability + window correction stay in
+place; this arc wraps them in a loop and exposes round-history
+to user selectors via the view object's `round_history` field.
 
-Five new pieces:
+Six new pieces:
 
 1. **The multi-round loop** in the coroutine's Stage 2+. Each
-   iteration is one round of select-and-deepen. Budget exhaustion,
-   convergence, or "no more turns to deepen" terminates the loop.
+   iteration is one round of select-and-deepen. Each round's
+   worst-set is computed from current state and can vary across
+   rounds (re-deepening already-deepened turns, or picking up
+   newly-worst turns as the state shifts).
 2. **`AdaptiveState`** object — accumulates per-round per-unit
-   data across iterations. Framework-owned, queryable from
-   selectors / value functions / budget objects.
+   data, including each turn's latest observed response.
+   Framework-owned, queryable from selectors / value functions /
+   budget objects.
 3. **`round_history`** field on `MoveView` / `TurnView` —
    selectors can read prior-round selector values, deepened
    counts, and the prior round's analyze packet.
@@ -45,6 +49,15 @@ Five new pieces:
    plus the four-form tolerance shape (`metric`, `tolerance`,
    `lookback`, `scale`). Composable via `all_of` / `any_of` per
    §11.4-style consistency.
+6. **Finalization stage** — at end-of-loop (whatever the
+   termination cause), the proxy emits each turn's latest
+   observed response with `is_during_search=False`. This is the
+   single authoritative emission per turn that the KataGo
+   protocol contract requires; during the multi-round loop
+   every emission carries `is_during_search=True` (preview).
+   The finalization-at-end mechanism makes the protocol
+   contract hold uniformly under any budget shape and allows
+   the worst-set to vary across rounds without violation.
 
 Plus context-dependent budget profiles (`review-tight` /
 `range-generous` / `loop-aggressive`) layered over raw budget
@@ -53,8 +66,9 @@ shapes for ergonomic per-context tuning.
 Pattern parallels v1.0.23 in shape (focused multi-commit arc on
 a feature branch) but is bigger in substrate surface. The wire
 shape gains a `budget` field on capability metadata. Legacy
-clients (no `budget` field) get K=1 by default — exactly
-v1.0.23's single-shot behaviour, bit-for-bit.
+clients (no `budget` field) get K=1 by default. The wire shape
+at K=1 differs slightly from v1.0.23 single-shot by +1 preview
+emission per deepened turn — see §5 for details.
 
 Phases 3 (info-theoretic primitives) and 4 (user-authored
 policies) are out of scope for v1.0.24. Phase 3 inherits this
@@ -101,64 +115,121 @@ capability.
 
 ```python
 async def coro(parent, ctx):
-    # Stage 1: original finals + preview streaming (unchanged from v1.0.23).
-    finals = []
+    # Stage 1: original finals + preview streaming. Each KataGo
+    # final is recorded in state (as the initial "latest" per
+    # turn) AND emitted to the client as a preview. Partials and
+    # metadata pass through unchanged.
+    state = AdaptiveState()
+    finals: list[AnalyzeResponse] = []
     async for resp in ctx.original_stream():
-        # ... process resp, append to finals, emit preview ...
+        if isinstance(resp, MetadataResponse):
+            yield resp
+            continue
+        if resp.is_during_search:
+            yield resp
+            continue
+        finals.append(resp)
+        state.observe(resp)
+        yield replace(resp, is_during_search=True)
 
     if not finals: return
 
-    # Stage 2: initialize state + budget.
-    all_turns = {TurnIndex(f.turn_number) for f in finals}
-    state = AdaptiveState(originals=finals)
+    # Stage 2: budget + multi-round loop.
     budget = parse_budget(cap_meta)
+    all_turns = {TurnIndex(f.turn_number) for f in finals}
 
-    # Multi-round loop.
-    deepened_so_far: set[TurnIndex] = set()
     while budget.has_capacity(state):
+        # Compute this round's worst-set from current state. The
+        # worst-set can vary across rounds: re-include
+        # already-deepened turns (re-deepening at higher visit
+        # counts) or include newly-worst turns whose state
+        # shifted relative to peers in prior rounds.
         deepen = _dispatch_deepening_round(
             state, cap_meta, analysis_config, window_size, all_turns,
         )
         if not deepen:
             break  # no more adaptation warranted
 
-        # Spawn deeper query for this round's deepening set.
+        # Spawn deeper query for this round's deepening set. Each
+        # KataGo final from the deeper query is recorded in state
+        # (overwriting the prior "latest" for that turn) AND
+        # emitted to the client as a PREVIEW (is_during_search=True).
+        # Partials pass through. No buffering: each KataGo
+        # response is immediately emitted to the client with
+        # appropriate field edits.
         deeper = _build_deeper_query(
             parent, sorted(deepen), budget.visits_for_round(),
         )
         async for resp in ctx.spawn(deeper):
-            state.observe_response(resp)
-            yield resp
+            if isinstance(resp, MetadataResponse):
+                yield resp
+                continue
+            if resp.is_during_search:
+                yield resp
+                continue
+            state.observe(resp)
+            yield replace(resp, is_during_search=True)
 
-        deepened_so_far.update(deepen)
         state.record_round(round_deepen=deepen)
 
-    # Stage 3: emit non-deepened originals as authoritative.
+    # Stage 3 — finalization. Emit each turn's latest observed
+    # response with is_during_search=False. This is the single
+    # authoritative emission per turn the KataGo protocol contract
+    # requires (exactly one is_during_search=False per turn per
+    # query). The data duplicates the latest preview emission for
+    # that turn modulo the flag; acknowledged-fine per §8.3.
     for f in finals:
-        if TurnIndex(f.turn_number) not in deepened_so_far:
-            yield f
+        turn = TurnIndex(f.turn_number)
+        latest = state.last_packet(turn) or f
+        yield replace(latest, is_during_search=False)
 ```
 
 Notes on the shape:
 
 - **Each round computes its own worst-set** from current `state`,
-  which includes the prior rounds' deeper-query observations.
-  Already-deepened turns may re-enter the worst-set if their
-  deeper analysis didn't move them out — KataGo's cache
-  continuation means re-deepening adds further visits efficiently.
-- **`state.observe_response(resp)`** updates the state as deeper-
-  query responses arrive. The next round's selector reads the
-  updated state.
-- **Stage 3 emits non-deepened originals AFTER the loop terminates.**
-  This is a UX-vs-cleanliness trade-off: previews linger for
-  non-deepened turns until the multi-round sequence completes,
-  but each turn has exactly one authoritative emission (no
-  duplicate finals). The v1.0.20 streaming-previews refactor
-  established this preview-then-final pattern as the SPA-side
-  expectation; lingering previews are within that contract.
-- **The single-shot semantics are recovered at K=1** — the budget
-  terminates after one round, the loop body runs once, Stage 3
-  emits non-deepened originals exactly as v1.0.23 did.
+  which carries the latest observed response per turn (from
+  Stage 1's originals or any prior round's deeper-query
+  responses). Already-deepened turns may re-enter the worst-set
+  if their deeper analysis didn't move them out — KataGo's
+  cache continuation makes re-deepening at progressively higher
+  maxVisits efficient. Turns not deepened in round 1 may enter
+  later rounds' worst-sets as the state shifts.
+- **`state.observe(resp)`** is called for every KataGo final the
+  proxy receives (originals in Stage 1 and deeper-query
+  responses in the loop). Records `resp` as the latest for
+  `TurnIndex(resp.turn_number)`. The next round's selector
+  reads the updated state via the per-turn / per-move
+  accessors; the finalization stage reads
+  `state.last_packet(turn)` to emit the authoritative.
+- **Finalization at end-of-loop emits each turn's latest with
+  `is_during_search=False`.** This is the single authoritative
+  emission per turn the protocol contract requires. The
+  finalization runs regardless of why the loop terminated
+  (budget exhausted, convergence, "no more to deepen") — the
+  protocol contract holds uniformly. The "duplicate modulo
+  is_during_search" pattern is named-and-acknowledged in §8.3.
+- **No buffering of KataGo responses.** Each KataGo response is
+  emitted to the client immediately (with `is_during_search`
+  edited to True). The finalization emission is a NEW emission
+  per turn — duplicating the preview's data modulo the flag.
+  `state.last_packet` provides a reference to the latest data
+  for the finalization stage; this is short-term retention for
+  the field-edit decision, not delayed emission.
+
+**Per-turn emission accounting:**
+
+A turn deepened in K rounds:
+- Stage 1: 1 preview (from KataGo's original final)
+- Per round in worst-set: 1 preview (from deeper-query final)
+- Finalization: 1 emission with `is_during_search=False`
+- Total: K + 2 proxy emissions; exactly one `is_during_search=False`. ✓
+
+A turn never deepened:
+- Stage 1: 1 preview
+- Finalization: 1 emission with `is_during_search=False`
+- Total: 2 proxy emissions; exactly one `is_during_search=False`. ✓
+
+Protocol contract holds uniformly.
 
 ### 2.2 `AdaptiveState` contract
 
@@ -491,9 +562,28 @@ clearly.
 ## 5. Defaults and backwards compatibility
 
 When no `budget` field is set, the budget defaults to
-`max_rounds=1` with no other constraints — exact v1.0.23
-single-shot semantics. Wire-compatible in both directions:
-legacy clients see today's behaviour bit-for-bit.
+`max_rounds=1` with no other constraints. The coroutine runs
+one round of select-and-deepen and then enters the finalization
+stage. Each turn receives the wire shape characteristic of K=1
+multi-round (preview during the round; one finalization emission
+with `is_during_search=False`).
+
+**Vs v1.0.23 single-shot, wire-shape diff:** The wire shape
+differs from v1.0.23 by +1 preview emission per deepened turn.
+v1.0.23 emitted each deepened turn's deeper-query final directly
+with `is_during_search=False` (one emission per deepened turn,
+serving both as preview-completion and authoritative-final).
+v1.0.24 emits the deeper-query final as a preview
+(`is_during_search=True`), then re-emits at the finalization
+stage with `is_during_search=False`. Per turn, two emissions
+where v1.0.23 had one. Non-deepened turns are unchanged
+(one preview from Stage 1, one finalization emission — matches
+v1.0.23 exactly).
+
+The +1 preview per deepened turn is the "duplicate modulo
+`is_during_search`" pattern named in §8.3; protocol-conformant
+and acknowledged client-acceptable. The release annotation
+names this divergence.
 
 When a `budget` profile string names an unknown profile, the
 dispatch refuses with `budget_invalid`. Per §11.4: silent
@@ -530,8 +620,12 @@ New module-level dataclass in
 
 - `AdaptiveState` with the queryable surface from §2.2.
 - `MoveRoundHistory` / `TurnRoundHistory` frozen dataclasses.
-- Framework-side population methods (`observe_originals`,
-  `observe_response`, `record_round`).
+- Framework-side population methods: `observe(resp)` records a
+  KataGo final as the latest for its turn (called from Stage 1
+  for originals and from the loop for deeper-query responses);
+  `record_round(round_deepen)` increments round counters and
+  records the round's deepening set for metric-trajectory
+  computation.
 - No consumers yet; additive only.
 
 ### Commit 2 — Budget abstraction (additive)
@@ -564,18 +658,27 @@ New module-level dataclass in
 The substantive integration commit. The `coro` Stage 2+ refactors
 to the multi-round loop from §2.1:
 
-- `AdaptiveState` constructed at coroutine entry, populated by
-  `observe_originals(finals)`.
+- `AdaptiveState` constructed at coroutine entry. Stage 1's
+  per-original `state.observe(resp)` calls record originals as
+  initial "latest per turn"; the per-round loop's
+  `state.observe(resp)` calls overwrite the latest as deeper
+  responses arrive.
 - `Budget` parsed from `cap_meta`.
 - `while budget.has_capacity(state)`: round loop.
 - Inside the loop: `_dispatch_deepening_round` (a thin wrapper
   around `_dispatch_deepening_set` that threads `state` for
-  the round_history construction); deeper query spawn; state
-  observation; round recording.
-- Stage 3 emits non-deepened originals after the loop.
-- K=1 default behaviour preserved bit-for-bit (the loop body
-  runs once; the deepening set is computed against the
-  initial state; the spawn matches v1.0.23's exact shape).
+  the round_history construction); deeper query spawn; each
+  KataGo final from the spawn emitted as a preview
+  (`is_during_search=True`) and recorded via `state.observe`;
+  round recording.
+- After the loop: finalization stage — for each turn in
+  `finals`, yield `replace(state.last_packet(turn) or
+  original_final, is_during_search=False)`. The single
+  authoritative emission per turn per the protocol contract;
+  duplicates the latest preview emission modulo the flag.
+- K=1 default behaviour: one round of select-and-deepen, then
+  finalization. Wire shape differs from v1.0.23 by +1 preview
+  emission per deepened turn (per §5 / §8.3).
 
 ### Commit 5 — Framework-default metric trajectories
 
@@ -612,8 +715,11 @@ New `tests/test_multi_round_adaptation.py` covering:
 - Multi-round dispatch — synthetic finals + state + budget;
   assert per-round worst-set computation; assert state
   accumulation across rounds.
-- K=1 default — single-round behaviour bit-for-bit equivalent
-  to v1.0.23's `_dispatch_deepening_set`.
+- K=1 default — one round of select-and-deepen + finalization;
+  wire shape carries +1 preview emission per deepened turn vs
+  v1.0.23, with one finalization emission per turn carrying
+  `is_during_search=False`. Assert the per-turn emission
+  accounting matches §2.1's table.
 - Convergence-based termination — synthetic state with a
   stabilising metric trajectory; assert the loop terminates at
   the expected round.
@@ -652,8 +758,8 @@ Per the v1.0.21 / v1.0.22 / v1.0.23 precedent:
 ### 8.1 `AdaptiveState` is framework-owned
 
 Selectors / value functions / budget objects read it; they do
-not write it. Mutation methods (`observe_originals`,
-`observe_response`, `record_round`) are private to the
+not write it. Mutation methods (`observe`, `record_round`)
+are private to the
 coroutine and the framework's dispatch helpers. This mirrors the
 v1.0.23 dispatch's discipline: framework owns lifecycle and
 mutation; user code reads and authors expressions.
@@ -666,16 +772,47 @@ selection K times with state updating between rounds." A
 future Phase 4 user-authored policy could vary the selection
 shape across rounds; v1.0.24 doesn't admit this.
 
-### 8.3 Stage 3 emits non-deepened originals AFTER the loop
+### 8.3 Finalization stage emits each turn's latest at end-of-loop
 
-The v1.0.20 streaming-previews refactor established that
-previews linger for un-finalised turns; this arc extends the
-"preview lingering" through the entire multi-round sequence
-for non-deepened turns. UX trade-off: previews linger longer
-for never-deepened turns vs the simpler "each turn has
-exactly one authoritative emission" property. Recommendation:
-accept the trade-off; the lingering is bounded by the budget
-which the user explicitly authored.
+Each KataGo response is emitted immediately to the client as a
+preview (`is_during_search=True`); the proxy retains a
+reference to each turn's latest observed response in
+`AdaptiveState`. When the multi-round loop terminates
+(whatever the termination cause), the finalization stage
+re-emits each turn's latest response with
+`is_during_search=False` — the single authoritative emission
+per turn the KataGo protocol contract requires.
+
+The finalization emission produces a "duplicate modulo
+`is_during_search`" wire pattern: the SPA receives the same
+data once as a preview during the loop and once as the
+authoritative at the end. The duplicate is acknowledged-fine on
+protocol-correctness grounds — the protocol mandates exactly
+one `is_during_search=False` per turn per query, which the
+finalization stage provides uniformly.
+
+What the finalization-at-end design enables:
+
+- **Worst-set varies per round.** A turn deepened in round 1
+  can re-enter round 2's worst-set for further deepening; a
+  turn not deepened in round 1 can be picked up in round 2 as
+  the state shifts. No protocol violation arises because the
+  in-loop emissions are previews; only the finalization emits
+  finals.
+- **All four budget shapes work uniformly.** Convergence and
+  wall-clock no longer need special-case handling — the
+  finalization happens at end-of-loop regardless of why the
+  loop ended.
+- **No buffering of KataGo responses.** Each KataGo response
+  flows immediately to the client; the `state.last_packet`
+  retention is short-term reference for the finalization
+  emission, not delayed pass-through.
+
+Wire-shape divergence vs v1.0.23 at K=1 is +1 preview emission
+per deepened turn (the deeper-query response is now emitted
+as a preview rather than directly as a final, with the
+finalization emission providing the authoritative). See §5 for
+the full per-turn accounting.
 
 ### 8.4 Re-deepening a previously-deepened turn is allowed
 
