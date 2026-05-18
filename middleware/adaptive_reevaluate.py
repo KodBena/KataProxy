@@ -67,6 +67,8 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import logging
 import time
 from collections import defaultdict
@@ -82,6 +84,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    Union,
     cast,
 )
 
@@ -98,10 +101,20 @@ from katago import (
     TurnIndex,
     move_to_turn_pair,
 )
+from middleware.allocation import (
+    AllocationAlgorithm,
+    _parse_allocation_algorithm,
+    _registered_algorithm_names,
+)
 from middleware.orchestration import (
     OrchestrationContext,
     OrchestrationMiddleware,
     orchestration_middleware,
+)
+from middleware.visit_scaling import (
+    VisitScalingModel,
+    _parse_visit_scaling_model,
+    _registered_model_names,
 )
 from proxy_logging import Event, get_proxy_logger
 from registry_interpreter import RegistryInterpreter
@@ -128,9 +141,19 @@ class AdaptiveConfigurationError(RuntimeError):
     inconsistent.
 
     See docs/roadmap-adaptive-selector-pluggability.md §11.4 for the
-    principle and the four `code` values: `ambiguous_axis`,
-    `axis_binding_mismatch`, `policy_axis_mismatch`,
-    `policy_parameters_invalid`.
+    cost-asymmetry principle. The `code` values across v1.0.23-v1.0.25:
+
+      v1.0.23 (selector pluggability):
+        - `ambiguous_axis`
+        - `axis_binding_mismatch`
+        - `policy_axis_mismatch`
+        - `policy_parameters_invalid`
+
+      v1.0.24 (multi-round + budget):
+        - `budget_invalid`
+
+      v1.0.25 (info-theoretic allocation):
+        - `allocation_invalid`
     """
 
     def __init__(self, *, code: str, detail: dict[str, Any]) -> None:
@@ -1547,6 +1570,337 @@ def _dispatch_deepening_set(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — information-theoretic allocation dispatch (v1.0.25 commit 5)
+#
+# Engagement: `capabilities.adaptive_reevaluate.allocation_algorithm`
+# present in the per-query metadata. When engaged, the per-round
+# dispatch (after _dispatch_deepening_round identifies the candidate
+# set) routes through `_allocate_visits` to produce a per-turn visit
+# budget, then spawns N parallel sub-queries (one per candidate),
+# streaming responses as previews via _stream_parallel_spawns. When
+# absent, the v1.0.24 single-spawn worst-quantile dispatch holds.
+#
+# See `proxy/docs/roadmap-info-theoretic-allocation.md` §§3.6, 5, 6.
+# ---------------------------------------------------------------------------
+
+
+# Attribute names whose access in a user-authored value-function
+# expression requires opting in via the corresponding `include*` flag
+# on the parent analyze query. The mapping is closed for v1.0.25;
+# future KataGo additions extend this dict.
+
+_GATED_ATTR_TO_INCLUDE_FLAG: dict[str, str] = {
+    "policy": "includePolicy",
+    "ownership": "includeOwnership",
+    "ownershipStdev": "includeOwnershipStdev",
+    "pvVisits": "includePVVisits",
+    "noResultValue": "includeNoResultValue",
+}
+
+
+def _required_include_flags(expression_str: str) -> set[str]:
+    """Walk the AST of a value-function expression and collect the set
+    of `include*` flags the expression's field references would
+    require on the parent query.
+
+    Heuristic on the moves-vs-root variant: if the expression
+    references `moveInfos` anywhere AND reads `.ownership` /
+    `.ownershipStdev`, both the root-level and the
+    moves-* variants are required. False-positives over-require flags
+    (benign: payload grows slightly); false-negatives (missing a
+    required flag) is what the eager check exists to prevent — the
+    AST walk's blanket "require both variants on moveInfos+ownership"
+    keeps the false-negative side clean.
+
+    A SyntaxError in the expression returns an empty set; the
+    interpreter raises at evaluation time with its own diagnostics.
+    """
+    try:
+        tree = ast.parse(expression_str, mode="eval")
+    except SyntaxError:
+        return set()
+
+    has_moveinfos_ref = False
+    attrs_seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "moveInfos":
+            has_moveinfos_ref = True
+        elif isinstance(node, ast.Attribute):
+            if node.attr == "moveInfos":
+                has_moveinfos_ref = True
+            attrs_seen.add(node.attr)
+
+    required: set[str] = set()
+    if "policy" in attrs_seen:
+        required.add("includePolicy")
+    if "noResultValue" in attrs_seen:
+        required.add("includeNoResultValue")
+    if "pvVisits" in attrs_seen:
+        required.add("includePVVisits")
+    if "ownership" in attrs_seen:
+        required.add("includeOwnership")
+        if has_moveinfos_ref:
+            required.add("includeMovesOwnership")
+    if "ownershipStdev" in attrs_seen:
+        required.add("includeOwnership")
+        required.add("includeOwnershipStdev")
+        if has_moveinfos_ref:
+            required.add("includeMovesOwnership")
+            required.add("includeMovesOwnershipStdev")
+    return required
+
+
+def _is_phase3_engaged(cap_meta: dict[str, Any]) -> bool:
+    """True when `allocation_algorithm` is set in capability metadata.
+
+    The single engagement signal per §6 of the roadmap: presence of
+    `allocation_algorithm` indicates the user has opted into Phase 3.
+    Co-fields (`visit_scaling_model`, `value_binding`) are validated
+    by `_engage_phase3` only when engagement is signalled — absent
+    signal leaves v1.0.24 dispatch entirely untouched.
+    """
+    return cap_meta.get("allocation_algorithm") is not None
+
+
+def _engage_phase3(
+    cap_meta: dict[str, Any],
+    analysis_config: Optional[dict[str, Any]],
+    parent_opaque: dict[str, Any],
+) -> tuple[AllocationAlgorithm, VisitScalingModel, Callable[[Any], float]]:
+    """Parse all three Phase 3 plug points OR refuse with
+    `AdaptiveConfigurationError(code="allocation_invalid")`.
+
+    Returns the resolved `(algorithm, visit_scaling_model, value_fn)`
+    triple. Called once at coroutine entry (not per round) so the
+    refusal happens before any compute is spent.
+
+    Eager validation per §3.6.4 / §11.10: the value-function
+    expression's AST is scanned for opt-in-gated field references;
+    if any required `include*` flag is absent on the parent query,
+    refuse with the missing-flags list in `detail`.
+    """
+    algo = _parse_allocation_algorithm(cap_meta)
+
+    model_name = cap_meta.get("visit_scaling_model")
+    if not isinstance(model_name, str) or not model_name:
+        raise AdaptiveConfigurationError(
+            code="allocation_invalid",
+            detail={
+                "visit_scaling_model": model_name,
+                "expected": "non-empty string (name of a curated model)",
+                "valid": _registered_model_names(),
+            },
+        )
+    model = _parse_visit_scaling_model(model_name)
+
+    value_binding = cap_meta.get("value_binding")
+    if not isinstance(value_binding, str) or not value_binding:
+        raise AdaptiveConfigurationError(
+            code="allocation_invalid",
+            detail={
+                "value_binding": value_binding,
+                "expected": (
+                    "non-empty string naming a value_fn symbol in "
+                    "analysis_config.symbols"
+                ),
+            },
+        )
+
+    interp = _try_build_interpreter(analysis_config)
+    if interp is None:
+        raise AdaptiveConfigurationError(
+            code="allocation_invalid",
+            detail={
+                "value_binding": value_binding,
+                "issue": (
+                    "Phase 3 requires analysis_config with a "
+                    "value_fn binding; analysis_config is absent or "
+                    "malformed"
+                ),
+            },
+        )
+
+    # Verify value_binding consistency: analysis_config.bindings.value_fn
+    # must point to the symbol named in capability metadata. The mismatch
+    # is a configuration error (SPA-side wire shape disagreed with itself).
+    bindings = analysis_config.get("bindings") if analysis_config else None
+    bindings_value_fn = (
+        bindings.get("value_fn") if isinstance(bindings, dict) else None
+    )
+    if bindings_value_fn != value_binding:
+        raise AdaptiveConfigurationError(
+            code="allocation_invalid",
+            detail={
+                "value_binding": value_binding,
+                "analysis_config.bindings.value_fn": bindings_value_fn,
+                "issue": (
+                    "capability metadata's value_binding must match "
+                    "analysis_config.bindings.value_fn"
+                ),
+            },
+        )
+
+    value_fn = interp.get_value_fn()
+    if value_fn is None:
+        raise AdaptiveConfigurationError(
+            code="allocation_invalid",
+            detail={
+                "value_binding": value_binding,
+                "issue": (
+                    "value_fn binding does not resolve in "
+                    "analysis_config; check that the named symbol "
+                    "exists in analysis_config.symbols"
+                ),
+            },
+        )
+
+    # Eager include-flag validation (§3.6.4 / §11.10).
+    symbols = analysis_config.get("symbols") if analysis_config else None
+    expression_src = (
+        symbols.get(value_binding) if isinstance(symbols, dict) else None
+    )
+    if isinstance(expression_src, str):
+        required_flags = _required_include_flags(expression_src)
+        missing = sorted(
+            flag for flag in required_flags
+            if not parent_opaque.get(flag)
+        )
+        if missing:
+            raise AdaptiveConfigurationError(
+                code="allocation_invalid",
+                detail={
+                    "value_binding": value_binding,
+                    "missing_includes": missing,
+                    "remedy": (
+                        "set these include* flags to true on the "
+                        "parent analyze query so the value function "
+                        "can read the fields it references"
+                    ),
+                },
+            )
+
+    # Cast for the type-checker: get_value_fn returns Callable[[Any], Any];
+    # the allocation algorithm consumes Callable[[TurnView], float] — the
+    # float coercion happens at the call site in the allocation code.
+    return algo, model, cast(Callable[[Any], float], value_fn)
+
+
+async def _stream_parallel_spawns(
+    ctx: OrchestrationContext,
+    queries: List[KataGoQuery],
+) -> AsyncIterator[KataGoResponse]:
+    """Stream responses from N parallel sub-queries, interleaved as
+    they arrive from upstream.
+
+    The orchestration framework's `ctx.parallel(*queries)` gathers
+    each sub-query's responses into a list and returns once all are
+    complete — which would buffer N rounds' worth of intermediate
+    previews against v1.0.20's no-buffering discipline. This helper
+    merges N async iterators into a single flat stream, yielding each
+    response as it arrives.
+
+    Each yield is one response from one sub-query; the response's
+    `turn_number` identifies which candidate the response belongs to.
+    All sub-queries' responses interleave; the caller demultiplexes
+    by `turn_number` if needed.
+
+    Cancellation safety: if the caller stops iterating, the pump
+    tasks are cancelled in the `finally` block; the orchestration
+    framework's own cancellation path handles sub-query teardown.
+    """
+    _Sentinel = object
+    sentinel: object = _Sentinel()
+    queue: asyncio.Queue[Union[KataGoResponse, object]] = asyncio.Queue()
+
+    async def pump(query: KataGoQuery) -> None:
+        try:
+            async for resp in ctx.spawn(query):
+                await queue.put(resp)
+        finally:
+            await queue.put(sentinel)
+
+    tasks = [asyncio.create_task(pump(q)) for q in queries]
+    pending = len(tasks)
+    try:
+        while pending > 0:
+            item = await queue.get()
+            if item is sentinel:
+                pending -= 1
+                continue
+            # The type check above narrows `item` away from the
+            # sentinel object, leaving KataGoResponse.
+            assert isinstance(item, (AnalyzeResponse, MetadataResponse))
+            yield item
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        for t in tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def _turn_view_for_allocation(
+    turn: TurnIndex, state: AdaptiveState,
+) -> Optional[TurnView]:
+    """Build a TurnView for the allocation algorithm from the state's
+    latest observed packet for this turn.
+
+    Returns None when the state has no packet for this turn — the
+    coroutine should not call _allocate_visits with a turn that
+    hasn't been observed. The Phase 3 dispatch composes with Phase 2:
+    the dispatch's `deepen` set comes from candidates whose finals
+    were already observed in Stage 1.
+    """
+    packet = state.last_packet(turn)
+    if packet is None:
+        return None
+    to_play: Color = "black" if int(turn) % 2 == 0 else "white"
+    return TurnView(
+        turn_index=turn,
+        to_play=to_play,
+        packet=packet,
+    )
+
+
+def _allocate_visits(
+    deepen: set[TurnIndex],
+    state: AdaptiveState,
+    algo: AllocationAlgorithm,
+    model: VisitScalingModel,
+    value_fn: Callable[[Any], float],
+    budget_visits: int,
+) -> dict[TurnIndex, int]:
+    """Run the Phase 3 allocation algorithm over the round's candidate set.
+
+    `deepen` is the per-round candidate set from
+    `_dispatch_deepening_round`; each candidate becomes a TurnView
+    constructed from state.last_packet. Turns absent from state
+    (defensive — shouldn't happen in normal dispatch) are skipped.
+
+    Returns the per-turn visit allocation. The empty dict when the
+    candidate set is empty after filtering OR when the algorithm
+    returns an empty allocation (e.g., budget_visits = 0).
+    """
+    candidates: list[TurnView] = []
+    for turn in sorted(deepen):
+        view = _turn_view_for_allocation(turn, state)
+        if view is not None:
+            candidates.append(view)
+    if not candidates:
+        return {}
+    allocation = algo.allocate(
+        candidates=candidates,
+        value_fn=value_fn,
+        visit_scaling_model=model,
+        budget_visits=budget_visits,
+    )
+    return allocation
+
+
+# ---------------------------------------------------------------------------
 # adaptive_reevaluate factory (orchestration-shaped)
 # ---------------------------------------------------------------------------
 
@@ -1618,6 +1972,25 @@ def adaptive_reevaluate(
         # so budget.has_capacity reads the most recent elapsed time.
         wall_clock_origin = time.monotonic()
 
+        # v1.0.25: Phase 3 engagement check. When `allocation_algorithm`
+        # is named in capability metadata, all three plug points are
+        # resolved + validated eagerly at coroutine entry — refusal
+        # happens before Stage 1's compute cost is committed. When
+        # absent, phase3 stays None and v1.0.24 dispatch holds.
+        raw_config = parent.opaque.get("analysis_config")
+        analysis_config: Optional[dict[str, Any]] = (
+            raw_config if isinstance(raw_config, dict) else None
+        )
+        phase3: Optional[tuple[
+            AllocationAlgorithm, VisitScalingModel, Callable[[Any], float],
+        ]] = None
+        if _is_phase3_engaged(cap_meta_for_dispatch):
+            phase3 = _engage_phase3(
+                cap_meta=cap_meta_for_dispatch,
+                analysis_config=analysis_config,
+                parent_opaque=parent.opaque,
+            )
+
         # Stage 1: forward partials + metadata immediately; record
         # each original final into state AND emit a preview to the
         # client. The original packet (is_during_search=False from
@@ -1640,11 +2013,9 @@ def adaptive_reevaluate(
             return
 
         # Stage 2: budget parsing + multi-round adaptive loop.
+        # analysis_config was extracted at coroutine entry (above) so
+        # the Phase 3 engagement check could consume it. Reused here.
         all_turns: set[TurnIndex] = {TurnIndex(f.turn_number) for f in finals}
-        raw_config = parent.opaque.get("analysis_config")
-        analysis_config: Optional[dict[str, Any]] = (
-            raw_config if isinstance(raw_config, dict) else None
-        )
 
         budget = _parse_budget(cap_meta_for_dispatch)
 
@@ -1677,26 +2048,64 @@ def adaptive_reevaluate(
                     f"adaptive: orig_id={ctx.parent_id!r} "
                     f"round={state.rounds_completed + 1} "
                     f"deepening turns={sorted(deepen)} "
-                    f"quantile={q_quantile} extra_visits={q_extra}"
+                    f"quantile={q_quantile} extra_visits={q_extra} "
+                    f"phase3={'on' if phase3 is not None else 'off'}"
                 ),
             )
 
-            # Spawn deeper; emit each final as a preview, observe in
-            # state. The deeper query carries its own internal id
-            # but the orchestration framework relabels responses onto
-            # the parent's orig_id before they reach the client.
-            deeper = _build_deeper_query(
-                parent, sorted(deepen), budget.visits_for_round(),
-            )
-            async for resp in ctx.spawn(deeper):
-                if isinstance(resp, MetadataResponse):
-                    yield resp
+            if phase3 is not None:
+                # v1.0.25 — Phase 3 dispatch: allocate per-turn visits,
+                # spawn N parallel sub-queries (one per candidate),
+                # stream responses interleaved as previews.
+                algo, model, value_fn = phase3
+                allocation = _allocate_visits(
+                    deepen=deepen,
+                    state=state,
+                    algo=algo,
+                    model=model,
+                    value_fn=value_fn,
+                    budget_visits=budget.visits_for_round(),
+                )
+                if not allocation:
+                    # Allocation collapsed to empty (e.g., zero budget);
+                    # nothing to spawn this round. Record the round
+                    # so the budget bookkeeping advances.
+                    state.record_round(
+                        worst_pairs=worst_pairs,
+                        deepening_turns=deepen,
+                        worst_selector_value=worst_value,
+                    )
+                    state.record_visits(budget.visits_for_round())
+                    state.record_wall_clock(time.monotonic() - wall_clock_origin)
                     continue
-                if resp.is_during_search:
-                    yield resp
-                    continue
-                state.observe(resp)
-                yield replace(resp, is_during_search=True)
+                sub_queries = [
+                    _build_deeper_query(parent, [turn], visits)
+                    for turn, visits in allocation.items()
+                ]
+                async for resp in _stream_parallel_spawns(ctx, sub_queries):
+                    if isinstance(resp, MetadataResponse):
+                        yield resp
+                        continue
+                    if resp.is_during_search:
+                        yield resp
+                        continue
+                    state.observe(resp)
+                    yield replace(resp, is_during_search=True)
+            else:
+                # v1.0.24 dispatch: single deeper query covering the
+                # whole deepening set under one maxVisits envelope.
+                deeper = _build_deeper_query(
+                    parent, sorted(deepen), budget.visits_for_round(),
+                )
+                async for resp in ctx.spawn(deeper):
+                    if isinstance(resp, MetadataResponse):
+                        yield resp
+                        continue
+                    if resp.is_during_search:
+                        yield resp
+                        continue
+                    state.observe(resp)
+                    yield replace(resp, is_during_search=True)
 
             state.record_round(
                 worst_pairs=worst_pairs,

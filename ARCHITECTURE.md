@@ -416,7 +416,9 @@ For an extender looking for the right file to read:
 | `middleware/session_middleware.py` | 1 | `SessionMiddleware` ABC, `MiddlewareChain` (with multi-orchestration guard), `IdentityMiddleware`, `SessionCapabilities` |
 | `middleware/orchestration.py` | 1 | `OrchestrationMiddleware`, `OrchestrationContext`, `orchestration_middleware` decorator (the third extension surface, v1.0.16) |
 | `middleware/keep_alive.py` | 1 | `KeepAliveMiddleware` (per-session inactivity watchdog) |
-| `middleware/adaptive_reevaluate.py` | 1 | `adaptive_reevaluate` factory + the orchestration coroutine (refactored to use `OrchestrationMiddleware` in v1.0.16) |
+| `middleware/adaptive_reevaluate.py` | 1 | `adaptive_reevaluate` factory + the orchestration coroutine (refactored to use `OrchestrationMiddleware` in v1.0.16, widened across v1.0.22–v1.0.25 with selector pluggability + multi-round + Phase 3 allocation dispatch) |
+| `middleware/visit_scaling.py` | 1 | `VisitScalingModel` Protocol + curated registry (`monte_carlo_sqrt`, `diminishing_returns_log`) — Phase 3 substrate (v1.0.25) |
+| `middleware/allocation.py` | 1 | `AllocationAlgorithm` Protocol + four curated algorithms (`greedy_eig`, `knowledge_gradient`, `thompson_sampling`, `ucb`) — Phase 3 substrate (v1.0.25) |
 | `middleware/capability_gate.py` | 1 | `CapabilityGatedMiddleware` (per-query capability opt-in wrapper, v1.0.14) |
 | | | |
 | `delta_analysis.py` | — | `DeltaAnalysisState` (protocol-agnostic reactive analysis substance; uses `reactive_pipeline`) |

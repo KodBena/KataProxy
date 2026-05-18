@@ -309,6 +309,43 @@ class TestRegistryInterpreterSelectors:
         assert interp.get_move_selector_fn() is None
         assert interp.get_turn_selector_fn() is not None
 
+    def test_value_fn_returns_none_when_binding_absent(self) -> None:
+        """Phase 3 `value_fn` accessor follows the same None-vs-stub
+        shape as the selector accessors. Absent binding → None."""
+        interp = _build_interpreter(bindings={}, symbols={})
+        assert interp.get_value_fn() is None
+
+    def test_value_fn_returns_callable_when_bound(self) -> None:
+        interp = _build_interpreter(
+            bindings={"value_fn": "score_priority"},
+            symbols={"score_priority": "1.0"},
+        )
+        fn = interp.get_value_fn()
+        assert fn is not None
+        assert callable(fn)
+
+    def test_value_fn_independent_of_selectors(self) -> None:
+        """A value_fn binding doesn't accidentally satisfy the
+        selector accessors (and vice-versa) — the three roles are
+        independent."""
+        interp = _build_interpreter(
+            bindings={"value_fn": "vfn"},
+            symbols={"vfn": "1.0"},
+        )
+        assert interp.get_value_fn() is not None
+        assert interp.get_move_selector_fn() is None
+        assert interp.get_turn_selector_fn() is None
+
+    def test_value_fn_returns_none_when_named_symbol_missing(self) -> None:
+        """Binding present but the named symbol isn't in the symtable
+        — graceful None return (the dispatch refuses with
+        allocation_invalid at engagement time)."""
+        interp = _build_interpreter(
+            bindings={"value_fn": "missing_symbol"},
+            symbols={},
+        )
+        assert interp.get_value_fn() is None
+
 
 # ---------------------------------------------------------------------------
 # 4. Axis resolution (valid shapes)
