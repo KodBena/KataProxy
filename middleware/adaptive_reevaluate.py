@@ -70,7 +70,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     AsyncIterator,
@@ -305,6 +305,249 @@ def _default_move_selector(deltas: list[float]) -> float:
     binding is active.
     """
     return float(np.mean(deltas))
+
+
+# ---------------------------------------------------------------------------
+# Adaptive state — across-iteration accumulator (v1.0.24 commit 1)
+#
+# Framework-owned object accumulating per-round per-unit data across the
+# multi-round loop. Read-only from selectors / value functions / budget
+# objects; populated by the coroutine and the framework via the
+# `observe` / `record_*` methods.
+#
+# Consumers (introduced in subsequent commits):
+#   - The finalization stage at end-of-loop reads `last_packet(turn)` to
+#     emit each turn's authoritative is_during_search=False response
+#     (commit 4).
+#   - The round_history field on MoveView / TurnView reads
+#     `selector_history_*` and `deepened_count_*` to surface per-unit
+#     history to user-authored selectors (commit 3).
+#   - Budget objects read `rounds_completed`, `total_visits_spent`,
+#     `wall_clock_elapsed_s`, and `metric_trajectory(name)` to evaluate
+#     termination (commit 2 introduces Budget; commit 6 wires wall
+#     clock).
+#   - Framework-default metric trajectories (worst_selector_value,
+#     worst_set_jaccard_to_previous) populated by `record_round` in
+#     commit 5.
+#
+# See docs/roadmap-multi-round-adaptation.md §2.2 for the contract.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MoveRoundHistory:
+    """Per-move history surfaced to a `move_selector_fn` via
+    `x.round_history`.
+
+    Empty in round 1 (selector_values=[], deepened=0,
+    previous_packet=None, rounds_completed=0); populated as
+    rounds progress. User selectors that don't access
+    round_history are unaffected by the field's presence.
+    """
+
+    selector_values: list[float]
+    deepened: int
+    previous_packet: Optional[AnalyzeResponse]
+    rounds_completed: int
+
+
+@dataclass(frozen=True)
+class TurnRoundHistory:
+    """Per-turn history surfaced to a `turn_selector_fn` via
+    `x.round_history`. Same shape as MoveRoundHistory.
+    """
+
+    selector_values: list[float]
+    deepened: int
+    previous_packet: Optional[AnalyzeResponse]
+    rounds_completed: int
+
+
+@dataclass
+class AdaptiveState:
+    """Across-iteration accumulator for adaptive's multi-round loop.
+
+    Lifetime: one per parent query, constructed at coroutine entry,
+    discarded at coroutine completion. The state is the source of
+    truth for:
+
+    - **Latest per-turn observed response** (`last_packet`). Updated
+      by `observe(resp)` for every KataGo final the proxy receives
+      (originals in Stage 1 and deeper-query responses in the
+      multi-round loop). Consumed by the finalization stage to
+      emit each turn's authoritative.
+    - **Per-unit history** (`selector_history_*`,
+      `deepened_count_*`). Updated by `record_round_scores_*` and
+      `record_round`. Surfaced to selectors via
+      MoveView/TurnView's round_history field.
+    - **Round-level aggregates** (`rounds_completed`,
+      `total_visits_spent`, `wall_clock_elapsed_s`). Consumed by
+      Budget objects via `has_capacity(state)`.
+    - **Named metric trajectories** (`metric_trajectory(name)`).
+      Populated by `record_round` for framework defaults
+      (worst_selector_value, worst_set_jaccard_to_previous) in
+      commit 5. Consumed by ConvergenceCheck objects.
+    """
+
+    rounds_completed: int = 0
+    total_visits_spent: int = 0
+    wall_clock_elapsed_s: float = 0.0
+
+    # Per-turn latest observed final (populated by observe()).
+    _last_packet_by_turn: dict[TurnIndex, AnalyzeResponse] = field(
+        default_factory=dict,
+    )
+
+    # Per-unit selector histories (populated by
+    # record_round_scores_*).
+    _selector_history_move: dict[tuple[Color, MoveIndex], list[float]] = field(
+        default_factory=dict,
+    )
+    _selector_history_turn: dict[TurnIndex, list[float]] = field(
+        default_factory=dict,
+    )
+
+    # Per-unit deepened counts (populated by record_round).
+    _deepened_counts_move: dict[tuple[Color, MoveIndex], int] = field(
+        default_factory=dict,
+    )
+    _deepened_counts_turn: dict[TurnIndex, int] = field(
+        default_factory=dict,
+    )
+
+    # Per-round deepening turn-sets (kept for jaccard-style
+    # trajectories that compare to the previous round).
+    _round_deepen_sets: list[set[TurnIndex]] = field(
+        default_factory=list,
+    )
+
+    # Named metric trajectories. Framework-default trajectories
+    # populated by record_round in commit 5.
+    _metric_trajectories: dict[str, list[float]] = field(
+        default_factory=dict,
+    )
+
+    # ─── Framework-side mutation methods ───
+
+    def observe(self, resp: AnalyzeResponse) -> None:
+        """Record a KataGo final as the latest for its turn.
+
+        Called for every is_during_search=False response observed by
+        the coroutine (originals from Stage 1 and deeper-query
+        responses from the multi-round loop). The finalization stage
+        at end-of-loop reads `last_packet(turn)` to emit each turn's
+        authoritative emission with is_during_search=False edited in.
+        """
+        self._last_packet_by_turn[TurnIndex(resp.turn_number)] = resp
+
+    def record_round_scores_move(
+        self,
+        scored: list[tuple[Color, MoveIndex, float]],
+    ) -> None:
+        """Append per-move selector scores for the current round.
+
+        Move-axis only. The score list reflects every move scored in
+        this round (not just the worst-set); selector_history_move
+        returns the full per-round trajectory of selector values per
+        (color, move) for selectors that want it.
+        """
+        for color, m, scalar in scored:
+            self._selector_history_move.setdefault((color, m), []).append(scalar)
+
+    def record_round_scores_turn(
+        self,
+        scored: list[tuple[TurnIndex, float]],
+    ) -> None:
+        """Append per-turn selector scores for the current round.
+
+        Turn-axis only; symmetric to record_round_scores_move.
+        """
+        for t, scalar in scored:
+            self._selector_history_turn.setdefault(t, []).append(scalar)
+
+    def record_round(
+        self,
+        *,
+        worst_pairs: Optional[list[tuple[Color, MoveIndex]]] = None,
+        deepening_turns: set[TurnIndex],
+    ) -> None:
+        """Finalize a round: increment round counters and update
+        per-unit deepened counts.
+
+        For move-axis rounds: pass `worst_pairs` (the move-level
+        worst-set before window expansion) to update per-move
+        deepened counts. For turn-axis rounds: omit `worst_pairs`
+        (per-turn deepened counts track via `deepening_turns`).
+
+        `deepening_turns` is the round's full deepening turn-set
+        (post-window-expansion on move-axis); used to update
+        per-turn deepened counts and to record the round's deepening
+        set for jaccard-style trajectories.
+
+        Framework-default metric trajectories (worst_selector_value,
+        worst_set_jaccard_to_previous) are populated here in
+        commit 5.
+        """
+        self.rounds_completed += 1
+        self._round_deepen_sets.append(set(deepening_turns))
+        for turn in deepening_turns:
+            self._deepened_counts_turn[turn] = (
+                self._deepened_counts_turn.get(turn, 0) + 1
+            )
+        if worst_pairs is not None:
+            for color, m in worst_pairs:
+                self._deepened_counts_move[(color, m)] = (
+                    self._deepened_counts_move.get((color, m), 0) + 1
+                )
+
+    def record_visits(self, visits: int) -> None:
+        """Increment `total_visits_spent` by this round's deeper-query
+        extra_visits (the amount the round added to KataGo's
+        maxVisits over the original)."""
+        self.total_visits_spent += visits
+
+    def record_wall_clock(self, elapsed_s: float) -> None:
+        """Update `wall_clock_elapsed_s` to the cumulative elapsed
+        time since coroutine entry. Populated by the coroutine
+        sampling time.monotonic() at round boundaries; consumed by
+        wall-clock budget shapes (commit 6)."""
+        self.wall_clock_elapsed_s = elapsed_s
+
+    # ─── Queryable surface (read-only from external callers) ───
+
+    def last_packet(self, t: TurnIndex) -> Optional[AnalyzeResponse]:
+        """Most recent KataGo final observed for this turn, or
+        None if the proxy has not yet observed any final for this
+        turn. Consumed by the finalization stage to emit each turn's
+        authoritative."""
+        return self._last_packet_by_turn.get(t)
+
+    def selector_history_move(
+        self, color: Color, m: MoveIndex,
+    ) -> list[float]:
+        """Per-move selector scalars across rounds (move-axis).
+
+        Returns a copy of the trajectory so callers can't mutate
+        framework-owned state by side-effect.
+        """
+        return list(self._selector_history_move.get((color, m), []))
+
+    def selector_history_turn(self, t: TurnIndex) -> list[float]:
+        """Per-turn selector scalars across rounds (turn-axis)."""
+        return list(self._selector_history_turn.get(t, []))
+
+    def deepened_count_move(self, color: Color, m: MoveIndex) -> int:
+        """Number of rounds this move was in the worst-set (move-axis)."""
+        return self._deepened_counts_move.get((color, m), 0)
+
+    def deepened_count_turn(self, t: TurnIndex) -> int:
+        """Number of rounds this turn was in the deepening set."""
+        return self._deepened_counts_turn.get(t, 0)
+
+    def metric_trajectory(self, name: str) -> list[float]:
+        """Named metric's per-round values. Returns an empty list if
+        the metric isn't tracked."""
+        return list(self._metric_trajectories.get(name, []))
 
 
 # ---------------------------------------------------------------------------
