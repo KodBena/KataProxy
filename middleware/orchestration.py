@@ -468,14 +468,32 @@ class OrchestrationMiddleware(SessionMiddleware):
             if old_task is not None and not old_task.done():
                 old_task.cancel()
             self._contexts.pop(orig_id, None)
+        # v1.0.26 (Phase 3.5 follow-up) — snapshot the query's opaque
+        # dict before the Hub's post-subscribe strip can mutate it
+        # (pubsub_hub.py:494 pops `capabilities`). The coro runs
+        # async-scheduled, so by the time it reads
+        # `parent.opaque["capabilities"]` the Hub has already
+        # processed and stripped. Without this snapshot, every
+        # capability-metadata-aware orchestration middleware (notably
+        # adaptive_reevaluate's worst_quantile / extra_visits / Phase 3
+        # fields) reads stale-empty cap_meta and silently falls back
+        # to closure defaults. Discovered 2026-05-18 when the SPA's
+        # learned-VF dropdown's `value_binding` / `allocation_algorithm`
+        # never reached the substrate.
+        import copy as _copy
+        query_for_coro = KataGoQuery(
+            action=query.action,
+            analyze_turns=query.analyze_turns,
+            opaque=_copy.deepcopy(query.opaque),
+        )
         ctx = OrchestrationContext(
             parent_id=orig_id,
-            parent_query=query,
+            parent_query=query_for_coro,
             session_capabilities=self._caps,
             middleware=self,
         )
         self._contexts[orig_id] = ctx
-        coro = self._coro_factory(query, ctx)
+        coro = self._coro_factory(query_for_coro, ctx)
         task = asyncio.create_task(
             self._drive_coroutine(orig_id, ctx, coro),
             name=f"orchestration:{self.name}:{orig_id}",
