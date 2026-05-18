@@ -287,8 +287,10 @@ def _expand_window_same_color(
     move_to_turn_pair(color, m), plus the same for moves
     m-1, m-2, ..., m-(N-1) of the same color. Out-of-range
     predecessors (negative move-index, or turn-index not in
-    all_turns) are dropped. Default window_size=2 — the move
-    plus its immediate same-color predecessor.
+    all_turns) are dropped. Default window_size=1 — re-evaluate
+    only the bad moves themselves (each move is two positions);
+    the windowing infrastructure is in place for users who want
+    to include context.
     """
     expanded: set[TurnIndex] = set()
     for color, m in worst_pairs:
@@ -306,12 +308,21 @@ def _expand_window_same_color(
     return expanded
 ```
 
-Default `window_size=2` (the move plus its immediate same-color
-predecessor) replaces the v1.0.22 default of `window_size=3`
-(symmetric ±1 turn-space). The defaults differ because the
-semantics differ — the size-3 in turn-space and size-2 in
-move-space deliberately don't map 1:1; size-2 in move-space is
-the smaller and more honest neighborhood.
+Default `window_size=1` — re-evaluate only the bad moves
+themselves (no contextual siblings). The semantic intent: if a
+move is flagged as worst, re-analyze the two positions it
+bridges and nothing else. Larger windows remain available for
+users who want to include same-color predecessor context, but
+the default reflects the actual intent of "deepen exactly what
+was flagged."
+
+The pre-v1.0.23 default of `window_size=3` (symmetric ±1
+turn-space) was both a different semantic (turn-space sibling
+expansion across colors) and a defensive hedge against
+off-by-one errors in the open-coded arithmetic. The v1.0.22
+type-branding work and the v1.0.23 named `move_to_turn_pair`
+seam remove the need for the hedge; the v1.0.23 default
+reflects the intended semantics directly.
 
 The pre-correction `_expand_window` is removed entirely. Turn-
 based selectors don't get a window in v1.0.23 (selectors author
@@ -355,7 +366,7 @@ Three new optional fields:
   "adaptive_reevaluate": {
     "worst_quantile": 0.25,
     "extra_visits": 800,
-    "window_size": 2,
+    "window_size": 1,
     "selection_policy": "per_color_quantile",
     "selector_axis": "move"
   }
@@ -363,8 +374,10 @@ Three new optional fields:
 ```
 
 `window_size` keeps its name but its semantics shifts: it is now
-the same-color-predecessor-count (move-space) rather than the
-symmetric turn-space half-window. Default changes from 3 to 2.
+the same-color-move count (move-space) rather than the symmetric
+turn-space half-window. Default changes from 3 to 1 — re-evaluate
+only the bad moves, no contextual siblings. The windowing
+infrastructure remains for users wanting context.
 
 `selection_policy` (optional) names one of the four curated
 strategies. Absent → axis default.
@@ -446,12 +459,20 @@ surfaces a system message naming the conflict.
 
 The one behavioural change visible at the wire for valid-shape
 clients is the window correction (move-space replaces
-turn-space). The default `window_size` value changes (3 → 2) to
-match the new semantics; clients that explicitly set
-`window_size=3` get "three same-color predecessors"
-post-v1.0.23, which is wider than the pre-v1.0.23 symmetric
-window. The release annotation names this divergence; clients
-tuning `window_size` should revisit their value.
+turn-space). The default `window_size` value changes (3 → 1) —
+re-evaluate only the bad moves themselves, no contextual
+siblings. The semantic intent is "deepen exactly what was
+flagged"; the windowing infrastructure remains for users who
+explicitly opt into context.
+
+Clients that explicitly pinned a window_size value should
+revisit it — the units have changed and the larger numbers
+admit substantially more turns than they did pre-v1.0.23.
+Concretely: pre-v1.0.23 `window_size=3` was a symmetric ±1
+turn-space window producing 4 turns per worst move; post-v1.0.23
+`window_size=3` is three same-color moves producing 6 turns per
+worst move. The release annotation names this divergence
+explicitly.
 
 ---
 
@@ -527,7 +548,10 @@ inconsistencies hard-refuse per §8.2 / §11.4.
 
 Replace `_expand_window` (turn-space, symmetric) with
 `_expand_window_same_color` (move-space, same-color
-predecessor). Default `window_size` shifts from 3 to 2.
+predecessor). Default `window_size` shifts from 3 to 1 — the
+semantic intent is "re-evaluate only the bad moves themselves
+(each move is two positions), no contextual siblings"; the
+windowing infrastructure remains for users wanting context.
 Behaviour change visible at the wire on adaptive-engaged
 queries.
 

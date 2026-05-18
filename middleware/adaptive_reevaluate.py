@@ -348,8 +348,11 @@ def _expand_window_same_color(
 
     For each worst (color, move) pair, includes that move's
     (before, after) turn pair PLUS the same pairs for its (window_size
-    - 1) same-color predecessors. Default `window_size=2` (the move
-    plus its immediate same-color predecessor).
+    - 1) same-color predecessors. Default `window_size=1` — re-evaluate
+    only the bad moves themselves (each move is two positions). The
+    windowing infrastructure is in place for users who want to include
+    context, but the semantic default is "re-evaluate exactly what was
+    flagged as worst, nothing else."
 
     Replaces the pre-v1.0.23 `_expand_window` (symmetric turn-space
     ±half), which crossed into opposite-color neighbouring moves
@@ -766,7 +769,7 @@ def _dispatch_deepening_set(
 def adaptive_reevaluate(
     worst_quantile: float = 0.25,
     extra_visits: int = 800,
-    window_size: int = 2,
+    window_size: int = 1,
 ) -> Callable[[], OrchestrationMiddleware]:
     """Return a factory that produces an OrchestrationMiddleware
     expressing adaptive re-evaluation.
@@ -784,7 +787,7 @@ def adaptive_reevaluate(
             adaptive_reevaluate(
                 worst_quantile=0.25,
                 extra_visits=800,
-                window_size=2,
+                window_size=1,
             )(),  # () to invoke the factory
         )
 
