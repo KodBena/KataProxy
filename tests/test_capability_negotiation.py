@@ -48,6 +48,7 @@ from katago import (  # noqa: E402
     KataGoQuery,
     KataGoResponse,
     MetadataResponse,
+    TurnIndex,
     translate_query_to_wire,
 )
 from middleware.capability_gate import CapabilityGatedMiddleware  # noqa: E402
@@ -685,7 +686,9 @@ class TestAdaptiveReevaluateMetadata:
             action=KataGoAction.ANALYZE,
             opaque={"maxVisits": 1000, "moves": []},
         )
-        deeper = _build_deeper_query(orig, [0, 1, 2], extra_visits=500)
+        deeper = _build_deeper_query(
+            orig, [TurnIndex(0), TurnIndex(1), TurnIndex(2)], extra_visits=500,
+        )
         assert deeper.opaque["maxVisits"] == 1500
 
     def test_build_deeper_query_strips_cache_flags(self) -> None:
@@ -700,7 +703,7 @@ class TestAdaptiveReevaluateMetadata:
                 "replay_final_only": True,
             },
         )
-        deeper = _build_deeper_query(orig, [0], extra_visits=500)
+        deeper = _build_deeper_query(orig, [TurnIndex(0)], extra_visits=500)
         assert "cache" not in deeper.opaque
         assert "lookup_cache" not in deeper.opaque
         assert "replay_final_only" not in deeper.opaque
