@@ -128,9 +128,19 @@ class AdaptiveConfigurationError(RuntimeError):
     inconsistent.
 
     See docs/roadmap-adaptive-selector-pluggability.md §11.4 for the
-    principle and the four `code` values: `ambiguous_axis`,
-    `axis_binding_mismatch`, `policy_axis_mismatch`,
-    `policy_parameters_invalid`.
+    cost-asymmetry principle. The `code` values across v1.0.23-v1.0.25:
+
+      v1.0.23 (selector pluggability):
+        - `ambiguous_axis`
+        - `axis_binding_mismatch`
+        - `policy_axis_mismatch`
+        - `policy_parameters_invalid`
+
+      v1.0.24 (multi-round + budget):
+        - `budget_invalid`
+
+      v1.0.25 (info-theoretic allocation):
+        - `allocation_invalid`
     """
 
     def __init__(self, *, code: str, detail: dict[str, Any]) -> None:
