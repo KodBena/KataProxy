@@ -892,15 +892,55 @@ class TestAdaptiveStreamingPreviews:
 
         m.on_session_end()
 
+    @staticmethod
+    def _spawn_final(turn: int) -> AnalyzeResponse:
+        """Final response carrying a `from_spawn` marker — used by
+        the finalization wire-shape test to distinguish deepened-turn
+        authoritatives (whose payload should be the latest spawn
+        packet) from non-deepened authoritatives (whose payload is
+        the original final)."""
+        return AnalyzeResponse(
+            is_during_search=False,
+            turn_number=turn,
+            opaque={
+                "moveInfos": [],
+                "extra": {
+                    "black": {"deltas": {str(turn): -0.1}},
+                    "white": {"deltas": {str(turn): -0.1}},
+                },
+                "from_spawn": True,
+            },
+        )
+
     @pytest.mark.asyncio
-    async def test_deepened_turns_have_no_stage_3_authoritative(
+    async def test_finalization_emits_one_authoritative_per_turn_with_latest_payload(
         self,
     ) -> None:
-        """Stage 3 emits authoritative is_during_search=False only for
-        turns NOT in the deepen set. Deepened turns rely on the
-        spawn sub-query (Stage 4) for their authoritative emission,
-        which the orchestration framework relabels onto the parent's
-        orig_id.
+        """v1.0.24 finalization-at-end invariant: exactly one
+        authoritative emission (is_during_search=False) per
+        analyzed turn, occurring after the multi-round loop
+        terminates and carrying the latest observed KataGo packet
+        for that turn. For deepened turns the latest is a
+        spawn-derived response; for non-deepened turns the
+        original.
+
+        Pre-v1.0.24 (v1.0.20 → v1.0.23) the wire shape was "Stage 3
+        emits authoritatives only for non-deepened turns; the spawn
+        (Stage 4) carries authoritatives for the deepened set." The
+        v1.0.24 multi-round design made that two-source authoritative
+        emission a KataGo protocol drift — re-deepening across rounds
+        would emit one is_during_search=False per round per turn —
+        so finalization-at-end collapses both into a single
+        end-of-loop emission stage. The duplication modulo
+        is_during_search (each deepened turn's preview emission is
+        followed by an authoritative emission carrying an identical
+        payload) is acknowledged as fine per §8.3 of
+        proxy/docs/roadmap-multi-round-adaptation.md.
+
+        Mid-loop invariant (asserted below): while spawn responses
+        are in flight the proxy emits only previews — no
+        authoritatives are emitted until the multi-round loop
+        terminates.
 
         Construction: 6-turn range with a single bad-delta turn at
         index 0. _find_worst_turns produces worst={0,1,2}; with
@@ -922,38 +962,90 @@ class TestAdaptiveStreamingPreviews:
         )
         m.on_query(ClientId("eid-1"), q)
 
-        all_yields: List[Tuple[ClientId, KataGoResponse]] = []
+        # Stage 1 — drive every original through the middleware.
+        before_spawn_yields: List[Tuple[ClientId, KataGoResponse]] = []
         for turn in range(6):
             resp = self._bad_final(0) if turn == 0 else self._neutral_final(turn)
-            all_yields += await self._drive_response(m, ClientId("eid-1"), resp)
+            before_spawn_yields += await self._drive_response(
+                m, ClientId("eid-1"), resp,
+            )
 
-        # Every turn produced a preview during Stage 1.
-        preview_turns = sorted(
-            r.turn_number for _, r in all_yields
+        # Mid-loop invariant: only previews emitted; the multi-round
+        # loop has spawned and is awaiting deeper-query responses.
+        # No authoritatives until finalization.
+        preview_turns_pre = sorted(
+            r.turn_number for _, r in before_spawn_yields
             if isinstance(r, AnalyzeResponse) and r.is_during_search
         )
-        assert preview_turns == [0, 1, 2, 3, 4, 5], (
-            f"expected one preview per turn; got {preview_turns}"
-        )
-
-        # Stage 3 authoritatives are ONLY for non-deepened turns.
-        auth_turns = sorted(
-            r.turn_number for _, r in all_yields
+        auth_turns_pre = sorted(
+            r.turn_number for _, r in before_spawn_yields
             if isinstance(r, AnalyzeResponse) and not r.is_during_search
         )
-        assert auth_turns == [3, 4, 5], (
-            f"Stage 3 should emit authoritatives only for non-deepened "
-            f"turns; got auth_turns={auth_turns} "
-            f"(deepened turns {{0, 1, 2}} should rely on the spawn)"
+        assert preview_turns_pre == [0, 1, 2, 3, 4, 5], (
+            f"Stage 1 should emit one preview per turn; "
+            f"got preview_turns_pre={preview_turns_pre}"
+        )
+        assert auth_turns_pre == [], (
+            f"v1.0.24 forbids authoritative emissions before the "
+            f"multi-round loop terminates; got "
+            f"auth_turns_pre={auth_turns_pre}"
         )
 
         # Spawn fires for the deepened turn set.
         assert await self._wait_for_spawn(c), "deeper sub-query did not spawn"
-        _spawn_oid, spawn_q = c.submitted[0]
+        spawn_oid, spawn_q = c.submitted[0]
         assert sorted(spawn_q.analyze_turns) == [0, 1, 2], (
             f"spawn should target the deepened turn set; "
             f"got analyze_turns={spawn_q.analyze_turns}"
         )
+
+        # Stage 2 — drive the spawn's finals through. The third
+        # (and last expected) final triggers the spawn iterator's
+        # sentinel, which lets the coroutine reach the finalization
+        # stage; the 6 authoritatives are drained on the same
+        # handle_response cycle.
+        post_spawn_yields: List[Tuple[ClientId, KataGoResponse]] = []
+        for turn in [0, 1, 2]:
+            post_spawn_yields += await self._drive_response(
+                m, spawn_oid, self._spawn_final(turn),
+            )
+
+        # Each spawn final emitted as a preview (Stage 2 forwarding).
+        spawn_preview_turns = sorted(
+            r.turn_number for _, r in post_spawn_yields
+            if isinstance(r, AnalyzeResponse) and r.is_during_search
+        )
+        assert spawn_preview_turns == [0, 1, 2], (
+            f"each spawn final should be emitted as a preview; "
+            f"got spawn_preview_turns={spawn_preview_turns}"
+        )
+
+        # Finalization invariant: exactly one authoritative per turn,
+        # in the same drain cycle as the final spawn response.
+        auth_emissions = [
+            r for _, r in post_spawn_yields
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        ]
+        auth_turns = sorted(r.turn_number for r in auth_emissions)
+        assert auth_turns == [0, 1, 2, 3, 4, 5], (
+            f"finalization should emit exactly one authoritative per "
+            f"analyzed turn; got auth_turns={auth_turns}"
+        )
+
+        # Per-turn payload provenance: deepened turns' authoritative
+        # carries the spawn payload (`from_spawn` marker); non-deepened
+        # turns' authoritative carries the original payload (no marker).
+        by_turn = {r.turn_number: r for r in auth_emissions}
+        for turn in (0, 1, 2):
+            assert by_turn[turn].opaque.get("from_spawn") is True, (
+                f"deepened turn {turn}'s authoritative should carry the "
+                f"latest spawn payload; got opaque={by_turn[turn].opaque}"
+            )
+        for turn in (3, 4, 5):
+            assert "from_spawn" not in by_turn[turn].opaque, (
+                f"non-deepened turn {turn}'s authoritative should carry "
+                f"the original payload; got opaque={by_turn[turn].opaque}"
+            )
 
         m.on_session_end()
 

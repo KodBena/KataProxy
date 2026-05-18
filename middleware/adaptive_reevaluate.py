@@ -1405,61 +1405,59 @@ def _build_turn_views(
     return views
 
 
-def _dispatch_deepening_set(
+def _dispatch_deepening_round(
     finals: List[AnalyzeResponse],
+    state: AdaptiveState,
     cap_meta: dict[str, Any],
     analysis_config: Optional[dict[str, Any]],
     window_size: int,
     all_turns: set[TurnIndex],
-) -> set[TurnIndex]:
-    """Resolve dispatch and produce the deepening-turn set.
+) -> tuple[set[TurnIndex], Optional[list[tuple[Color, MoveIndex]]]]:
+    """Run one round's select-and-deepen dispatch against the current
+    state and return the deepening turn-set + move-level worst-set.
 
-    Move-axis path: worst-set is expanded via `_expand_window`
-    (turn-space symmetric; same-color-predecessor in commit 5).
-    Turn-axis path: worst-set IS the deepening set (no framework
-    window expansion in v1.0.23; selector authors any cross-turn
-    aggregation via `apply_window` in the expression substrate).
+    Returns (deepening_turns, worst_pairs):
+      - deepening_turns: the set of turns to deepen this round
+        (after window expansion for move-axis; identity-with-
+        all_turns-mask for turn-axis).
+      - worst_pairs: move-level worst-set for move-axis (before
+        window expansion); None for turn-axis. The caller passes
+        worst_pairs to state.record_round to update per-move
+        deepened counts.
+
+    Side effect: records this round's per-unit scoring into state
+    via state.record_round_scores_move/turn so subsequent rounds'
+    view round_history reflects this round's selector values.
     """
     interpreter = _try_build_interpreter(analysis_config)
     axis, user_selector = _resolve_axis_and_selector(interpreter, cap_meta)
 
-    # v1.0.24 commit 3: construct an AdaptiveState for view round_history
-    # population. In the single-round dispatch (this function's pre-
-    # commit-4 shape), the state is freshly empty — round_history
-    # fields on every view are zero/empty. Commit 4 lifts state
-    # management to the coroutine so the multi-round loop's per-round
-    # state evolution drives view round_history.
-    state = AdaptiveState()
-    for f in finals:
-        state.observe(f)
-
     if axis == "move":
-        # Score the per-color moves — either via the hardcoded default
-        # (no user binding) or the user-authored selector. The default
-        # path preserves the legacy "mean policy delta + per-color
-        # quantile" shape; the window correction (move-space same-color
-        # predecessor expansion) is the one wire-visible behaviour
-        # change post-v1.0.23 on this path.
         turn_maps = _collect_per_move_deltas(finals)
         worst_pairs: list[tuple[Color, MoveIndex]]
+        scored: list[tuple[Color, MoveIndex, float]]
         if user_selector is None:
-            scored_default: list[tuple[Color, MoveIndex, float]] = [
+            scored = [
                 (color, m, _default_move_selector(ds))
                 for color in _COLORS
                 for m, ds in turn_maps[color].items()
             ]
             worst_pairs = _select_per_color_quantile_move(
-                scored_default,
+                scored,
                 worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
             )
         else:
             views_m = _build_move_views(finals, turn_maps, state)
-            scored_m: list[tuple[Color, MoveIndex, float]] = [
+            scored = [
                 (v.color, v.move_index, float(user_selector(v)))
                 for v in views_m
             ]
-            worst_pairs = _apply_selection_policy_move(scored_m, cap_meta)
-        return _expand_window_same_color(worst_pairs, all_turns, window_size)
+            worst_pairs = _apply_selection_policy_move(scored, cap_meta)
+        state.record_round_scores_move(scored)
+        deepening = _expand_window_same_color(
+            worst_pairs, all_turns, window_size,
+        )
+        return deepening, worst_pairs
 
     # axis == "turn" — user binding required (axis resolution enforces).
     assert user_selector is not None
@@ -1467,8 +1465,39 @@ def _dispatch_deepening_set(
     scored_t: list[tuple[TurnIndex, float]] = [
         (v.turn_index, float(user_selector(v))) for v in views_t
     ]
+    state.record_round_scores_turn(scored_t)
     worst_turns_list = _apply_selection_policy_turn(scored_t, cap_meta)
-    return set(worst_turns_list) & all_turns
+    deepening = set(worst_turns_list) & all_turns
+    return deepening, None
+
+
+def _dispatch_deepening_set(
+    finals: List[AnalyzeResponse],
+    cap_meta: dict[str, Any],
+    analysis_config: Optional[dict[str, Any]],
+    window_size: int,
+    all_turns: set[TurnIndex],
+) -> set[TurnIndex]:
+    """Single-round convenience wrapper around _dispatch_deepening_round.
+
+    Constructs a fresh AdaptiveState, observes finals, and dispatches
+    one round. Returns the deepening turn-set. Preserved for the
+    v1.0.23-style tests that exercise dispatch in isolation; the
+    multi-round coroutine uses _dispatch_deepening_round directly
+    with a persistent state.
+    """
+    state = AdaptiveState()
+    for f in finals:
+        state.observe(f)
+    deepening, _ = _dispatch_deepening_round(
+        finals=finals,
+        state=state,
+        cap_meta=cap_meta,
+        analysis_config=analysis_config,
+        window_size=window_size,
+        all_turns=all_turns,
+    )
+    return deepening
 
 
 # ---------------------------------------------------------------------------
@@ -1524,91 +1553,115 @@ def adaptive_reevaluate(
         q_quantile = cap_meta.get("worst_quantile", worst_quantile)
         q_extra = cap_meta.get("extra_visits", extra_visits)
 
-        # Stage 1: forward partials and metadata immediately. For each
-        # original final that arrives, buffer it for Stage 2's worst-
-        # quantile decision AND emit it immediately as a preview
-        # (is_during_search=True). The preview lets the SPA render the
-        # turn's data the moment KataGo finishes it; the authoritative
-        # is_during_search=False follows in Stage 3 (non-deepened turns)
-        # or Stage 4 (deepened turns, via the spawn sub-query).
-        # The framework signals end-of-stream via original_stream()
-        # exhaustion once all expected finals have arrived.
+        # Mirror closure defaults into cap_meta so dispatch + budget
+        # parsing read uniformly. cap_meta_for_dispatch is the single
+        # source for per-query knobs across the multi-round loop.
+        cap_meta_for_dispatch: dict[str, Any] = dict(cap_meta)
+        cap_meta_for_dispatch.setdefault("worst_quantile", q_quantile)
+        cap_meta_for_dispatch.setdefault("extra_visits", q_extra)
+
+        # v1.0.24: AdaptiveState constructed at coroutine entry; lives
+        # for the duration of the query. Tracks each turn's latest
+        # observed final (for the finalization stage) plus per-unit
+        # history and round-level aggregates for selectors / budget.
+        state = AdaptiveState()
+
+        # Stage 1: forward partials + metadata immediately; record
+        # each original final into state AND emit a preview to the
+        # client. The original packet (is_during_search=False from
+        # KataGo) is edited to a preview (is_during_search=True) on
+        # the wire; the finalization stage at end-of-loop emits the
+        # authoritative is_during_search=False per turn.
         finals: List[AnalyzeResponse] = []
         async for resp in ctx.original_stream():
             if isinstance(resp, MetadataResponse):
-                # adaptive is analyze-shaped end-to-end, but metadata
-                # responses (e.g., error responses) can still arrive
-                # for analyze queries; pass them through.
                 yield resp
                 continue
             if resp.is_during_search:
                 yield resp
                 continue
             finals.append(resp)
+            state.observe(resp)
             yield replace(resp, is_during_search=True)
 
         if not finals:
             return
 
-        # Stage 2: decide on adaptation. Dispatch into the
-        # selector + selection-policy substrate; either the
-        # hardcoded default (no user binding) or the user-authored
-        # selector path runs, with configuration inconsistencies
-        # hard-refusing per AdaptiveConfigurationError. The cap_meta
-        # already carries worst_quantile / window_size / etc.; the
-        # coroutine's closure-default scalars are present as keys via
-        # the legacy-default scaffolding so the dispatch reads
-        # uniformly.
+        # Stage 2: budget parsing + multi-round adaptive loop.
         all_turns: set[TurnIndex] = {TurnIndex(f.turn_number) for f in finals}
         raw_config = parent.opaque.get("analysis_config")
         analysis_config: Optional[dict[str, Any]] = (
             raw_config if isinstance(raw_config, dict) else None
         )
-        # Ensure cap_meta carries the resolved scalar defaults
-        # (closure capture + per-query overrides). The dispatch
-        # helpers read cap_meta as the single source for these
-        # scalars; mirror them in so the call site is uniform.
-        cap_meta_for_dispatch: dict[str, Any] = dict(cap_meta)
-        cap_meta_for_dispatch.setdefault("worst_quantile", q_quantile)
-        deepen = _dispatch_deepening_set(
-            finals=finals,
-            cap_meta=cap_meta_for_dispatch,
-            analysis_config=analysis_config,
-            window_size=window_size,
-            all_turns=all_turns,
-        )
 
-        if not deepen:
-            # No adaptation warranted; promote each preview to the
-            # authoritative final (is_during_search=False).
-            for f in finals:
-                yield f
-            return
+        budget = _parse_budget(cap_meta_for_dispatch)
 
-        _log.info(
-            Event.DIAGNOSTIC,
-            cid=ctx.parent_id,
-            msg=(
-                f"adaptive: orig_id={ctx.parent_id!r} "
-                f"deepening turns={sorted(deepen)} "
-                f"quantile={q_quantile} extra_visits={q_extra}"
-            ),
-        )
+        # Multi-round loop. Each iteration:
+        #   1. Compute this round's worst-set from current state
+        #      (can re-include already-deepened turns; can include
+        #      newly-worst turns whose state shifted).
+        #   2. Spawn deeper query; each KataGo final is recorded in
+        #      state AND emitted as a preview (is_during_search=True).
+        #   3. record_round finalizes the round (counters, deepening
+        #      sets, per-unit deepened counts).
+        # Termination: budget exhausted (any constraint) OR empty
+        # worst-set ("no more adaptation warranted").
+        while budget.has_capacity(state):
+            deepen, worst_pairs = _dispatch_deepening_round(
+                finals=finals,
+                state=state,
+                cap_meta=cap_meta_for_dispatch,
+                analysis_config=analysis_config,
+                window_size=window_size,
+                all_turns=all_turns,
+            )
+            if not deepen:
+                break
 
-        # Stage 3: promote previews to authoritative for non-deepened
-        # turns only. Deepened turns already streamed as previews in
-        # Stage 1; their authoritative is_during_search=False arrives
-        # via the spawn sub-query (Stage 4), relabelled onto the
-        # parent's orig_id by the orchestration framework.
+            _log.info(
+                Event.DIAGNOSTIC,
+                cid=ctx.parent_id,
+                msg=(
+                    f"adaptive: orig_id={ctx.parent_id!r} "
+                    f"round={state.rounds_completed + 1} "
+                    f"deepening turns={sorted(deepen)} "
+                    f"quantile={q_quantile} extra_visits={q_extra}"
+                ),
+            )
+
+            # Spawn deeper; emit each final as a preview, observe in
+            # state. The deeper query carries its own internal id
+            # but the orchestration framework relabels responses onto
+            # the parent's orig_id before they reach the client.
+            deeper = _build_deeper_query(
+                parent, sorted(deepen), budget.visits_for_round(),
+            )
+            async for resp in ctx.spawn(deeper):
+                if isinstance(resp, MetadataResponse):
+                    yield resp
+                    continue
+                if resp.is_during_search:
+                    yield resp
+                    continue
+                state.observe(resp)
+                yield replace(resp, is_during_search=True)
+
+            state.record_round(
+                worst_pairs=worst_pairs,
+                deepening_turns=deepen,
+            )
+            state.record_visits(budget.visits_for_round())
+
+        # Stage 3 — finalization. Emit each turn's latest observed
+        # response with is_during_search=False. The single
+        # authoritative emission per turn the KataGo protocol contract
+        # requires. Duplicates the latest preview emission for that
+        # turn modulo the flag (per §8.3 of the roadmap); the SPA's
+        # rendering of analysis data from previews handles the
+        # intermediate state.
         for f in finals:
-            if TurnIndex(f.turn_number) not in deepen:
-                yield f
-
-        # Stage 4: spawn the deeper analysis; yield its responses.
-        # The framework auto-relabels them onto the parent's orig_id
-        # via the OrchestrationMiddleware's handle_response.
-        deeper = _build_deeper_query(parent, sorted(deepen), q_extra)
-        async for resp in ctx.spawn(deeper):
-            yield resp
+            turn = TurnIndex(f.turn_number)
+            latest = state.last_packet(turn) or f
+            yield replace(latest, is_during_search=False)
 
     return coro
