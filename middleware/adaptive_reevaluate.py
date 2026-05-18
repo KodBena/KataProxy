@@ -70,7 +70,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import AsyncIterator, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import numpy as np
@@ -98,12 +98,162 @@ _log = get_proxy_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Selector substrate — views and selection policies (v1.0.23 commit 1)
+#
+# The views (MoveView, TurnView) are the per-unit objects passed to
+# user-authored selector expressions bound via analysis_config.bindings's
+# `move_selector_fn` / `turn_selector_fn` roles. The selection-policy
+# primitives operate on typed scored lists and return the worst-set; the
+# dispatch wiring that resolves which policy to call per query lands in
+# commit 4. See docs/roadmap-adaptive-selector-pluggability.md.
+# ---------------------------------------------------------------------------
+
+
+# Typed colour iteration constant — used by per-color selection policies and
+# by the pure helpers below.
+_COLORS: tuple[Color, Color] = ("black", "white")
+
+
+@dataclass(frozen=True)
+class MoveView:
+    """The per-move view a `move_selector_fn` binding receives.
+
+    Carries the brand (color + move_index) plus the per-arrival policy
+    deltas for this move and references to the before/after analyze
+    packets so the user expression can compute transition-shaped
+    metrics (policy delta aggregations, score-lead drop, played-policy
+    divergence, etc.).
+    """
+
+    color: Color
+    move_index: MoveIndex
+    deltas: list[float]
+    before: AnalyzeResponse
+    after: AnalyzeResponse
+
+
+@dataclass(frozen=True)
+class TurnView:
+    """The per-turn view a `turn_selector_fn` binding receives.
+
+    Carries the position index, the side-to-play at this position, and
+    the analyze response. Turn-based metrics (policy entropy, score
+    variance via state_fns precomputation, ownership flux) operate on
+    a single packet without transition context.
+    """
+
+    turn_index: TurnIndex
+    to_play: Color
+    packet: AnalyzeResponse
+
+
+# Selection-policy primitives — move-axis
+#
+# Each takes a typed scored list and returns the worst-set as
+# (Color, MoveIndex) tuples. Parameters are keyword-only; the dispatch
+# in commit 4 supplies them from capability metadata.
+#
+# The threshold-based quantile primitives match the existing
+# _find_worst_turns behaviour bit-for-bit: threshold = scalar at the
+# quantile-index after sorting ascending; inclusion criterion is
+# `scalar <= threshold`; ties are admitted. This is what makes the
+# commit-3 refactor's "default-path preserves behaviour exactly"
+# guarantee honest.
+
+def _select_per_color_quantile_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    worst_quantile: float,
+) -> list[tuple[Color, MoveIndex]]:
+    """Per-color bottom-quantile selection.
+
+    Both colors contribute Q% of their items independently; the union
+    is returned. Matches the v1.0.22 `_find_worst_turns` per-color
+    quantile shape exactly (threshold-based with `<=`).
+    """
+    worst: list[tuple[Color, MoveIndex]] = []
+    for color in _COLORS:
+        color_scored = [(m, s) for c, m, s in scored if c == color]
+        if not color_scored:
+            continue
+        sorted_scalars = sorted(s for _, s in color_scored)
+        threshold = sorted_scalars[int(len(color_scored) * worst_quantile)]
+        worst.extend((color, m) for m, s in color_scored if s <= threshold)
+    return worst
+
+
+def _select_pooled_quantile_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    worst_quantile: float,
+) -> list[tuple[Color, MoveIndex]]:
+    """Pooled bottom-quantile selection across both colors."""
+    if not scored:
+        return []
+    sorted_scalars = sorted(s for _, _, s in scored)
+    threshold = sorted_scalars[int(len(scored) * worst_quantile)]
+    return [(c, m) for c, m, s in scored if s <= threshold]
+
+
+def _select_per_color_threshold_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    black_threshold: float,
+    white_threshold: float,
+) -> list[tuple[Color, MoveIndex]]:
+    """Per-color absolute thresholds — scalar <= color's threshold."""
+    threshold: dict[Color, float] = {
+        "black": black_threshold,
+        "white": white_threshold,
+    }
+    return [(c, m) for c, m, s in scored if s <= threshold[c]]
+
+
+def _select_top_k_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    top_k: int,
+) -> list[tuple[Color, MoveIndex]]:
+    """Bottom-K worst items across both colors, pooled."""
+    sorted_scored = sorted(scored, key=lambda x: x[2])
+    return [(c, m) for c, m, _ in sorted_scored[:top_k]]
+
+
+# Selection-policy primitives — turn-axis
+#
+# Each takes a typed scored list and returns the worst-set as
+# TurnIndex values. Per-color partitioning does not apply on the
+# turn axis (positions are color-agnostic for selection purposes;
+# the to_play field on TurnView is the user's to consult).
+
+def _select_pooled_quantile_turn(
+    scored: list[tuple[TurnIndex, float]],
+    *,
+    worst_quantile: float,
+) -> list[TurnIndex]:
+    """Pooled bottom-quantile selection over turns."""
+    if not scored:
+        return []
+    sorted_scalars = sorted(s for _, s in scored)
+    threshold = sorted_scalars[int(len(scored) * worst_quantile)]
+    return [t for t, s in scored if s <= threshold]
+
+
+def _select_top_k_turn(
+    scored: list[tuple[TurnIndex, float]],
+    *,
+    top_k: int,
+) -> list[TurnIndex]:
+    """Bottom-K worst turns."""
+    sorted_scored = sorted(scored, key=lambda x: x[1])
+    return [t for t, _ in sorted_scored[:top_k]]
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers (runtime behaviour unchanged since the pre-v1.0.16 imperative
 # impl; signatures brand-threaded in v1.0.22 — see
 # docs/roadmap-adaptive-type-branding.md).
 # ---------------------------------------------------------------------------
-
-_COLORS: tuple[Color, Color] = ("black", "white")
 
 
 def _find_worst_turns(
