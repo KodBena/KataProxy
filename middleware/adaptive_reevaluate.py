@@ -249,29 +249,54 @@ def _select_top_k_turn(
     return [t for t, _ in sorted_scored[:top_k]]
 
 
+# Default move-axis selector — used when no `move_selector_fn` binding
+# is present in the active `analysis_config`. Lower returned scalar is
+# worse (smaller mean policy delta indicates the actual move's quality
+# was lower). The signature is deltas-only rather than MoveView-typed
+# because the default path bypasses view construction (it does not
+# need the before/after AnalyzeResponse references); user-authored
+# selectors receive a full MoveView from the dispatch site in
+# commit 4.
+
+def _default_move_selector(deltas: list[float]) -> float:
+    """The hardcoded default move-axis selector: mean of per-arrival
+    policy deltas for the move. Used when no `move_selector_fn`
+    binding is active.
+    """
+    return float(np.mean(deltas))
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers (runtime behaviour unchanged since the pre-v1.0.16 imperative
-# impl; signatures brand-threaded in v1.0.22 — see
-# docs/roadmap-adaptive-type-branding.md).
+# impl; signatures brand-threaded in v1.0.22; refactored in v1.0.23 to use
+# the selector substrate above while preserving the legacy-path behaviour
+# bit-for-bit — see docs/roadmap-adaptive-selector-pluggability.md).
 # ---------------------------------------------------------------------------
 
 
 def _find_worst_turns(
     responses: List[AnalyzeResponse], quantile: float,
 ) -> list[TurnIndex]:
-    """Return turn indices whose mean policy delta is in the worst quantile.
+    """Return turn indices to deepen, using the hardcoded default
+    move-axis selector + per-color quantile selection policy.
 
     `quantile` is per-orig_id (read from the query's
     capabilities.adaptive_reevaluate metadata, falling back to the
     constructor-time default).
 
+    Refactored in v1.0.23 to factor the inline scoring + selection
+    arithmetic into the substrate's default selector
+    (`_default_move_selector`) and the
+    `_select_per_color_quantile_move` policy primitive. Behaviour
+    is preserved bit-for-bit on this legacy (no-binding) path:
+    same per-color quantile shape, same threshold-with-`<=`
+    inclusion semantics, same dict-iteration emission order.
+
     Returns a flat list of `TurnIndex` values: each selected move
     contributes its two-turn pair (before and after the move) via
-    `move_to_turn_pair`. Per-color quantile selection is applied
-    independently to Black's and White's move sequences; the
-    framework-internal `2*t + displacement` arithmetic lives behind
-    the seam.
+    `move_to_turn_pair`.
     """
+    # Collect per-arrival deltas per (color, move).
     turn_maps: dict[Color, dict[MoveIndex, list[float]]] = {
         "black": defaultdict(list),
         "white": defaultdict(list),
@@ -283,21 +308,23 @@ def _find_worst_turns(
                 for t, d in deltas.items():
                     turn_maps[color][MoveIndex(int(t))].append(float(d))
 
-    worst: list[TurnIndex] = []
-    for color in _COLORS:
-        tm = turn_maps[color]
-        if not tm:
-            continue
-        avg_deltas = [(m, float(np.mean(ds))) for m, ds in tm.items()]
-        threshold = sorted(d for _, d in avg_deltas)[
-            int(len(avg_deltas) * quantile)
-        ]
-        worst_moves = [m for m, d in avg_deltas if d <= threshold]
-        for m in worst_moves:
-            before, after = move_to_turn_pair(color, m)
-            worst.append(before)
-            worst.append(after)
+    # Score each (color, move) using the default move selector,
+    # then apply per-color quantile selection.
+    scored: list[tuple[Color, MoveIndex, float]] = [
+        (color, m, _default_move_selector(ds))
+        for color in _COLORS
+        for m, ds in turn_maps[color].items()
+    ]
+    worst_pairs = _select_per_color_quantile_move(
+        scored, worst_quantile=quantile,
+    )
 
+    # Expand each worst (color, move) to its two-turn pair.
+    worst: list[TurnIndex] = []
+    for color, m in worst_pairs:
+        before, after = move_to_turn_pair(color, m)
+        worst.append(before)
+        worst.append(after)
     return worst
 
 
