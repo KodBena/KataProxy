@@ -372,8 +372,10 @@ strategies. Absent → axis default.
 `selector_axis` (optional) disambiguates when both
 `move_selector_fn` and `turn_selector_fn` are bound (rare).
 Absent → the axis whose binding is present wins; if neither,
-hardcoded default; if both without disambiguator, the
-implementation logs a warning and falls back to move-based.
+hardcoded default; if both bindings are present without a
+disambiguator, the implementation hard-refuses with
+`AdaptiveConfigurationError(code="ambiguous_axis")` per §8.2
+/ §11.4.
 
 ### 7.3 Top-k and threshold parameters
 
@@ -409,25 +411,47 @@ metadata would be a fail-loud violation).
 
 ## 8. Defaults and backwards compatibility
 
-Behaviour matrix for absent / present metadata combinations:
+### 8.1 Valid-shape dispatch matrix
 
-| `move_selector_fn` | `turn_selector_fn` | `selection_policy` | Effective shape |
-|---|---|---|---|
-| absent | absent | absent | Hardcoded default: move-based, mean-of-deltas, per-color quantile. |
-| present | absent | absent | User move selector, per-color quantile (move-default). |
-| absent | present | absent | User turn selector, pooled quantile (turn-default). |
-| present | absent | named | User move selector, named policy. |
-| absent | present | named | User turn selector, named policy. |
-| present | present | (any) | Disambiguator (`selector_axis`) required; warn + move-based fallback. |
+Behaviour matrix for absent / present metadata combinations on
+valid configurations:
 
-The one behavioural change visible at the wire for all clients
-is the window correction (move-space replaces turn-space). The
-default `window_size` value changes (3 → 2) to match the new
-semantics; clients that explicitly set `window_size=3` get
-"three same-color predecessors" post-v1.0.23, which is wider
-than the pre-v1.0.23 symmetric window. The release annotation
-names this divergence; clients tuning `window_size` should
-revisit their value.
+| `move_selector_fn` | `turn_selector_fn` | `selector_axis` | `selection_policy` | Effective shape |
+|---|---|---|---|---|
+| absent | absent | (any) | absent | Hardcoded default: move-based, mean-of-deltas, per-color quantile. |
+| present | absent | absent or `"move"` | absent | User move selector, per-color quantile (move-default). |
+| present | absent | absent or `"move"` | named | User move selector, named policy. |
+| absent | present | absent or `"turn"` | absent | User turn selector, pooled quantile (turn-default). |
+| absent | present | absent or `"turn"` | named | User turn selector, named policy. |
+| present | present | `"move"` | (any) | User move selector, named or default policy. |
+| present | present | `"turn"` | (any) | User turn selector, named or default policy. |
+
+### 8.2 Refused inconsistencies
+
+Configurations that name an inconsistent shape hard-refuse with
+a structured `AdaptiveConfigurationError` (see §11.4 for the
+principle and the four `code` values). The orchestration
+coroutine raises at the dispatch site; the framework's exception
+handler synthesises a structured error response. Frontend
+surfaces a system message naming the conflict.
+
+| Condition | Code |
+|---|---|
+| Both bindings present, no `selector_axis` | `ambiguous_axis` |
+| `selector_axis` names an axis whose binding is absent | `axis_binding_mismatch` |
+| `selection_policy` value inapplicable on the active axis | `policy_axis_mismatch` |
+| `selection_policy` missing a required parameter | `policy_parameters_invalid` |
+
+### 8.3 Wire-visible behaviour change
+
+The one behavioural change visible at the wire for valid-shape
+clients is the window correction (move-space replaces
+turn-space). The default `window_size` value changes (3 → 2) to
+match the new semantics; clients that explicitly set
+`window_size=3` get "three same-color predecessors"
+post-v1.0.23, which is wider than the pre-v1.0.23 symmetric
+window. The release annotation names this divergence; clients
+tuning `window_size` should revisit their value.
 
 ---
 
@@ -476,17 +500,28 @@ selector binding); the existing tests pass unchanged.
 
 Wire the new binding roles into the coroutine:
 
+- Introduce `AdaptiveConfigurationError` (per §11.4) with the
+  four inconsistency codes (`ambiguous_axis`,
+  `axis_binding_mismatch`, `policy_axis_mismatch`,
+  `policy_parameters_invalid`). The class lives alongside the
+  dispatch helpers in `middleware/adaptive_reevaluate.py`.
 - Resolve selector axis from `analysis_config.bindings` +
-  `capabilities.adaptive_reevaluate.selector_axis`.
-- For move axis: build `MoveView` per (color, move), call
-  user selector or default, apply selection policy.
+  `capabilities.adaptive_reevaluate.selector_axis`. Raise
+  `AdaptiveConfigurationError` on `ambiguous_axis` /
+  `axis_binding_mismatch` per §8.2.
+- Resolve selection policy from
+  `capabilities.adaptive_reevaluate.selection_policy`. Raise on
+  `policy_axis_mismatch` / `policy_parameters_invalid`.
+- For move axis: build `MoveView` per (color, move), call user
+  selector or default, apply selection policy.
 - For turn axis: build `TurnView` per turn, call user selector,
   apply selection policy.
-- The Stage 2 block of `coro` consumes the new dispatch
-  helpers and produces the deepening set as before.
+- The Stage 2 block of `coro` consumes the new dispatch helpers
+  and produces the deepening set as before.
 
 Behaviour preserved on the legacy path; new wire-shape fields
-unlock new behaviours per the matrix in §8.
+unlock new behaviours per the matrix in §8.1. Configuration
+inconsistencies hard-refuse per §8.2 / §11.4.
 
 ### Commit 5 — Window correction (move-space)
 
@@ -511,8 +546,14 @@ New tests in `tests/test_adaptive_selector_pluggability.py`:
 - `RegistryInterpreter` resolution: `get_move_selector_fn` /
   `get_turn_selector_fn` return `None` on absent bindings,
   the user-authored callable on present.
-- Dispatch axis resolution: each row of §8's matrix is
-  exercised with a synthetic `analysis_config` + `cap_meta`.
+- Dispatch axis resolution (valid shapes): each row of §8.1's
+  matrix that names a valid effective shape dispatches to the
+  expected selector + policy with a synthetic `analysis_config`
+  + `cap_meta`.
+- Configuration-consistency refusal: each row of §8.2's table
+  raises `AdaptiveConfigurationError` with the expected `code`
+  and `detail`; the orchestration framework's exception handler
+  produces the documented structured error response.
 - Window correction: same-color-predecessor expansion produces
   the documented turn-set for known move-color inputs.
 - Wire-shape integration: a full adaptive coroutine run with
@@ -576,15 +617,63 @@ window adds noise. If a future arc surfaces a use case, adding
 an optional `turn_window_size` field in capability metadata is
 backwards-compatible.
 
-### 11.4 `selector_axis` disambiguator is the warn-and-fallback path
+### 11.4 Configuration inconsistency hard-refuses with structured error
 
-If both `move_selector_fn` and `turn_selector_fn` are bound AND
-no `selector_axis` disambiguator is set, the implementation logs
-a warning and falls back to move-based. Rationale: silent
-inversion of intent is the failure mode ADR-0002 forbids; a
-warning surface lets the user see and correct. Hard-raising
-would punish a configuration mistake more loudly than warranted
-for a recoverable shape.
+Adaptive's per-query configuration (bindings + capability
+metadata + selection-policy parameters) admits several shapes
+of inconsistency. All of them hard-refuse with a structured
+`AdaptiveConfigurationError` carrying a `code` field and
+optional `detail`.
+
+**Rationale (the cost-asymmetry argument).** ADR-0002's general
+fail-loud rule trades "spam vs missed signal" on cheap ops. On
+a range-based adaptive query — full-game range across possibly
+hundreds of positions, plus the spawned deeper sub-query at
+`original_max + extra_visits` — both terms of the tradeoff push
+the same way:
+
+- Executing a wrong-intent query costs substantial real compute
+  (many GPU-seconds across the range and the deepening).
+- A wrong-intent result is hard for the user to notice does not
+  match their configured intent — the deepened analysis looks
+  plausible and can be conflated with intentional behaviour.
+- A clear refusal with a diagnostic is near-zero-cost and
+  informative.
+
+The asymmetry inverts: refusal beats warn-and-fallback on
+expensive ops. Discipline is calibrated to that.
+
+**The four inconsistency codes:**
+
+- `ambiguous_axis` — both `move_selector_fn` and
+  `turn_selector_fn` are bound; no `selector_axis`
+  disambiguator is set. Detail names both bindings.
+- `axis_binding_mismatch` — `selector_axis` names an axis
+  whose binding is not present (e.g., `"turn"` set but only
+  `move_selector_fn` bound). Detail names the axis and the
+  absent binding.
+- `policy_axis_mismatch` — the named `selection_policy` does
+  not apply on the active axis (e.g., `per_color_quantile` or
+  `per_color_threshold` on a turn-based selector). Detail
+  names the policy and the axis.
+- `policy_parameters_invalid` — the named `selection_policy`
+  is missing a required parameter (e.g., `top_k` named without
+  a `top_k: int` field; `per_color_threshold` without
+  `black_threshold` / `white_threshold`). Detail names the
+  missing parameter. This case generalises §7.3's existing
+  raises-on-mismatch position.
+
+**Implementation surface.** The orchestration coroutine raises
+`AdaptiveConfigurationError` at the dispatch site (Commit 4
+introduces the class alongside the dispatch helpers). The
+framework's exception handler synthesises a structured error
+response per the SELECTOR-unknown-model precedent
+(`{id, error, code, detail}`). The frontend's existing
+error-message handling maps the `code` field to a localised
+prompt naming which knobs to set or fix.
+
+Connected to ADR-0002 and the umbrella's memory entry on
+fail-loud calibration for expensive operations.
 
 ### 11.5 Window correction is hard-flipped
 
