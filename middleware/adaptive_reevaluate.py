@@ -68,6 +68,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -1610,6 +1611,12 @@ def adaptive_reevaluate(
         # observed final (for the finalization stage) plus per-unit
         # history and round-level aggregates for selectors / budget.
         state = AdaptiveState()
+        # Wall-clock origin for the wall_clock_seconds budget shape;
+        # sampled at coroutine entry (Stage 1 + finalization both count
+        # toward the elapsed total per §3.1's "from coroutine entry to
+        # has_capacity check" calibration). Updated after each round
+        # so budget.has_capacity reads the most recent elapsed time.
+        wall_clock_origin = time.monotonic()
 
         # Stage 1: forward partials + metadata immediately; record
         # each original final into state AND emit a preview to the
@@ -1697,6 +1704,7 @@ def adaptive_reevaluate(
                 worst_selector_value=worst_value,
             )
             state.record_visits(budget.visits_for_round())
+            state.record_wall_clock(time.monotonic() - wall_clock_origin)
 
         # Stage 3 — finalization. Emit each turn's latest observed
         # response with is_during_search=False. The single
