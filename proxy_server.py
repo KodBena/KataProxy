@@ -1173,10 +1173,14 @@ def _make_middleware() -> SessionMiddleware:
         adaptive_reevaluate(
             worst_quantile=0.25,
             extra_visits=800,
-            window_size=3,
+            window_size=2,
         )(),  # () because adaptive_reevaluate now returns a factory
               # (refactored to use the orchestration primitive in
               # v1.0.16; see roadmap-orchestration-middleware.md).
+              # window_size=2 reflects v1.0.23's move-space
+              # same-color-predecessor semantics (was symmetric ±1
+              # turn-space pre-v1.0.23, default 3); see
+              # docs/roadmap-adaptive-selector-pluggability.md.
     )
     if cfg.KEEP_ALIVE_IDLE_TIMEOUT_SECONDS <= 0:
         return base

@@ -322,9 +322,9 @@ def _collect_per_move_deltas(
 
     Reads `extra.<color>.deltas` (the per-move per-arrival policy
     deltas emitted by the analysis_enricher transformer) and groups
-    them into a typed per-color, per-move-index map. Used by both
-    the legacy-path `_find_worst_turns` and the user-axis dispatch
-    in `_build_move_views` (commit 4).
+    them into a typed per-color, per-move-index map. Consumed by
+    both the default-path scoring in `_dispatch_deepening_set` and
+    the user-axis `_build_move_views`.
     """
     turn_maps: dict[Color, dict[MoveIndex, list[float]]] = {
         "black": defaultdict(list),
@@ -339,69 +339,42 @@ def _collect_per_move_deltas(
     return turn_maps
 
 
-def _find_worst_turns(
-    responses: List[AnalyzeResponse], quantile: float,
-) -> list[TurnIndex]:
-    """Return turn indices to deepen, using the hardcoded default
-    move-axis selector + per-color quantile selection policy.
-
-    `quantile` is per-orig_id (read from the query's
-    capabilities.adaptive_reevaluate metadata, falling back to the
-    constructor-time default).
-
-    Refactored in v1.0.23 to factor the inline scoring + selection
-    arithmetic into the substrate's default selector
-    (`_default_move_selector`) and the
-    `_select_per_color_quantile_move` policy primitive. Behaviour
-    is preserved bit-for-bit on this legacy (no-binding) path:
-    same per-color quantile shape, same threshold-with-`<=`
-    inclusion semantics, same dict-iteration emission order.
-
-    Returns a flat list of `TurnIndex` values: each selected move
-    contributes its two-turn pair (before and after the move) via
-    `move_to_turn_pair`.
-    """
-    turn_maps = _collect_per_move_deltas(responses)
-
-    # Score each (color, move) using the default move selector,
-    # then apply per-color quantile selection.
-    scored: list[tuple[Color, MoveIndex, float]] = [
-        (color, m, _default_move_selector(ds))
-        for color in _COLORS
-        for m, ds in turn_maps[color].items()
-    ]
-    worst_pairs = _select_per_color_quantile_move(
-        scored, worst_quantile=quantile,
-    )
-
-    # Expand each worst (color, move) to its two-turn pair.
-    worst: list[TurnIndex] = []
-    for color, m in worst_pairs:
-        before, after = move_to_turn_pair(color, m)
-        worst.append(before)
-        worst.append(after)
-    return worst
-
-
-def _expand_window(
-    worst_turns: list[TurnIndex],
+def _expand_window_same_color(
+    worst_pairs: list[tuple[Color, MoveIndex]],
     all_turns: set[TurnIndex],
     window_size: int,
 ) -> set[TurnIndex]:
-    """Expand each worst turn into a window of neighbouring turns.
+    """Same-color predecessor window in move-space.
 
-    Operates purely in turn-space; per-color displacement is the
-    seam's concern, not the window's. v1.0.23 replaces the symmetric
-    turn-space expansion with a same-color move-space window per
-    docs/roadmap-adaptive-type-branding.md's sibling design note.
+    For each worst (color, move) pair, includes that move's
+    (before, after) turn pair PLUS the same pairs for its (window_size
+    - 1) same-color predecessors. Default `window_size=2` (the move
+    plus its immediate same-color predecessor).
+
+    Replaces the pre-v1.0.23 `_expand_window` (symmetric turn-space
+    ±half), which crossed into opposite-color neighbouring moves
+    whose badness is independent of the selected move. The new
+    expansion stays within the move's color, matching the per-color
+    selection semantics. See docs/roadmap-adaptive-selector-pluggability.md
+    §6 and §11.4's rationale.
+
+    Out-of-range predecessors (negative MoveIndex) and turns whose
+    TurnIndex is not in `all_turns` (game edges, range not analyzed)
+    are dropped.
     """
     expanded: set[TurnIndex] = set()
-    half = window_size // 2
-    for t in worst_turns:
-        for offset in range(-half, half + 1):
-            c = TurnIndex(int(t) + offset)
-            if c in all_turns:
-                expanded.add(c)
+    for color, m in worst_pairs:
+        m_int = int(m)
+        for offset in range(window_size):
+            pred_int = m_int - offset
+            if pred_int < 0:
+                break
+            pred = MoveIndex(pred_int)
+            before, after = move_to_turn_pair(color, pred)
+            if before in all_turns:
+                expanded.add(before)
+            if after in all_turns:
+                expanded.add(after)
     return expanded
 
 
@@ -749,26 +722,32 @@ def _dispatch_deepening_set(
     axis, user_selector = _resolve_axis_and_selector(interpreter, cap_meta)
 
     if axis == "move":
-        worst_turns: list[TurnIndex]
+        # Score the per-color moves — either via the hardcoded default
+        # (no user binding) or the user-authored selector. The default
+        # path preserves the legacy "mean policy delta + per-color
+        # quantile" shape; the window correction (move-space same-color
+        # predecessor expansion) is the one wire-visible behaviour
+        # change post-v1.0.23 on this path.
+        turn_maps = _collect_per_move_deltas(finals)
+        worst_pairs: list[tuple[Color, MoveIndex]]
         if user_selector is None:
-            # Default path — preserves bit-for-bit legacy behaviour.
-            quantile = float(cap_meta.get("worst_quantile", 0.25))
-            worst_turns = _find_worst_turns(finals, quantile)
+            scored_default: list[tuple[Color, MoveIndex, float]] = [
+                (color, m, _default_move_selector(ds))
+                for color in _COLORS
+                for m, ds in turn_maps[color].items()
+            ]
+            worst_pairs = _select_per_color_quantile_move(
+                scored_default,
+                worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
+            )
         else:
-            # User-authored move selector — build views, score, select.
-            turn_maps = _collect_per_move_deltas(finals)
             views_m = _build_move_views(finals, turn_maps)
             scored_m: list[tuple[Color, MoveIndex, float]] = [
                 (v.color, v.move_index, float(user_selector(v)))
                 for v in views_m
             ]
             worst_pairs = _apply_selection_policy_move(scored_m, cap_meta)
-            worst_turns = []
-            for color, m in worst_pairs:
-                before, after = move_to_turn_pair(color, m)
-                worst_turns.append(before)
-                worst_turns.append(after)
-        return _expand_window(worst_turns, all_turns, window_size)
+        return _expand_window_same_color(worst_pairs, all_turns, window_size)
 
     # axis == "turn" — user binding required (axis resolution enforces).
     assert user_selector is not None
@@ -787,7 +766,7 @@ def _dispatch_deepening_set(
 def adaptive_reevaluate(
     worst_quantile: float = 0.25,
     extra_visits: int = 800,
-    window_size: int = 3,
+    window_size: int = 2,
 ) -> Callable[[], OrchestrationMiddleware]:
     """Return a factory that produces an OrchestrationMiddleware
     expressing adaptive re-evaluation.
@@ -805,7 +784,7 @@ def adaptive_reevaluate(
             adaptive_reevaluate(
                 worst_quantile=0.25,
                 extra_visits=800,
-                window_size=3,
+                window_size=2,
             )(),  # () to invoke the factory
         )
 
