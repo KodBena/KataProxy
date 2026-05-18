@@ -657,6 +657,23 @@ class RegistryInterpreter:
         """
         return self._resolve_optional_binding("turn_selector_fn")
 
+    def get_value_fn(self) -> Optional[Callable[[Any], Any]]:
+        """Return the user-authored Phase 3 value function, or None.
+
+        Per `proxy/docs/roadmap-info-theoretic-allocation.md` §3.2, the
+        Phase 3 allocation dispatch reads `bindings['value_fn']` and
+        resolves to a per-turn `TurnView -> float` callable. Convention:
+        higher = more valuable (opposite of the selector's lower=worse).
+
+        Same None-vs-stub semantics as the selector accessors: absent
+        or broken binding returns None. Phase 3 is opt-in, so the
+        dispatch refuses with `AdaptiveConfigurationError(code=
+        "allocation_invalid")` at engagement time if None is returned
+        while `allocation_algorithm` is named — there is no silent
+        fallback to a default value function.
+        """
+        return self._resolve_optional_binding("value_fn")
+
     def _resolve_optional_binding(
         self, key: str,
     ) -> Optional[Callable[[Any], Any]]:
