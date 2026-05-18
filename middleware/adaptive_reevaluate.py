@@ -70,8 +70,19 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import replace
-from typing import AsyncIterator, Callable, Dict, List, Optional, Set, Tuple, cast
+from dataclasses import dataclass, replace
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    cast,
+)
 
 import numpy as np
 
@@ -92,35 +103,228 @@ from middleware.orchestration import (
     orchestration_middleware,
 )
 from proxy_logging import Event, get_proxy_logger
+from registry_interpreter import RegistryInterpreter
 
 logger = logging.getLogger("kataproxy." + __name__)
 _log = get_proxy_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (runtime behaviour unchanged since the pre-v1.0.16 imperative
-# impl; signatures brand-threaded in v1.0.22 — see
-# docs/roadmap-adaptive-type-branding.md).
+# Configuration-consistency error class (v1.0.23)
+# ---------------------------------------------------------------------------
+#
+# Hard-refusal at the adaptive dispatch site per the cost-asymmetry
+# calibration in docs/roadmap-adaptive-selector-pluggability.md §11.4:
+# executing an expensive range-based query with conflated intent is
+# more harmful than refusing clearly. The orchestration framework's
+# exception handler synthesises a structured error response when the
+# coroutine raises (see middleware/orchestration.py); the operator's
+# log carries the full `code` + `detail` context via the exception's
+# string representation.
+
+class AdaptiveConfigurationError(RuntimeError):
+    """Raised when adaptive_reevaluate's per-query configuration is
+    inconsistent.
+
+    See docs/roadmap-adaptive-selector-pluggability.md §11.4 for the
+    principle and the four `code` values: `ambiguous_axis`,
+    `axis_binding_mismatch`, `policy_axis_mismatch`,
+    `policy_parameters_invalid`.
+    """
+
+    def __init__(self, *, code: str, detail: dict[str, Any]) -> None:
+        super().__init__(f"adaptive_reevaluate: {code} {detail}")
+        self.code = code
+        self.detail = detail
+
+
+# ---------------------------------------------------------------------------
+# Selector substrate — views and selection policies (v1.0.23 commit 1)
+#
+# The views (MoveView, TurnView) are the per-unit objects passed to
+# user-authored selector expressions bound via analysis_config.bindings's
+# `move_selector_fn` / `turn_selector_fn` roles. The selection-policy
+# primitives operate on typed scored lists and return the worst-set; the
+# dispatch wiring that resolves which policy to call per query lands in
+# commit 4. See docs/roadmap-adaptive-selector-pluggability.md.
 # ---------------------------------------------------------------------------
 
+
+# Typed colour iteration constant — used by per-color selection policies and
+# by the pure helpers below.
 _COLORS: tuple[Color, Color] = ("black", "white")
 
 
-def _find_worst_turns(
-    responses: List[AnalyzeResponse], quantile: float,
+@dataclass(frozen=True)
+class MoveView:
+    """The per-move view a `move_selector_fn` binding receives.
+
+    Carries the brand (color + move_index) plus the per-arrival policy
+    deltas for this move and references to the before/after analyze
+    packets so the user expression can compute transition-shaped
+    metrics (policy delta aggregations, score-lead drop, played-policy
+    divergence, etc.).
+    """
+
+    color: Color
+    move_index: MoveIndex
+    deltas: list[float]
+    before: AnalyzeResponse
+    after: AnalyzeResponse
+
+
+@dataclass(frozen=True)
+class TurnView:
+    """The per-turn view a `turn_selector_fn` binding receives.
+
+    Carries the position index, the side-to-play at this position, and
+    the analyze response. Turn-based metrics (policy entropy, score
+    variance via state_fns precomputation, ownership flux) operate on
+    a single packet without transition context.
+    """
+
+    turn_index: TurnIndex
+    to_play: Color
+    packet: AnalyzeResponse
+
+
+# Selection-policy primitives — move-axis
+#
+# Each takes a typed scored list and returns the worst-set as
+# (Color, MoveIndex) tuples. Parameters are keyword-only; the dispatch
+# in commit 4 supplies them from capability metadata.
+#
+# The threshold-based quantile primitives match the existing
+# _find_worst_turns behaviour bit-for-bit: threshold = scalar at the
+# quantile-index after sorting ascending; inclusion criterion is
+# `scalar <= threshold`; ties are admitted. This is what makes the
+# commit-3 refactor's "default-path preserves behaviour exactly"
+# guarantee honest.
+
+def _select_per_color_quantile_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    worst_quantile: float,
+) -> list[tuple[Color, MoveIndex]]:
+    """Per-color bottom-quantile selection.
+
+    Both colors contribute Q% of their items independently; the union
+    is returned. Matches the v1.0.22 `_find_worst_turns` per-color
+    quantile shape exactly (threshold-based with `<=`).
+    """
+    worst: list[tuple[Color, MoveIndex]] = []
+    for color in _COLORS:
+        color_scored = [(m, s) for c, m, s in scored if c == color]
+        if not color_scored:
+            continue
+        sorted_scalars = sorted(s for _, s in color_scored)
+        threshold = sorted_scalars[int(len(color_scored) * worst_quantile)]
+        worst.extend((color, m) for m, s in color_scored if s <= threshold)
+    return worst
+
+
+def _select_pooled_quantile_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    worst_quantile: float,
+) -> list[tuple[Color, MoveIndex]]:
+    """Pooled bottom-quantile selection across both colors."""
+    if not scored:
+        return []
+    sorted_scalars = sorted(s for _, _, s in scored)
+    threshold = sorted_scalars[int(len(scored) * worst_quantile)]
+    return [(c, m) for c, m, s in scored if s <= threshold]
+
+
+def _select_per_color_threshold_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    black_threshold: float,
+    white_threshold: float,
+) -> list[tuple[Color, MoveIndex]]:
+    """Per-color absolute thresholds — scalar <= color's threshold."""
+    threshold: dict[Color, float] = {
+        "black": black_threshold,
+        "white": white_threshold,
+    }
+    return [(c, m) for c, m, s in scored if s <= threshold[c]]
+
+
+def _select_top_k_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    *,
+    top_k: int,
+) -> list[tuple[Color, MoveIndex]]:
+    """Bottom-K worst items across both colors, pooled."""
+    sorted_scored = sorted(scored, key=lambda x: x[2])
+    return [(c, m) for c, m, _ in sorted_scored[:top_k]]
+
+
+# Selection-policy primitives — turn-axis
+#
+# Each takes a typed scored list and returns the worst-set as
+# TurnIndex values. Per-color partitioning does not apply on the
+# turn axis (positions are color-agnostic for selection purposes;
+# the to_play field on TurnView is the user's to consult).
+
+def _select_pooled_quantile_turn(
+    scored: list[tuple[TurnIndex, float]],
+    *,
+    worst_quantile: float,
 ) -> list[TurnIndex]:
-    """Return turn indices whose mean policy delta is in the worst quantile.
+    """Pooled bottom-quantile selection over turns."""
+    if not scored:
+        return []
+    sorted_scalars = sorted(s for _, s in scored)
+    threshold = sorted_scalars[int(len(scored) * worst_quantile)]
+    return [t for t, s in scored if s <= threshold]
 
-    `quantile` is per-orig_id (read from the query's
-    capabilities.adaptive_reevaluate metadata, falling back to the
-    constructor-time default).
 
-    Returns a flat list of `TurnIndex` values: each selected move
-    contributes its two-turn pair (before and after the move) via
-    `move_to_turn_pair`. Per-color quantile selection is applied
-    independently to Black's and White's move sequences; the
-    framework-internal `2*t + displacement` arithmetic lives behind
-    the seam.
+def _select_top_k_turn(
+    scored: list[tuple[TurnIndex, float]],
+    *,
+    top_k: int,
+) -> list[TurnIndex]:
+    """Bottom-K worst turns."""
+    sorted_scored = sorted(scored, key=lambda x: x[1])
+    return [t for t, _ in sorted_scored[:top_k]]
+
+
+# Default move-axis selector — used when no `move_selector_fn` binding
+# is present in the active `analysis_config`. Lower returned scalar is
+# worse (smaller mean policy delta indicates the actual move's quality
+# was lower). The signature is deltas-only rather than MoveView-typed
+# because the default path bypasses view construction (it does not
+# need the before/after AnalyzeResponse references); user-authored
+# selectors receive a full MoveView from the dispatch site in
+# commit 4.
+
+def _default_move_selector(deltas: list[float]) -> float:
+    """The hardcoded default move-axis selector: mean of per-arrival
+    policy deltas for the move. Used when no `move_selector_fn`
+    binding is active.
+    """
+    return float(np.mean(deltas))
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (runtime behaviour unchanged since the pre-v1.0.16 imperative
+# impl; signatures brand-threaded in v1.0.22; refactored in v1.0.23 to use
+# the selector substrate above while preserving the legacy-path behaviour
+# bit-for-bit — see docs/roadmap-adaptive-selector-pluggability.md).
+# ---------------------------------------------------------------------------
+
+
+def _collect_per_move_deltas(
+    responses: List[AnalyzeResponse],
+) -> dict[Color, dict[MoveIndex, list[float]]]:
+    """Collect per-color per-move policy deltas from final responses.
+
+    Reads `extra.<color>.deltas` (the per-move per-arrival policy
+    deltas emitted by the analysis_enricher transformer) and groups
+    them into a typed per-color, per-move-index map. Consumed by
+    both the default-path scoring in `_dispatch_deepening_set` and
+    the user-axis `_build_move_views`.
     """
     turn_maps: dict[Color, dict[MoveIndex, list[float]]] = {
         "black": defaultdict(list),
@@ -132,44 +336,48 @@ def _find_worst_turns(
             if isinstance(deltas, dict):
                 for t, d in deltas.items():
                     turn_maps[color][MoveIndex(int(t))].append(float(d))
-
-    worst: list[TurnIndex] = []
-    for color in _COLORS:
-        tm = turn_maps[color]
-        if not tm:
-            continue
-        avg_deltas = [(m, float(np.mean(ds))) for m, ds in tm.items()]
-        threshold = sorted(d for _, d in avg_deltas)[
-            int(len(avg_deltas) * quantile)
-        ]
-        worst_moves = [m for m, d in avg_deltas if d <= threshold]
-        for m in worst_moves:
-            before, after = move_to_turn_pair(color, m)
-            worst.append(before)
-            worst.append(after)
-
-    return worst
+    return turn_maps
 
 
-def _expand_window(
-    worst_turns: list[TurnIndex],
+def _expand_window_same_color(
+    worst_pairs: list[tuple[Color, MoveIndex]],
     all_turns: set[TurnIndex],
     window_size: int,
 ) -> set[TurnIndex]:
-    """Expand each worst turn into a window of neighbouring turns.
+    """Same-color predecessor window in move-space.
 
-    Operates purely in turn-space; per-color displacement is the
-    seam's concern, not the window's. v1.0.23 replaces the symmetric
-    turn-space expansion with a same-color move-space window per
-    docs/roadmap-adaptive-type-branding.md's sibling design note.
+    For each worst (color, move) pair, includes that move's
+    (before, after) turn pair PLUS the same pairs for its (window_size
+    - 1) same-color predecessors. Default `window_size=1` — re-evaluate
+    only the bad moves themselves (each move is two positions). The
+    windowing infrastructure is in place for users who want to include
+    context, but the semantic default is "re-evaluate exactly what was
+    flagged as worst, nothing else."
+
+    Replaces the pre-v1.0.23 `_expand_window` (symmetric turn-space
+    ±half), which crossed into opposite-color neighbouring moves
+    whose badness is independent of the selected move. The new
+    expansion stays within the move's color, matching the per-color
+    selection semantics. See docs/roadmap-adaptive-selector-pluggability.md
+    §6 and §11.4's rationale.
+
+    Out-of-range predecessors (negative MoveIndex) and turns whose
+    TurnIndex is not in `all_turns` (game edges, range not analyzed)
+    are dropped.
     """
     expanded: set[TurnIndex] = set()
-    half = window_size // 2
-    for t in worst_turns:
-        for offset in range(-half, half + 1):
-            c = TurnIndex(int(t) + offset)
-            if c in all_turns:
-                expanded.add(c)
+    for color, m in worst_pairs:
+        m_int = int(m)
+        for offset in range(window_size):
+            pred_int = m_int - offset
+            if pred_int < 0:
+                break
+            pred = MoveIndex(pred_int)
+            before, after = move_to_turn_pair(color, pred)
+            if before in all_turns:
+                expanded.add(before)
+            if after in all_turns:
+                expanded.add(after)
     return expanded
 
 
@@ -213,13 +421,355 @@ def _build_deeper_query(
 
 
 # ---------------------------------------------------------------------------
+# Dispatch helpers (v1.0.23 commit 4)
+#
+# These wire user-authored selectors and the curated selection policies
+# into the per-query path. They consume:
+#
+#   - `analysis_config` (parent.opaque['analysis_config']) — the
+#     authoritative source of `move_selector_fn` / `turn_selector_fn`
+#     bindings, via RegistryInterpreter's Optional-returning accessors
+#     introduced in v1.0.23 commit 2;
+#   - `cap_meta` (parent.opaque['capabilities']['adaptive_reevaluate'])
+#     — the disambiguator (`selector_axis`), the selection policy
+#     name + parameters (`selection_policy`, `worst_quantile`,
+#     `top_k`, `black_threshold`, `white_threshold`), and the
+#     legacy scalar knobs (`worst_quantile`, `extra_visits`,
+#     `window_size`).
+#
+# Configuration inconsistencies hard-refuse with
+# AdaptiveConfigurationError per the cost-asymmetry calibration in
+# docs/roadmap-adaptive-selector-pluggability.md §11.4.
+# ---------------------------------------------------------------------------
+
+
+def _try_build_interpreter(
+    analysis_config: Optional[dict[str, Any]],
+) -> Optional[RegistryInterpreter]:
+    """Build a RegistryInterpreter from analysis_config, or None.
+
+    Returns None when analysis_config is absent or fails to compile
+    (matches analysis_enricher's "warn and skip enrichment" posture
+    for compile failures). Adaptive's dispatch treats this as
+    "no user-authored selectors" and falls back to the hardcoded
+    default path.
+
+    This is the same fallback discipline as analysis_enricher.on_query;
+    §11.4's hard-refusal applies to ADAPTIVE-SPECIFIC inconsistencies
+    (axis/policy/parameter conflicts), not to analysis_config-level
+    compile failures that would also break the rest of the analysis
+    pipeline.
+    """
+    if not analysis_config:
+        return None
+    try:
+        return RegistryInterpreter(analysis_config)
+    except (RuntimeError, TypeError, ValueError) as e:
+        _log.warning(
+            Event.DIAGNOSTIC,
+            msg=(
+                f"adaptive: RegistryInterpreter setup failed: {e}; "
+                f"selectors disabled (falling back to hardcoded default)"
+            ),
+        )
+        return None
+
+
+def _resolve_axis_and_selector(
+    interpreter: Optional[RegistryInterpreter],
+    cap_meta: dict[str, Any],
+) -> tuple[Literal["move", "turn"], Optional[Callable[[Any], Any]]]:
+    """Resolve the effective selector axis and (optional) user-authored callable.
+
+    Returns:
+      ("move", None)        — default path; no user binding for move axis.
+      ("move", callable)    — user-authored move selector.
+      ("turn", callable)    — user-authored turn selector (turn axis
+                              has no hardcoded default — a user
+                              binding is required for the turn axis).
+
+    Raises AdaptiveConfigurationError on the inconsistency cases
+    enumerated in §11.4:
+      - `ambiguous_axis`: both bindings present, no `selector_axis`.
+      - `axis_binding_mismatch`: `selector_axis` names an absent
+        binding or an invalid axis value.
+    """
+    declared_axis = cap_meta.get("selector_axis")
+
+    if declared_axis is not None and declared_axis not in ("move", "turn"):
+        raise AdaptiveConfigurationError(
+            code="axis_binding_mismatch",
+            detail={
+                "selector_axis": declared_axis,
+                "remedy": "selector_axis must be 'move' or 'turn'",
+            },
+        )
+
+    move_selector = (
+        interpreter.get_move_selector_fn() if interpreter is not None else None
+    )
+    turn_selector = (
+        interpreter.get_turn_selector_fn() if interpreter is not None else None
+    )
+
+    if declared_axis is None:
+        if move_selector is not None and turn_selector is not None:
+            raise AdaptiveConfigurationError(
+                code="ambiguous_axis",
+                detail={
+                    "remedy": (
+                        "both move_selector_fn and turn_selector_fn are "
+                        "bound; set capabilities.adaptive_reevaluate."
+                        "selector_axis to 'move' or 'turn' to disambiguate"
+                    ),
+                },
+            )
+        if turn_selector is not None:
+            return ("turn", turn_selector)
+        # move_selector is either a callable or None (no binding,
+        # default path engages).
+        return ("move", move_selector)
+
+    if declared_axis == "move":
+        if move_selector is None:
+            raise AdaptiveConfigurationError(
+                code="axis_binding_mismatch",
+                detail={
+                    "selector_axis": "move",
+                    "remedy": (
+                        "bind move_selector_fn in "
+                        "analysis_config.bindings, or omit selector_axis "
+                        "to use the hardcoded default selector"
+                    ),
+                },
+            )
+        return ("move", move_selector)
+
+    # declared_axis == "turn"
+    if turn_selector is None:
+        raise AdaptiveConfigurationError(
+            code="axis_binding_mismatch",
+            detail={
+                "selector_axis": "turn",
+                "remedy": "bind turn_selector_fn in analysis_config.bindings",
+            },
+        )
+    return ("turn", turn_selector)
+
+
+def _apply_selection_policy_move(
+    scored: list[tuple[Color, MoveIndex, float]],
+    cap_meta: dict[str, Any],
+) -> list[tuple[Color, MoveIndex]]:
+    """Apply the named selection policy to move-axis scored data.
+
+    Raises AdaptiveConfigurationError on policy_axis_mismatch (unknown
+    policy name, or turn-only policy named on move axis) or
+    policy_parameters_invalid (required parameter missing).
+    """
+    policy_name = cap_meta.get("selection_policy", "per_color_quantile")
+
+    if policy_name == "per_color_quantile":
+        return _select_per_color_quantile_move(
+            scored,
+            worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
+        )
+    if policy_name == "pooled_quantile":
+        return _select_pooled_quantile_move(
+            scored,
+            worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
+        )
+    if policy_name == "per_color_threshold":
+        missing = [
+            k for k in ("black_threshold", "white_threshold")
+            if k not in cap_meta
+        ]
+        if missing:
+            raise AdaptiveConfigurationError(
+                code="policy_parameters_invalid",
+                detail={
+                    "selection_policy": "per_color_threshold",
+                    "missing": missing,
+                },
+            )
+        return _select_per_color_threshold_move(
+            scored,
+            black_threshold=float(cap_meta["black_threshold"]),
+            white_threshold=float(cap_meta["white_threshold"]),
+        )
+    if policy_name == "top_k":
+        if "top_k" not in cap_meta:
+            raise AdaptiveConfigurationError(
+                code="policy_parameters_invalid",
+                detail={
+                    "selection_policy": "top_k",
+                    "missing": ["top_k"],
+                },
+            )
+        return _select_top_k_move(scored, top_k=int(cap_meta["top_k"]))
+    raise AdaptiveConfigurationError(
+        code="policy_axis_mismatch",
+        detail={
+            "selection_policy": policy_name,
+            "axis": "move",
+            "valid": [
+                "per_color_quantile", "pooled_quantile",
+                "per_color_threshold", "top_k",
+            ],
+        },
+    )
+
+
+def _apply_selection_policy_turn(
+    scored: list[tuple[TurnIndex, float]],
+    cap_meta: dict[str, Any],
+) -> list[TurnIndex]:
+    """Apply the named selection policy to turn-axis scored data.
+
+    Per-color policies (per_color_quantile, per_color_threshold) are
+    move-only and raise policy_axis_mismatch when named on the turn
+    axis.
+    """
+    policy_name = cap_meta.get("selection_policy", "pooled_quantile")
+
+    if policy_name == "pooled_quantile":
+        return _select_pooled_quantile_turn(
+            scored,
+            worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
+        )
+    if policy_name == "top_k":
+        if "top_k" not in cap_meta:
+            raise AdaptiveConfigurationError(
+                code="policy_parameters_invalid",
+                detail={
+                    "selection_policy": "top_k",
+                    "missing": ["top_k"],
+                },
+            )
+        return _select_top_k_turn(scored, top_k=int(cap_meta["top_k"]))
+    raise AdaptiveConfigurationError(
+        code="policy_axis_mismatch",
+        detail={
+            "selection_policy": policy_name,
+            "axis": "turn",
+            "valid_for_turn": ["pooled_quantile", "top_k"],
+        },
+    )
+
+
+def _build_move_views(
+    finals: List[AnalyzeResponse],
+    turn_maps: dict[Color, dict[MoveIndex, list[float]]],
+) -> list[MoveView]:
+    """Construct a MoveView for each (color, move) with deltas, when
+    both endpoint AnalyzeResponses are available.
+
+    Moves at game edges (or any move whose before/after turn isn't in
+    the final-response set) are skipped — the user selector cannot
+    operate on them without complete view data.
+    """
+    by_turn: dict[TurnIndex, AnalyzeResponse] = {
+        TurnIndex(f.turn_number): f for f in finals
+    }
+    views: list[MoveView] = []
+    for color in _COLORS:
+        for m, deltas in turn_maps[color].items():
+            before_idx, after_idx = move_to_turn_pair(color, m)
+            before_packet = by_turn.get(before_idx)
+            after_packet = by_turn.get(after_idx)
+            if before_packet is None or after_packet is None:
+                continue
+            views.append(MoveView(
+                color=color,
+                move_index=m,
+                deltas=list(deltas),
+                before=before_packet,
+                after=after_packet,
+            ))
+    return views
+
+
+def _build_turn_views(
+    finals: List[AnalyzeResponse],
+) -> list[TurnView]:
+    """Construct a TurnView for each final AnalyzeResponse.
+
+    Side-to-play at turn t: Black at even turns (0, 2, 4, …), White
+    at odd turns. The convention follows KataGo's analyze_turns
+    indexing where turn 0 is the root.
+    """
+    views: list[TurnView] = []
+    for f in finals:
+        turn = TurnIndex(f.turn_number)
+        to_play: Color = "black" if int(turn) % 2 == 0 else "white"
+        views.append(TurnView(turn_index=turn, to_play=to_play, packet=f))
+    return views
+
+
+def _dispatch_deepening_set(
+    finals: List[AnalyzeResponse],
+    cap_meta: dict[str, Any],
+    analysis_config: Optional[dict[str, Any]],
+    window_size: int,
+    all_turns: set[TurnIndex],
+) -> set[TurnIndex]:
+    """Resolve dispatch and produce the deepening-turn set.
+
+    Move-axis path: worst-set is expanded via `_expand_window`
+    (turn-space symmetric; same-color-predecessor in commit 5).
+    Turn-axis path: worst-set IS the deepening set (no framework
+    window expansion in v1.0.23; selector authors any cross-turn
+    aggregation via `apply_window` in the expression substrate).
+    """
+    interpreter = _try_build_interpreter(analysis_config)
+    axis, user_selector = _resolve_axis_and_selector(interpreter, cap_meta)
+
+    if axis == "move":
+        # Score the per-color moves — either via the hardcoded default
+        # (no user binding) or the user-authored selector. The default
+        # path preserves the legacy "mean policy delta + per-color
+        # quantile" shape; the window correction (move-space same-color
+        # predecessor expansion) is the one wire-visible behaviour
+        # change post-v1.0.23 on this path.
+        turn_maps = _collect_per_move_deltas(finals)
+        worst_pairs: list[tuple[Color, MoveIndex]]
+        if user_selector is None:
+            scored_default: list[tuple[Color, MoveIndex, float]] = [
+                (color, m, _default_move_selector(ds))
+                for color in _COLORS
+                for m, ds in turn_maps[color].items()
+            ]
+            worst_pairs = _select_per_color_quantile_move(
+                scored_default,
+                worst_quantile=float(cap_meta.get("worst_quantile", 0.25)),
+            )
+        else:
+            views_m = _build_move_views(finals, turn_maps)
+            scored_m: list[tuple[Color, MoveIndex, float]] = [
+                (v.color, v.move_index, float(user_selector(v)))
+                for v in views_m
+            ]
+            worst_pairs = _apply_selection_policy_move(scored_m, cap_meta)
+        return _expand_window_same_color(worst_pairs, all_turns, window_size)
+
+    # axis == "turn" — user binding required (axis resolution enforces).
+    assert user_selector is not None
+    views_t = _build_turn_views(finals)
+    scored_t: list[tuple[TurnIndex, float]] = [
+        (v.turn_index, float(user_selector(v))) for v in views_t
+    ]
+    worst_turns_list = _apply_selection_policy_turn(scored_t, cap_meta)
+    return set(worst_turns_list) & all_turns
+
+
+# ---------------------------------------------------------------------------
 # adaptive_reevaluate factory (orchestration-shaped)
 # ---------------------------------------------------------------------------
 
 def adaptive_reevaluate(
     worst_quantile: float = 0.25,
     extra_visits: int = 800,
-    window_size: int = 3,
+    window_size: int = 1,
 ) -> Callable[[], OrchestrationMiddleware]:
     """Return a factory that produces an OrchestrationMiddleware
     expressing adaptive re-evaluation.
@@ -237,7 +787,7 @@ def adaptive_reevaluate(
             adaptive_reevaluate(
                 worst_quantile=0.25,
                 extra_visits=800,
-                window_size=3,
+                window_size=1,
             )(),  # () to invoke the factory
         )
 
@@ -291,10 +841,33 @@ def adaptive_reevaluate(
         if not finals:
             return
 
-        # Stage 2: decide on adaptation.
+        # Stage 2: decide on adaptation. Dispatch into the
+        # selector + selection-policy substrate; either the
+        # hardcoded default (no user binding) or the user-authored
+        # selector path runs, with configuration inconsistencies
+        # hard-refusing per AdaptiveConfigurationError. The cap_meta
+        # already carries worst_quantile / window_size / etc.; the
+        # coroutine's closure-default scalars are present as keys via
+        # the legacy-default scaffolding so the dispatch reads
+        # uniformly.
         all_turns: set[TurnIndex] = {TurnIndex(f.turn_number) for f in finals}
-        worst = _find_worst_turns(finals, q_quantile)
-        deepen = _expand_window(worst, all_turns, window_size)
+        raw_config = parent.opaque.get("analysis_config")
+        analysis_config: Optional[dict[str, Any]] = (
+            raw_config if isinstance(raw_config, dict) else None
+        )
+        # Ensure cap_meta carries the resolved scalar defaults
+        # (closure capture + per-query overrides). The dispatch
+        # helpers read cap_meta as the single source for these
+        # scalars; mirror them in so the call site is uniform.
+        cap_meta_for_dispatch: dict[str, Any] = dict(cap_meta)
+        cap_meta_for_dispatch.setdefault("worst_quantile", q_quantile)
+        deepen = _dispatch_deepening_set(
+            finals=finals,
+            cap_meta=cap_meta_for_dispatch,
+            analysis_config=analysis_config,
+            window_size=window_size,
+            all_turns=all_turns,
+        )
 
         if not deepen:
             # No adaptation warranted; promote each preview to the
