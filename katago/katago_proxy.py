@@ -25,7 +25,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Any, Callable, Optional, Sequence, cast
+from typing import Any, Callable, Literal, NewType, Optional, Sequence, cast
 
 from AbstractProxy.proxy_core import (
     ClientId,
@@ -58,7 +58,86 @@ __all__ = [
     "register_query_completion",
     "KATAGO_QUERY_PRISMS",
     "CompletionTracker",
+    # Game-tree indexing brands (v1.0.22; see
+    # docs/roadmap-adaptive-type-branding.md).
+    "MoveIndex",
+    "TurnIndex",
+    "Color",
+    "move_to_turn_pair",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Game-tree indexing — MoveIndex / TurnIndex / Color
+# ---------------------------------------------------------------------------
+#
+# KataGo's analysis protocol mixes two distinct integer concepts at the
+# game-tree level: per-color move indices (the position of a move within
+# one color's move sequence — what `extra.<color>.deltas` is keyed by)
+# and per-position turn indices (the overall position number, root = 0
+# — what `KataGoQuery.analyze_turns` carries). The brands below make
+# them type-distinct under `mypy --strict` while staying runtime-equal
+# `int`s. The single named translation seam (`move_to_turn_pair`) owns
+# the move-space → turn-space arithmetic.
+#
+# v1.0.22 introduces these brands and threads them through
+# `middleware/adaptive_reevaluate.py`'s internal helpers. The wider
+# migration (typing `KataGoQuery.analyze_turns` as `list[TurnIndex]`,
+# propagating brands through `analysis_enricher` and `delta_analysis`)
+# is deferred — see `docs/roadmap-adaptive-type-branding.md` §7.2.
+#
+# Pattern parallels the v1.0.21 identity-type branding arc
+# (`AbstractProxy/proxy_core.py`'s ClientId / InternalId / CanonicalId
+# / WireId); see `docs/roadmap-identity-type-branding.md` §3 for the
+# full NewType semantics discussion.
+
+MoveIndex = NewType("MoveIndex", int)
+"""Per-color move index. 0-indexed within one color's move sequence.
+
+The Nth Black move has `MoveIndex(N)`; the Nth White move has
+`MoveIndex(N)`. The brand carries no color context itself — color
+must be supplied alongside (e.g., via `move_to_turn_pair`'s `color`
+argument) when the brand is consumed.
+"""
+
+TurnIndex = NewType("TurnIndex", int)
+"""Per-position turn index. 0 = root (empty board), 1 = position after
+the first move, 2 = position after the first response, and so on.
+
+The wire field `KataGoQuery.analyze_turns` carries `TurnIndex` values
+post-migration. v1.0.22 keeps the wire-types field declared as
+`Optional[list[int]]` (see roadmap §7.2); the brand discipline lives
+in `adaptive_reevaluate`'s internal arithmetic.
+"""
+
+Color = Literal["black", "white"]
+"""Side-to-play / color of a move. A `Literal` type alias rather than
+a NewType: the 2-valued domain admits the existing string literals
+natively, and mypy enforces that only `"black"` or `"white"` flows
+through `Color`-typed sites without requiring explicit construction
+at every literal.
+"""
+
+
+def move_to_turn_pair(
+    color: Color, m: MoveIndex,
+) -> tuple[TurnIndex, TurnIndex]:
+    """Translate a per-color move index to its (before, after) turn pair.
+
+    For Black's m-th move (`MoveIndex(m)`): returns `(TurnIndex(2m), TurnIndex(2m+1))`.
+    For White's m-th move (`MoveIndex(m)`): returns `(TurnIndex(2m+1), TurnIndex(2m+2))`.
+
+    The "before" turn is the position the moving side faces; the
+    "after" turn is the position resulting from playing the move.
+
+    This is the one open-coded location for the move-space → turn-space
+    arithmetic in the proxy. Every consumer that previously wrote
+    `2 * t + displacement` (in `_find_worst_turns`; in v1.0.23+'s
+    same-color-predecessor expansion) calls this seam.
+    """
+    displacement = 0 if color == "black" else 1
+    t = int(m)
+    return TurnIndex(2 * t + displacement), TurnIndex(2 * t + 1 + displacement)
 
 
 # ---------------------------------------------------------------------------

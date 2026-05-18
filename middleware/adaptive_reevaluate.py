@@ -71,16 +71,20 @@ import logging
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import replace
-from typing import AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
+from typing import AsyncIterator, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import numpy as np
 
 from katago import (
     AnalyzeResponse,
+    Color,
     KataGoAction,
     KataGoQuery,
     KataGoResponse,
     MetadataResponse,
+    MoveIndex,
+    TurnIndex,
+    move_to_turn_pair,
 )
 from middleware.orchestration import (
     OrchestrationContext,
@@ -94,64 +98,83 @@ _log = get_proxy_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers (unchanged signatures from the pre-v1.0.16 imperative impl)
+# Pure helpers (runtime behaviour unchanged since the pre-v1.0.16 imperative
+# impl; signatures brand-threaded in v1.0.22 — see
+# docs/roadmap-adaptive-type-branding.md).
 # ---------------------------------------------------------------------------
+
+_COLORS: tuple[Color, Color] = ("black", "white")
+
 
 def _find_worst_turns(
     responses: List[AnalyzeResponse], quantile: float,
-) -> List[int]:
-    """Return turn numbers whose mean policy delta is in the worst quantile.
+) -> list[TurnIndex]:
+    """Return turn indices whose mean policy delta is in the worst quantile.
 
     `quantile` is per-orig_id (read from the query's
     capabilities.adaptive_reevaluate metadata, falling back to the
     constructor-time default).
+
+    Returns a flat list of `TurnIndex` values: each selected move
+    contributes its two-turn pair (before and after the move) via
+    `move_to_turn_pair`. Per-color quantile selection is applied
+    independently to Black's and White's move sequences; the
+    framework-internal `2*t + displacement` arithmetic lives behind
+    the seam.
     """
-    turn_maps: Dict[str, Dict[int, List[float]]] = {
+    turn_maps: dict[Color, dict[MoveIndex, list[float]]] = {
         "black": defaultdict(list),
         "white": defaultdict(list),
     }
     for resp in responses:
-        for color in ("black", "white"):
+        for color in _COLORS:
             deltas = resp.opaque.get("extra", {}).get(color, {}).get("deltas")
             if isinstance(deltas, dict):
                 for t, d in deltas.items():
-                    turn_maps[color][int(t)].append(float(d))
+                    turn_maps[color][MoveIndex(int(t))].append(float(d))
 
-    worst: List[int] = []
-    for displacement, color in [(0, "black"), (1, "white")]:
+    worst: list[TurnIndex] = []
+    for color in _COLORS:
         tm = turn_maps[color]
         if not tm:
             continue
-        avg_deltas = [(t, float(np.mean(ds))) for t, ds in tm.items()]
+        avg_deltas = [(m, float(np.mean(ds))) for m, ds in tm.items()]
         threshold = sorted(d for _, d in avg_deltas)[
             int(len(avg_deltas) * quantile)
         ]
-        moves = [t for t, d in avg_deltas if d <= threshold]
-        turns = sum(
-            [[2 * t + displacement, 2 * t + 1 + displacement] for t in moves],
-            [],
-        )
-        worst.extend(turns)
+        worst_moves = [m for m, d in avg_deltas if d <= threshold]
+        for m in worst_moves:
+            before, after = move_to_turn_pair(color, m)
+            worst.append(before)
+            worst.append(after)
 
     return worst
 
 
 def _expand_window(
-    worst_turns: List[int], all_turns: Set[int], window_size: int,
-) -> Set[int]:
-    """Expand each worst turn into a window of neighbouring turns."""
-    expanded: Set[int] = set()
+    worst_turns: list[TurnIndex],
+    all_turns: set[TurnIndex],
+    window_size: int,
+) -> set[TurnIndex]:
+    """Expand each worst turn into a window of neighbouring turns.
+
+    Operates purely in turn-space; per-color displacement is the
+    seam's concern, not the window's. v1.0.23 replaces the symmetric
+    turn-space expansion with a same-color move-space window per
+    docs/roadmap-adaptive-type-branding.md's sibling design note.
+    """
+    expanded: set[TurnIndex] = set()
     half = window_size // 2
     for t in worst_turns:
         for offset in range(-half, half + 1):
-            c = t + offset
+            c = TurnIndex(int(t) + offset)
             if c in all_turns:
                 expanded.add(c)
     return expanded
 
 
 def _build_deeper_query(
-    orig: KataGoQuery, turns: List[int], extra_visits: int,
+    orig: KataGoQuery, turns: list[TurnIndex], extra_visits: int,
 ) -> KataGoQuery:
     """Build a deeper-analysis query derived from the original.
 
@@ -174,9 +197,17 @@ def _build_deeper_query(
     new_opaque.pop("cache", None)
     new_opaque.pop("lookup_cache", None)
     new_opaque.pop("replay_final_only", None)
+    # NOTE (ADR-0002 Rule 2): KataGoQuery.analyze_turns is declared
+    # Optional[list[int]] at the wire-types level. Adaptive's internal
+    # surface threads list[TurnIndex] (runtime-equal to list[int]; the
+    # brand is a typecheck-only distinction). The wider migration that
+    # would narrow the wire-types field is deferred per
+    # docs/roadmap-adaptive-type-branding.md §7.2; the cast is the one
+    # documented seam between the branded internal world and the
+    # un-branded wire-types declaration.
     return KataGoQuery(
         action=KataGoAction.ANALYZE,
-        analyze_turns=turns,
+        analyze_turns=cast(list[int], turns),
         opaque=new_opaque,
     )
 
@@ -261,7 +292,7 @@ def adaptive_reevaluate(
             return
 
         # Stage 2: decide on adaptation.
-        all_turns: Set[int] = {f.turn_number for f in finals}
+        all_turns: set[TurnIndex] = {TurnIndex(f.turn_number) for f in finals}
         worst = _find_worst_turns(finals, q_quantile)
         deepen = _expand_window(worst, all_turns, window_size)
 
@@ -288,7 +319,7 @@ def adaptive_reevaluate(
         # via the spawn sub-query (Stage 4), relabelled onto the
         # parent's orig_id by the orchestration framework.
         for f in finals:
-            if f.turn_number not in deepen:
+            if TurnIndex(f.turn_number) not in deepen:
                 yield f
 
         # Stage 4: spawn the deeper analysis; yield its responses.
