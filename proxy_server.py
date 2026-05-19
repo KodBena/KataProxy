@@ -352,6 +352,7 @@ class ClientSession:
         caps = SessionCapabilities(
             submit_query=self._handle_query,
             terminate_query=self._terminate_query,
+            send_response=self._send_response,
             proxy_log=self._log,
         )
         self._middleware.on_session_start(caps)
@@ -894,6 +895,76 @@ class ClientSession:
             self._log.exception(
                 Event.DIAGNOSTIC,
                 msg=f"peer={self._peer} middleware error in deliver_upstream",
+            )
+
+    async def _send_response(
+        self, orig_id: ClientId, response: KataGoResponse,
+    ) -> None:
+        """Push-based output channel: inject a middleware-produced
+        response onto this session's WebSocket.
+
+        Wired into SessionCapabilities.send_response. Called by
+        middleware that produces output decoupled from incoming wire
+        arrivals — typically the orchestration framework's driver task,
+        whose trailing yields would otherwise be stranded by
+        handle_response's drain heuristic. See
+        proxy/docs/roadmap-orchestration-output-channel.md for the
+        full rationale.
+
+        Bypasses:
+          - the transformer chain (the response data was already
+            processed upstream of the middleware producing it),
+          - the inner middleware chain (the middleware producing this
+            response is the one driving the call; routing through
+            handle_response would either recurse or require tagged-
+            bypass logic),
+          - any outer middleware (KeepAliveMiddleware does not need
+            to observe synthetic emissions; activity on the parent
+            orig_id has already been observed via its KataGo
+            originals).
+
+        Logs lifecycle.forward at the appropriate kind-driven level.
+        The parent_cid for the log emission is sourced from the
+        session's _active_queries entry if present (the parent is
+        still active); falls back to orig_id when the entry is gone
+        (the parent has reached natural completion and the
+        orchestration's trailing emissions follow afterwards).
+
+        ConnectionClosed during the WebSocket send is non-fatal —
+        synthetic emissions in the trailing window after the parent's
+        completion may race with the SPA's disconnect; log and
+        continue rather than abort the orchestration's cleanup path.
+        """
+        out_wire = translate_response_to_wire(response, orig_id)
+        out_json = json.dumps(out_wire)
+
+        parent_active = self._active_queries.get(orig_id)
+        parent_cid = parent_active[1] if parent_active is not None else orig_id
+
+        self._log.debug(
+            Event.DIAGNOSTIC,
+            cid=parent_cid, orig=orig_id,
+            msg=(
+                f"peer={self._peer} "
+                f"sending synthetic orig_id={orig_id!r} "
+                f"out={json.dumps(filter_dict(out_wire))}"
+            ),
+        )
+        lifecycle.forward(
+            self._log,
+            cid=parent_cid, orig=orig_id,
+            kind=_classify_response_kind(response),
+        )
+        try:
+            await self._ws.send(out_json)
+        except ConnectionClosed:
+            self._log.info(
+                Event.DIAGNOSTIC,
+                cid=parent_cid, orig=orig_id,
+                msg=(
+                    f"peer={self._peer} ws closed during synthetic send "
+                    f"orig_id={orig_id!r}; emission dropped"
+                ),
             )
 
     # -----------------------------------------------------------------------
