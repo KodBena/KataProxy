@@ -793,3 +793,177 @@ class TestDecorator:
         m1 = coro()
         m2 = coro()
         assert m1 is not m2
+
+
+# ===========================================================================
+# Output channel: trailing-yield delivery contract
+# ===========================================================================
+#
+# Regression tests for the omitted-finals bug surfaced 2026-05-19 against
+# adaptive_reevaluate's Stage 3 finalization. The bug is in the framework's
+# output-channel mechanism: `handle_response` drains `ctx._output_queue`
+# after a single `asyncio.sleep(0)`, which only yields one event-loop
+# iteration. When the driver task is woken from the input queue directly
+# (the `ctx.spawn`-iterated-directly path), it runs in iteration N alongside
+# `handle_response_task`, and its yields land in the queue before the drain
+# runs. When intermediate tasks sit between the input queue and the driver
+# (the `ctx.parallel` collect-tasks path; the analogous pump-task pattern
+# in `adaptive_reevaluate.py::_stream_parallel_spawns`), the driver's
+# wake-up is deferred to iteration N+1, by which time `handle_response`
+# has already returned. A coroutine that emits a final response AFTER such
+# an intermediate-task primitive completes has its yield stranded in
+# `_output_queue` until the context is GC'd.
+#
+# Test A is the control: direct `ctx.spawn` iteration; the trailing yield
+# reaches the wire. Test B is the regression: `ctx.parallel` with a trailing
+# yield; the yield is currently stranded. Together they isolate the bug to
+# the specific scheduling-asymmetry the design note at
+# `proxy/docs/roadmap-orchestration-output-channel.md` analyses.
+#
+# Test B is expected to FAIL against the current substrate (this commit
+# leaves it red as the regression artefact). It turns green in the
+# implementation arc that introduces the push-based output channel.
+
+
+@pytest.mark.asyncio
+class TestTrailingYieldAfterSpawnPrimitive:
+    """Trailing yields after a spawn primitive must reach the wire.
+
+    KataGo's analysis protocol mandates exactly one `is_during_search=False`
+    response per analyzed turn, even when a query is interrupted. The
+    adaptive_reevaluate Stage 3 finalization stage emits these AFTER the
+    Stage 2 deepening loop completes — i.e., after the last sub-query
+    response is processed. The orchestration framework must deliver such
+    trailing yields to the wire; this contract is what these tests
+    police.
+    """
+
+    async def test_trailing_yield_after_direct_spawn_reaches(self) -> None:
+        """Control: `async for r in ctx.spawn(sub): ...` then trailing yield.
+
+        Driver task is suspended directly on the sub-query's
+        `record.queue`; the test's push to `record.queue` wakes the
+        driver in the same event-loop iteration as `handle_response`'s
+        `await asyncio.sleep(0)`, so the driver produces both the
+        passed-through response AND the trailing canary yield before
+        `handle_response_task` runs the drain. Drain catches everything.
+        """
+        caps = _FakeSessionCapabilities()
+
+        @orchestration_middleware(name="direct_spawn_then_trailing")
+        async def trailing(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
+            sub = _make_analyze_query(analyze_turns=[0])
+            async for resp in ctx.spawn(sub):
+                yield resp
+            # Stage 3 analog: trailing emission after the spawn primitive
+            # completes. turn=99 is the canary (no real sub-query targets
+            # turn=99, so any yield with that turn number must come from
+            # this line).
+            yield _final_analyze(turn=99)
+
+        m = trailing()
+        m.on_session_start(caps.as_session_capabilities())
+        parent_orig = ClientId("p-direct")
+        m.on_query(parent_orig, _make_analyze_query(analyze_turns=[0]))
+
+        # Wait for the coroutine to reach the spawn primitive.
+        await _wait_for(lambda: bool(caps.submitted), timeout_s=0.5)
+        assert len(caps.submitted) == 1
+        sub_orig = caps.submitted[0][0]
+
+        # Deliver the sub-query's final. The coroutine's `async for` over
+        # `ctx.spawn(sub)` consumes it, yields it, then completes (the
+        # sub-query has expected_finals=1). The trailing `yield canary`
+        # runs in the same task wake-up as the spawn completion.
+        out = await _drive_response(m, sub_orig, _final_analyze(turn=0))
+
+        canary_yields = [
+            (oid, r) for oid, r in out
+            if isinstance(r, AnalyzeResponse) and r.turn_number == 99
+        ]
+        assert len(canary_yields) == 1, (
+            f"control: trailing canary (turn=99) expected in output. "
+            f"All yields: {out}"
+        )
+        # Cleanup.
+        m.on_session_end()
+
+    async def test_trailing_yield_after_parallel_reaches(self) -> None:
+        """Regression: `await ctx.parallel(a, b)` then trailing yield.
+
+        Currently FAILS. `ctx.parallel` wraps each sub-query in a
+        `collect` task via `asyncio.gather`; when a sub-query's response
+        arrives, the collect task wakes (not the driver task). The
+        driver only wakes when gather aggregates all completions, which
+        is deferred to iteration N+1 by `call_soon` scheduling. The
+        drain in `handle_response`'s iteration N runs before iteration
+        N+1's driver work, so the trailing canary lands in
+        `_output_queue` after `handle_response` has returned — stranded
+        with no future drain.
+
+        This test pins the bug. The fix in the orchestration
+        output-channel arc turns it green.
+        """
+        caps = _FakeSessionCapabilities()
+
+        @orchestration_middleware(name="parallel_then_trailing")
+        async def trailing(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
+            sub_a = _make_analyze_query(analyze_turns=[0])
+            sub_b = _make_analyze_query(analyze_turns=[1])
+            results = await ctx.parallel(sub_a, sub_b)
+            # We deliberately do NOT yield the results — the test is
+            # about whether the trailing canary reaches the wire,
+            # independently of how the sub-query responses themselves
+            # are routed. The canary's turn_number=99 is the
+            # discriminator.
+            _ = results
+            yield _final_analyze(turn=99)
+
+        m = trailing()
+        m.on_session_start(caps.as_session_capabilities())
+        parent_orig = ClientId("p-parallel")
+        m.on_query(parent_orig, _make_analyze_query(analyze_turns=[0]))
+
+        # Wait for both sub-queries to be submitted.
+        await _wait_for(lambda: len(caps.submitted) == 2, timeout_s=0.5)
+        sub_a_orig, sub_b_orig = caps.submitted[0][0], caps.submitted[1][0]
+
+        # Deliver each sub-query's final. The first one wakes its
+        # collect task but not the driver (gather is still waiting on
+        # the second). The second completion triggers gather's
+        # aggregation, which schedules the driver for the NEXT
+        # iteration — by which time `handle_response_b`'s drain has
+        # already returned.
+        out_a = await _drive_response(
+            m, sub_a_orig, _final_analyze(turn=0),
+        )
+        out_b = await _drive_response(
+            m, sub_b_orig, _final_analyze(turn=1),
+        )
+        all_yields = out_a + out_b
+
+        # Give the driver a chance to run its trailing yield, in case
+        # event-loop scheduling lands the driver's wake-up before any
+        # subsequent `handle_response`. (Without this, a test that
+        # passes only on certain event-loop implementations would be a
+        # flake. With it, a test that fails reliably pins the bug.)
+        await asyncio.sleep(0.05)
+
+        # The bug: any trailing yield produced after the gather
+        # aggregation has been stranded in `_output_queue` and never
+        # reached the test's collection.
+        canary_yields = [
+            (oid, r) for oid, r in all_yields
+            if isinstance(r, AnalyzeResponse) and r.turn_number == 99
+        ]
+        assert len(canary_yields) == 1, (
+            f"regression: trailing canary (turn=99) expected in output "
+            f"but was stranded. yields_a={out_a}, yields_b={out_b}. "
+            f"This is the omitted-finals bug; see design note at "
+            f"docs/roadmap-orchestration-output-channel.md."
+        )
+        m.on_session_end()
