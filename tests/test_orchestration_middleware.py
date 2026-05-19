@@ -101,18 +101,21 @@ def _partial_analyze(turn: int = 0) -> AnalyzeResponse:
 
 
 class _FakeSessionCapabilities:
-    """Records submit_query / terminate_query calls; lets tests drive
-    sub-query response delivery via the orchestration middleware's
-    handle_response path.
+    """Records submit_query / terminate_query / send_response calls; lets
+    tests drive sub-query response delivery via the orchestration
+    middleware's handle_response path and harvest output from the
+    push-based send_response channel.
 
     Mirrors the real SessionCapabilities surface but does not actually
-    submit anything to a router — tests inject responses directly via
-    the middleware's handle_response method below.
+    submit anything to a router or write to a WebSocket — tests inject
+    responses directly via the middleware's handle_response method
+    below, and harvest orchestration emissions from synthetic_sends.
     """
 
     def __init__(self) -> None:
         self.submitted: List[Tuple[ClientId, KataGoQuery]] = []
         self.terminated: List[ClientId] = []
+        self.synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
     async def submit_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         self.submitted.append((orig_id, query))
@@ -120,10 +123,16 @@ class _FakeSessionCapabilities:
     async def terminate_query(self, orig_id: ClientId) -> None:
         self.terminated.append(orig_id)
 
+    async def send_response(
+        self, orig_id: ClientId, response: KataGoResponse,
+    ) -> None:
+        self.synthetic_sends.append((orig_id, response))
+
     def as_session_capabilities(self) -> SessionCapabilities:
         return SessionCapabilities(
             submit_query=self.submit_query,
             terminate_query=self.terminate_query,
+            send_response=self.send_response,
         )
 
 
@@ -132,14 +141,47 @@ async def _drive_response(
     orig_id: ClientId,
     response: KataGoResponse,
 ) -> List[Tuple[ClientId, KataGoResponse]]:
-    """Helper: invoke handle_response and collect its yields into a list."""
+    """Helper: invoke handle_response, then collect both its direct
+    yields AND any synthetic sends the orchestration coroutine pushed
+    via caps.send_response during this invocation's processing.
+
+    The orchestration coroutine runs in a separate asyncio task; its
+    emissions reach caps.send_response asynchronously. A brief
+    settling sleep lets the driver task process whatever the
+    handle_response push set in motion before we snapshot the
+    synthetic-sends slice. Tests asserting on the ORDER of yields vs
+    synthetic sends should not rely on this helper — it merges the
+    two streams in a convenient but not order-preserving way.
+    """
     out: List[Tuple[ClientId, KataGoResponse]] = []
     assert middleware._caps is not None
+    caps = _caps_owning_test_fake(middleware._caps)
+    pre_count = len(caps.synthetic_sends) if caps is not None else 0
     async for oid, resp in middleware.handle_response(
         orig_id, response, middleware._caps.submit_query
     ):
         out.append((oid, resp))
+    # Let the driver task run to settle any push-based emissions
+    # triggered by the input we just routed.
+    await asyncio.sleep(0.01)
+    if caps is not None:
+        out.extend(caps.synthetic_sends[pre_count:])
     return out
+
+
+def _caps_owning_test_fake(
+    sc: SessionCapabilities,
+) -> Optional["_FakeSessionCapabilities"]:
+    """If the SessionCapabilities was built by a _FakeSessionCapabilities,
+    return that fake; otherwise return None. Used by _drive_response to
+    locate the synthetic-sends sink without changing the production
+    SessionCapabilities API.
+    """
+    sr = sc.send_response
+    fake = getattr(sr, "__self__", None)
+    if isinstance(fake, _FakeSessionCapabilities):
+        return fake
+    return None
 
 
 async def _wait_for(
@@ -642,29 +684,48 @@ class TestCompositionWithCapabilityGate:
         # that mimics deliver_upstream's middleware.handle_response
         # call). The gate must delegate to wrapped so the wrapped's
         # _sub_to_parent lookup re-routes the response under the
-        # parent's orig_id.
+        # parent's orig_id — and the orchestration coroutine's yield
+        # then reaches the WebSocket via caps.send_response.
+        #
+        # Post-output-channel-arc: the relabeled response no longer
+        # appears in handle_response's yields (those are for
+        # non-orchestrated pass-through only); it lands in
+        # caps.synthetic_sends via the push-based output channel.
         sub_response = _final_analyze(turn=0)
-        out: List[Tuple[ClientId, KataGoResponse]] = []
+        gate_yields: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in gated.handle_response(
             sub_orig_id, sub_response, caps.submit_query
         ):
-            out.append((oid, resp))
+            gate_yields.append((oid, resp))
+        # Let the orchestration coroutine's driver task settle.
+        await asyncio.sleep(0.01)
 
-        # Critical: the response must be relabeled to "p1" (the
-        # parent's orig_id). The pre-fix bug had this output carrying
-        # the synthetic sub_orig_id, which the SPA's subscriber map
-        # would silently drop.
-        assert any(oid == ClientId("p1") for oid, _ in out), (
-            f"sub-query response did not reach the orchestration's "
-            f"auto-relabel; out={[(oid, type(r).__name__) for oid, r in out]}. "
+        # handle_response yields nothing for orchestrated orig_ids:
+        # routing-only contract.
+        assert gate_yields == [], (
+            f"handle_response should yield nothing for an orchestrated "
+            f"sub-query orig_id under the push-based output channel. "
+            f"got: {[(o, type(r).__name__) for o, r in gate_yields]}"
+        )
+        # Critical: the response reaches caps.synthetic_sends relabeled
+        # to "p1" (the parent's orig_id). The pre-fix bug had this
+        # response either stranded in an output queue or carrying the
+        # synthetic sub_orig_id.
+        assert any(oid == ClientId("p1") for oid, _ in caps.synthetic_sends), (
+            f"sub-query response did not reach caps.send_response "
+            f"under the parent's orig_id; "
+            f"synthetic_sends={[(o, type(r).__name__) for o, r in caps.synthetic_sends]}. "
             f"Regression: CapabilityGatedMiddleware short-circuited "
             f"the response without delegating to the wrapped "
-            f"OrchestrationMiddleware."
+            f"OrchestrationMiddleware, or the orchestration substrate "
+            f"failed to push via caps.send_response."
         )
-        # Symmetric: the synthetic id must NOT leak through to the
-        # gate's output (wire-side leakage causes the SPA-side drop).
-        assert not any(oid == sub_orig_id for oid, _ in out), (
-            f"synthetic sub_orig_id leaked through to gate output; "
+        # Symmetric: the synthetic id must NOT leak through to
+        # synthetic_sends either.
+        assert not any(
+            oid == sub_orig_id for oid, _ in caps.synthetic_sends
+        ), (
+            f"synthetic sub_orig_id leaked into caps.send_response; "
             f"the SPA's subscriber map is keyed by parent orig_id, "
             f"so this would cause silent response drops on the wire"
         )

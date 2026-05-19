@@ -58,6 +58,7 @@ def _make_caps() -> Tuple[Any, SessionCapabilities]:
     class _Caps:
         submitted: List[Tuple[ClientId, KataGoQuery]] = []
         terminated: List[ClientId] = []
+        synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
         async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
             self.submitted.append((oid, q))
@@ -65,11 +66,17 @@ def _make_caps() -> Tuple[Any, SessionCapabilities]:
         async def terminate(self, oid: ClientId) -> None:
             self.terminated.append(oid)
 
+        async def send(self, oid: ClientId, r: KataGoResponse) -> None:
+            self.synthetic_sends.append((oid, r))
+
     c = _Caps()
     c.submitted = []
     c.terminated = []
+    c.synthetic_sends = []
     return c, SessionCapabilities(
-        submit_query=c.submit, terminate_query=c.terminate,
+        submit_query=c.submit,
+        terminate_query=c.terminate,
+        send_response=c.send,
     )
 
 
@@ -88,25 +95,24 @@ async def _drive_and_collect_error(
 
     Asserts that exactly one error envelope appears (the refusal
     surface should produce a single structured error, not multiple).
+
+    Under the push-based output channel, the framework's error
+    envelope is pushed via caps.send_response, not via handle_response
+    yields. Harvested from the fake caps' synthetic_sends.
     """
     import asyncio
     m.on_query(oid, q)
     # Drive any response to tick the event loop so the coroutine's
     # _engage_phase3 raise propagates through _drive_coroutine.
+    sc = getattr(m, "_caps", None)
+    fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
     out: List[Tuple[ClientId, KataGoResponse]] = []
     async for o, r in m.handle_response(oid, _dummy_final(), None):
         out.append((o, r))
-    # Settle any remaining yields.
+    # Settle and harvest synthetic sends.
     await asyncio.sleep(0.02)
-    ctx = m._contexts.get(oid)
-    if ctx is not None:
-        while True:
-            try:
-                item = ctx._output_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(item, tuple):
-                out.append(item)
+    if fake is not None:
+        out.extend(fake.synthetic_sends)
     errors = [
         r for _, r in out
         if isinstance(r, MetadataResponse)

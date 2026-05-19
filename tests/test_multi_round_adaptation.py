@@ -648,6 +648,7 @@ class TestMultiRoundCoroutine:
         class _Caps:
             submitted: List[Tuple[ClientId, KataGoQuery]] = []
             terminated: List[ClientId] = []
+            synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
             async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
                 self.submitted.append((oid, q))
@@ -655,20 +656,36 @@ class TestMultiRoundCoroutine:
             async def terminate(self, oid: ClientId) -> None:
                 self.terminated.append(oid)
 
+            async def send(self, oid: ClientId, r: KataGoResponse) -> None:
+                self.synthetic_sends.append((oid, r))
+
         c = _Caps()
         c.submitted = []
         c.terminated = []
+        c.synthetic_sends = []
         return c, SessionCapabilities(
-            submit_query=c.submit, terminate_query=c.terminate,
+            submit_query=c.submit,
+            terminate_query=c.terminate,
+            send_response=c.send,
         )
 
     @staticmethod
     async def _drive_response(
         m: Any, orig_id: ClientId, response: KataGoResponse,
     ) -> List[Tuple[ClientId, KataGoResponse]]:
+        """Drive handle_response and harvest orchestration emissions
+        for the orig_id from caps.send_response (the push-based output
+        channel)."""
+        import asyncio
+        sc = getattr(m, "_caps", None)
+        fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
+        pre = len(fake.synthetic_sends) if fake is not None else 0
         out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in m.handle_response(orig_id, response, None):
             out.append((oid, resp))
+        if fake is not None:
+            await asyncio.sleep(0.01)
+            out.extend(fake.synthetic_sends[pre:])
         return out
 
     @staticmethod

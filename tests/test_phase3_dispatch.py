@@ -28,6 +28,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -104,6 +105,7 @@ def _make_caps() -> Tuple[Any, SessionCapabilities]:
     class _Caps:
         submitted: List[Tuple[ClientId, KataGoQuery]] = []
         terminated: List[ClientId] = []
+        synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
         async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
             self.submitted.append((oid, q))
@@ -111,15 +113,45 @@ def _make_caps() -> Tuple[Any, SessionCapabilities]:
         async def terminate(self, oid: ClientId) -> None:
             self.terminated.append(oid)
 
+        async def send(self, oid: ClientId, r: KataGoResponse) -> None:
+            self.synthetic_sends.append((oid, r))
+
     c = _Caps()
     c.submitted = []
     c.terminated = []
+    c.synthetic_sends = []
     return c, SessionCapabilities(
-        submit_query=c.submit, terminate_query=c.terminate,
+        submit_query=c.submit,
+        terminate_query=c.terminate,
+        send_response=c.send,
     )
 
 
+def _fake_from_middleware(m: Any) -> Any:
+    """Recover the test _Caps fake object from the middleware's
+    SessionCapabilities. Returns None if the middleware isn't wired or
+    if its send_response isn't a bound method of a _Caps-shaped object.
+
+    Allows _drive / _settle_and_drain to harvest from the push-based
+    output channel without each call site threading the fake through.
+    """
+    sc = getattr(m, "_caps", None)
+    if sc is None:
+        return None
+    sr = getattr(sc, "send_response", None)
+    return getattr(sr, "__self__", None) if sr is not None else None
+
+
 async def _drive(m: Any, oid: ClientId, resp: KataGoResponse) -> List[Tuple[ClientId, KataGoResponse]]:
+    """Invoke handle_response and collect its direct yields.
+
+    Under the push-based output channel, handle_response yields nothing
+    for orchestration-managed orig_ids (the orchestration coroutine's
+    output flows via caps.send_response). Pass-through orig_ids (those
+    the orchestration substrate doesn't manage) still yield through.
+    Tests that need the orchestration's emissions harvest from
+    caps.synthetic_sends or via _settle_and_drain.
+    """
     out: List[Tuple[ClientId, KataGoResponse]] = []
     async for o, r in m.handle_response(oid, resp, None):
         out.append((o, r))
@@ -127,7 +159,6 @@ async def _drive(m: Any, oid: ClientId, resp: KataGoResponse) -> List[Tuple[Clie
 
 
 async def _wait_for_spawn_count(caps: Any, n: int, timeout_s: float = 1.0) -> bool:
-    import asyncio
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
         if len(caps.submitted) >= n:
@@ -139,68 +170,56 @@ async def _wait_for_spawn_count(caps: Any, n: int, timeout_s: float = 1.0) -> bo
 async def _settle_and_drain(
     m: Any, orig_id: ClientId, max_wait_s: float = 0.5,
 ) -> List[Tuple[ClientId, KataGoResponse]]:
-    """Wait for the orchestration coroutine to finish and drain any
-    pending output. Use after the last input drive when the test
-    expects post-loop emissions (e.g., Stage-3 finalisation) — the
-    parallel-spawn dispatch needs more event-loop ticks than a
-    single-spawn dispatch to settle, and `handle_response`'s drain
-    loop is single-tick non-blocking by design."""
-    import asyncio
-    out: List[Tuple[ClientId, KataGoResponse]] = []
-    ctx = m._contexts.get(orig_id)
-    if ctx is None:
-        return out
+    """Wait for the orchestration coroutine to finish, then return ALL
+    push-based emissions for the given orig_id over the test's lifetime.
+
+    The orchestration coroutine pushes via caps.send_response; this
+    helper waits until the driver task completes or timeout, then
+    returns every (orig_id, response) tuple in caps.synthetic_sends
+    that matches the requested orig_id. Tests typically call this
+    once at the end of a drive sequence and inspect the full set of
+    emissions there.
+    """
+    fake = _fake_from_middleware(m)
+    if fake is None:
+        return []
     task = m._tasks.get(orig_id)
     deadline = asyncio.get_event_loop().time() + max_wait_s
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.005)
-        while True:
-            try:
-                item = ctx._output_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(item, tuple):
-                out.append(item)
         if task is not None and task.done():
-            # One final drain after task completion for any items
-            # queued by the finalization stage.
             await asyncio.sleep(0)
-            while True:
-                try:
-                    item = ctx._output_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if isinstance(item, tuple):
-                    out.append(item)
             break
-    return out
+    return [(o, r) for o, r in fake.synthetic_sends if o == orig_id]
 
 
 async def _wait_for_coroutine_error(
     m: Any, orig_id: ClientId, timeout_s: float = 0.5,
 ) -> Any:
-    """Drive a dummy response to surface the coroutine's startup
-    exception. Phase 3's `_engage_phase3` raises before Stage 1
-    consumes anything; the orchestration framework catches and emits
-    a MetadataResponse error on the wire. Returns the first
-    MetadataResponse with an `error` opaque field, or None on
-    timeout."""
+    """Wait for the orchestration framework to emit an error response
+    via caps.send_response. Phase 3's `_engage_phase3` raises before
+    Stage 1 consumes anything; the framework catches and pushes a
+    MetadataResponse error via the push-based output channel. Returns
+    the first MetadataResponse with an `error` opaque field, or None
+    on timeout.
+    """
     import asyncio
-    # The dummy response — its content doesn't matter; we just need to
-    # tick the event loop so the framework's error-response shows up
-    # in the output stream.
+    fake = _fake_from_middleware(m)
+    if fake is None:
+        return None
+    # Drive a dummy response to tick the framework into action; the
+    # actual error emission comes via caps.send_response.
     dummy = _neutral_final(0)
-    async for _o, r in m.handle_response(orig_id, dummy, None):
-        if isinstance(r, type(_neutral_final(0))):
-            continue  # any AnalyzeResponse — not an error
-        # MetadataResponse with `error` opaque is the framework's
-        # error envelope.
-        opaque = getattr(r, "opaque", None)
-        if isinstance(opaque, dict) and "error" in opaque:
-            return r
-    # Sometimes the error is queued before the dummy is pulled; one
-    # more sleep + drain via a second dummy attempts to surface it.
-    await asyncio.sleep(0)
+    pre = len(fake.synthetic_sends)
+    async for _o, _r in m.handle_response(orig_id, dummy, None):
+        pass
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        for _oid, r in fake.synthetic_sends[pre:]:
+            opaque = getattr(r, "opaque", None)
+            if isinstance(opaque, dict) and "error" in opaque:
+                return r
+        await asyncio.sleep(0.01)
     return None
 
 
