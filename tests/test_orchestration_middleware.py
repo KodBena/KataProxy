@@ -101,18 +101,21 @@ def _partial_analyze(turn: int = 0) -> AnalyzeResponse:
 
 
 class _FakeSessionCapabilities:
-    """Records submit_query / terminate_query calls; lets tests drive
-    sub-query response delivery via the orchestration middleware's
-    handle_response path.
+    """Records submit_query / terminate_query / send_response calls; lets
+    tests drive sub-query response delivery via the orchestration
+    middleware's handle_response path and harvest output from the
+    push-based send_response channel.
 
     Mirrors the real SessionCapabilities surface but does not actually
-    submit anything to a router — tests inject responses directly via
-    the middleware's handle_response method below.
+    submit anything to a router or write to a WebSocket — tests inject
+    responses directly via the middleware's handle_response method
+    below, and harvest orchestration emissions from synthetic_sends.
     """
 
     def __init__(self) -> None:
         self.submitted: List[Tuple[ClientId, KataGoQuery]] = []
         self.terminated: List[ClientId] = []
+        self.synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
     async def submit_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         self.submitted.append((orig_id, query))
@@ -120,10 +123,16 @@ class _FakeSessionCapabilities:
     async def terminate_query(self, orig_id: ClientId) -> None:
         self.terminated.append(orig_id)
 
+    async def send_response(
+        self, orig_id: ClientId, response: KataGoResponse,
+    ) -> None:
+        self.synthetic_sends.append((orig_id, response))
+
     def as_session_capabilities(self) -> SessionCapabilities:
         return SessionCapabilities(
             submit_query=self.submit_query,
             terminate_query=self.terminate_query,
+            send_response=self.send_response,
         )
 
 
@@ -132,14 +141,47 @@ async def _drive_response(
     orig_id: ClientId,
     response: KataGoResponse,
 ) -> List[Tuple[ClientId, KataGoResponse]]:
-    """Helper: invoke handle_response and collect its yields into a list."""
+    """Helper: invoke handle_response, then collect both its direct
+    yields AND any synthetic sends the orchestration coroutine pushed
+    via caps.send_response during this invocation's processing.
+
+    The orchestration coroutine runs in a separate asyncio task; its
+    emissions reach caps.send_response asynchronously. A brief
+    settling sleep lets the driver task process whatever the
+    handle_response push set in motion before we snapshot the
+    synthetic-sends slice. Tests asserting on the ORDER of yields vs
+    synthetic sends should not rely on this helper — it merges the
+    two streams in a convenient but not order-preserving way.
+    """
     out: List[Tuple[ClientId, KataGoResponse]] = []
     assert middleware._caps is not None
+    caps = _caps_owning_test_fake(middleware._caps)
+    pre_count = len(caps.synthetic_sends) if caps is not None else 0
     async for oid, resp in middleware.handle_response(
         orig_id, response, middleware._caps.submit_query
     ):
         out.append((oid, resp))
+    # Let the driver task run to settle any push-based emissions
+    # triggered by the input we just routed.
+    await asyncio.sleep(0.01)
+    if caps is not None:
+        out.extend(caps.synthetic_sends[pre_count:])
     return out
+
+
+def _caps_owning_test_fake(
+    sc: SessionCapabilities,
+) -> Optional["_FakeSessionCapabilities"]:
+    """If the SessionCapabilities was built by a _FakeSessionCapabilities,
+    return that fake; otherwise return None. Used by _drive_response to
+    locate the synthetic-sends sink without changing the production
+    SessionCapabilities API.
+    """
+    sr = sc.send_response
+    fake = getattr(sr, "__self__", None)
+    if isinstance(fake, _FakeSessionCapabilities):
+        return fake
+    return None
 
 
 async def _wait_for(
@@ -642,29 +684,48 @@ class TestCompositionWithCapabilityGate:
         # that mimics deliver_upstream's middleware.handle_response
         # call). The gate must delegate to wrapped so the wrapped's
         # _sub_to_parent lookup re-routes the response under the
-        # parent's orig_id.
+        # parent's orig_id — and the orchestration coroutine's yield
+        # then reaches the WebSocket via caps.send_response.
+        #
+        # Post-output-channel-arc: the relabeled response no longer
+        # appears in handle_response's yields (those are for
+        # non-orchestrated pass-through only); it lands in
+        # caps.synthetic_sends via the push-based output channel.
         sub_response = _final_analyze(turn=0)
-        out: List[Tuple[ClientId, KataGoResponse]] = []
+        gate_yields: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in gated.handle_response(
             sub_orig_id, sub_response, caps.submit_query
         ):
-            out.append((oid, resp))
+            gate_yields.append((oid, resp))
+        # Let the orchestration coroutine's driver task settle.
+        await asyncio.sleep(0.01)
 
-        # Critical: the response must be relabeled to "p1" (the
-        # parent's orig_id). The pre-fix bug had this output carrying
-        # the synthetic sub_orig_id, which the SPA's subscriber map
-        # would silently drop.
-        assert any(oid == ClientId("p1") for oid, _ in out), (
-            f"sub-query response did not reach the orchestration's "
-            f"auto-relabel; out={[(oid, type(r).__name__) for oid, r in out]}. "
+        # handle_response yields nothing for orchestrated orig_ids:
+        # routing-only contract.
+        assert gate_yields == [], (
+            f"handle_response should yield nothing for an orchestrated "
+            f"sub-query orig_id under the push-based output channel. "
+            f"got: {[(o, type(r).__name__) for o, r in gate_yields]}"
+        )
+        # Critical: the response reaches caps.synthetic_sends relabeled
+        # to "p1" (the parent's orig_id). The pre-fix bug had this
+        # response either stranded in an output queue or carrying the
+        # synthetic sub_orig_id.
+        assert any(oid == ClientId("p1") for oid, _ in caps.synthetic_sends), (
+            f"sub-query response did not reach caps.send_response "
+            f"under the parent's orig_id; "
+            f"synthetic_sends={[(o, type(r).__name__) for o, r in caps.synthetic_sends]}. "
             f"Regression: CapabilityGatedMiddleware short-circuited "
             f"the response without delegating to the wrapped "
-            f"OrchestrationMiddleware."
+            f"OrchestrationMiddleware, or the orchestration substrate "
+            f"failed to push via caps.send_response."
         )
-        # Symmetric: the synthetic id must NOT leak through to the
-        # gate's output (wire-side leakage causes the SPA-side drop).
-        assert not any(oid == sub_orig_id for oid, _ in out), (
-            f"synthetic sub_orig_id leaked through to gate output; "
+        # Symmetric: the synthetic id must NOT leak through to
+        # synthetic_sends either.
+        assert not any(
+            oid == sub_orig_id for oid, _ in caps.synthetic_sends
+        ), (
+            f"synthetic sub_orig_id leaked into caps.send_response; "
             f"the SPA's subscriber map is keyed by parent orig_id, "
             f"so this would cause silent response drops on the wire"
         )
@@ -793,3 +854,177 @@ class TestDecorator:
         m1 = coro()
         m2 = coro()
         assert m1 is not m2
+
+
+# ===========================================================================
+# Output channel: trailing-yield delivery contract
+# ===========================================================================
+#
+# Regression tests for the omitted-finals bug surfaced 2026-05-19 against
+# adaptive_reevaluate's Stage 3 finalization. The bug is in the framework's
+# output-channel mechanism: `handle_response` drains `ctx._output_queue`
+# after a single `asyncio.sleep(0)`, which only yields one event-loop
+# iteration. When the driver task is woken from the input queue directly
+# (the `ctx.spawn`-iterated-directly path), it runs in iteration N alongside
+# `handle_response_task`, and its yields land in the queue before the drain
+# runs. When intermediate tasks sit between the input queue and the driver
+# (the `ctx.parallel` collect-tasks path; the analogous pump-task pattern
+# in `adaptive_reevaluate.py::_stream_parallel_spawns`), the driver's
+# wake-up is deferred to iteration N+1, by which time `handle_response`
+# has already returned. A coroutine that emits a final response AFTER such
+# an intermediate-task primitive completes has its yield stranded in
+# `_output_queue` until the context is GC'd.
+#
+# Test A is the control: direct `ctx.spawn` iteration; the trailing yield
+# reaches the wire. Test B is the regression: `ctx.parallel` with a trailing
+# yield; the yield is currently stranded. Together they isolate the bug to
+# the specific scheduling-asymmetry the design note at
+# `proxy/docs/roadmap-orchestration-output-channel.md` analyses.
+#
+# Test B is expected to FAIL against the current substrate (this commit
+# leaves it red as the regression artefact). It turns green in the
+# implementation arc that introduces the push-based output channel.
+
+
+@pytest.mark.asyncio
+class TestTrailingYieldAfterSpawnPrimitive:
+    """Trailing yields after a spawn primitive must reach the wire.
+
+    KataGo's analysis protocol mandates exactly one `is_during_search=False`
+    response per analyzed turn, even when a query is interrupted. The
+    adaptive_reevaluate Stage 3 finalization stage emits these AFTER the
+    Stage 2 deepening loop completes — i.e., after the last sub-query
+    response is processed. The orchestration framework must deliver such
+    trailing yields to the wire; this contract is what these tests
+    police.
+    """
+
+    async def test_trailing_yield_after_direct_spawn_reaches(self) -> None:
+        """Control: `async for r in ctx.spawn(sub): ...` then trailing yield.
+
+        Driver task is suspended directly on the sub-query's
+        `record.queue`; the test's push to `record.queue` wakes the
+        driver in the same event-loop iteration as `handle_response`'s
+        `await asyncio.sleep(0)`, so the driver produces both the
+        passed-through response AND the trailing canary yield before
+        `handle_response_task` runs the drain. Drain catches everything.
+        """
+        caps = _FakeSessionCapabilities()
+
+        @orchestration_middleware(name="direct_spawn_then_trailing")
+        async def trailing(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
+            sub = _make_analyze_query(analyze_turns=[0])
+            async for resp in ctx.spawn(sub):
+                yield resp
+            # Stage 3 analog: trailing emission after the spawn primitive
+            # completes. turn=99 is the canary (no real sub-query targets
+            # turn=99, so any yield with that turn number must come from
+            # this line).
+            yield _final_analyze(turn=99)
+
+        m = trailing()
+        m.on_session_start(caps.as_session_capabilities())
+        parent_orig = ClientId("p-direct")
+        m.on_query(parent_orig, _make_analyze_query(analyze_turns=[0]))
+
+        # Wait for the coroutine to reach the spawn primitive.
+        await _wait_for(lambda: bool(caps.submitted), timeout_s=0.5)
+        assert len(caps.submitted) == 1
+        sub_orig = caps.submitted[0][0]
+
+        # Deliver the sub-query's final. The coroutine's `async for` over
+        # `ctx.spawn(sub)` consumes it, yields it, then completes (the
+        # sub-query has expected_finals=1). The trailing `yield canary`
+        # runs in the same task wake-up as the spawn completion.
+        out = await _drive_response(m, sub_orig, _final_analyze(turn=0))
+
+        canary_yields = [
+            (oid, r) for oid, r in out
+            if isinstance(r, AnalyzeResponse) and r.turn_number == 99
+        ]
+        assert len(canary_yields) == 1, (
+            f"control: trailing canary (turn=99) expected in output. "
+            f"All yields: {out}"
+        )
+        # Cleanup.
+        m.on_session_end()
+
+    async def test_trailing_yield_after_parallel_reaches(self) -> None:
+        """Regression: `await ctx.parallel(a, b)` then trailing yield.
+
+        Currently FAILS. `ctx.parallel` wraps each sub-query in a
+        `collect` task via `asyncio.gather`; when a sub-query's response
+        arrives, the collect task wakes (not the driver task). The
+        driver only wakes when gather aggregates all completions, which
+        is deferred to iteration N+1 by `call_soon` scheduling. The
+        drain in `handle_response`'s iteration N runs before iteration
+        N+1's driver work, so the trailing canary lands in
+        `_output_queue` after `handle_response` has returned — stranded
+        with no future drain.
+
+        This test pins the bug. The fix in the orchestration
+        output-channel arc turns it green.
+        """
+        caps = _FakeSessionCapabilities()
+
+        @orchestration_middleware(name="parallel_then_trailing")
+        async def trailing(
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
+            sub_a = _make_analyze_query(analyze_turns=[0])
+            sub_b = _make_analyze_query(analyze_turns=[1])
+            results = await ctx.parallel(sub_a, sub_b)
+            # We deliberately do NOT yield the results — the test is
+            # about whether the trailing canary reaches the wire,
+            # independently of how the sub-query responses themselves
+            # are routed. The canary's turn_number=99 is the
+            # discriminator.
+            _ = results
+            yield _final_analyze(turn=99)
+
+        m = trailing()
+        m.on_session_start(caps.as_session_capabilities())
+        parent_orig = ClientId("p-parallel")
+        m.on_query(parent_orig, _make_analyze_query(analyze_turns=[0]))
+
+        # Wait for both sub-queries to be submitted.
+        await _wait_for(lambda: len(caps.submitted) == 2, timeout_s=0.5)
+        sub_a_orig, sub_b_orig = caps.submitted[0][0], caps.submitted[1][0]
+
+        # Deliver each sub-query's final. The first one wakes its
+        # collect task but not the driver (gather is still waiting on
+        # the second). The second completion triggers gather's
+        # aggregation, which schedules the driver for the NEXT
+        # iteration — by which time `handle_response_b`'s drain has
+        # already returned.
+        out_a = await _drive_response(
+            m, sub_a_orig, _final_analyze(turn=0),
+        )
+        out_b = await _drive_response(
+            m, sub_b_orig, _final_analyze(turn=1),
+        )
+        all_yields = out_a + out_b
+
+        # Give the driver a chance to run its trailing yield, in case
+        # event-loop scheduling lands the driver's wake-up before any
+        # subsequent `handle_response`. (Without this, a test that
+        # passes only on certain event-loop implementations would be a
+        # flake. With it, a test that fails reliably pins the bug.)
+        await asyncio.sleep(0.05)
+
+        # The bug: any trailing yield produced after the gather
+        # aggregation has been stranded in `_output_queue` and never
+        # reached the test's collection.
+        canary_yields = [
+            (oid, r) for oid, r in all_yields
+            if isinstance(r, AnalyzeResponse) and r.turn_number == 99
+        ]
+        assert len(canary_yields) == 1, (
+            f"regression: trailing canary (turn=99) expected in output "
+            f"but was stranded. yields_a={out_a}, yields_b={out_b}. "
+            f"This is the omitted-finals bug; see design note at "
+            f"docs/roadmap-orchestration-output-channel.md."
+        )
+        m.on_session_end()

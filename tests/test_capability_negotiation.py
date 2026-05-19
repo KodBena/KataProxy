@@ -512,10 +512,17 @@ class TestAdaptiveReevaluateMetadata:
 
     @staticmethod
     def _make_caps() -> Tuple[Any, SessionCapabilities]:
-        """Fake SessionCapabilities recording submit/terminate calls."""
+        """Fake SessionCapabilities recording submit/terminate/send calls.
+
+        Includes the push-based send_response channel per the
+        orchestration output-channel arc; orchestration emissions
+        land in synthetic_sends and tests harvest them via
+        _settle_synthetic_sends below.
+        """
         class _Caps:
             submitted: List[Tuple[ClientId, KataGoQuery]] = []
             terminated: List[ClientId] = []
+            synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
             async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
                 self.submitted.append((oid, q))
@@ -523,12 +530,18 @@ class TestAdaptiveReevaluateMetadata:
             async def terminate(self, oid: ClientId) -> None:
                 self.terminated.append(oid)
 
+            async def send(self, oid: ClientId, r: KataGoResponse) -> None:
+                self.synthetic_sends.append((oid, r))
+
         c = _Caps()
         c.submitted = []
         c.terminated = []
+        c.synthetic_sends = []
         from middleware.session_middleware import SessionCapabilities
         return c, SessionCapabilities(
-            submit_query=c.submit, terminate_query=c.terminate,
+            submit_query=c.submit,
+            terminate_query=c.terminate,
+            send_response=c.send,
         )
 
     @staticmethod
@@ -551,10 +564,25 @@ class TestAdaptiveReevaluateMetadata:
     async def _drive_response(
         m: Any, orig_id: ClientId, response: KataGoResponse,
     ) -> List[Tuple[ClientId, KataGoResponse]]:
-        """Drain handle_response yields into a list."""
+        """Drive handle_response and harvest orchestration emissions
+        for this orig_id from the push-based output channel.
+
+        handle_response yields nothing for orchestration-managed
+        orig_ids (the framework's emissions go via caps.send_response);
+        for pass-through orig_ids it still yields. The helper returns
+        the union, with a brief settle so the driver task's push has
+        a chance to land before we read.
+        """
+        import asyncio
+        sc = getattr(m, "_caps", None)
+        fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
+        pre = len(fake.synthetic_sends) if fake is not None else 0
         out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in m.handle_response(orig_id, response, None):
             out.append((oid, resp))
+        if fake is not None:
+            await asyncio.sleep(0.01)
+            out.extend(fake.synthetic_sends[pre:])
         return out
 
     @staticmethod
@@ -746,6 +774,7 @@ class TestAdaptiveStreamingPreviews:
         class _Caps:
             submitted: List[Tuple[ClientId, KataGoQuery]] = []
             terminated: List[ClientId] = []
+            synthetic_sends: List[Tuple[ClientId, KataGoResponse]] = []
 
             async def submit(self, oid: ClientId, q: KataGoQuery) -> None:
                 self.submitted.append((oid, q))
@@ -753,12 +782,18 @@ class TestAdaptiveStreamingPreviews:
             async def terminate(self, oid: ClientId) -> None:
                 self.terminated.append(oid)
 
+            async def send(self, oid: ClientId, r: KataGoResponse) -> None:
+                self.synthetic_sends.append((oid, r))
+
         c = _Caps()
         c.submitted = []
         c.terminated = []
+        c.synthetic_sends = []
         from middleware.session_middleware import SessionCapabilities
         return c, SessionCapabilities(
-            submit_query=c.submit, terminate_query=c.terminate,
+            submit_query=c.submit,
+            terminate_query=c.terminate,
+            send_response=c.send,
         )
 
     @staticmethod
@@ -791,9 +826,20 @@ class TestAdaptiveStreamingPreviews:
     async def _drive_response(
         m: Any, orig_id: ClientId, response: KataGoResponse,
     ) -> List[Tuple[ClientId, KataGoResponse]]:
+        """Drive handle_response and harvest orchestration emissions
+        for the orig_id from caps.send_response (the push-based output
+        channel introduced by the orchestration output-channel arc).
+        """
+        import asyncio
+        sc = getattr(m, "_caps", None)
+        fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
+        pre = len(fake.synthetic_sends) if fake is not None else 0
         out: List[Tuple[ClientId, KataGoResponse]] = []
         async for oid, resp in m.handle_response(orig_id, response, None):
             out.append((oid, resp))
+        if fake is not None:
+            await asyncio.sleep(0.01)
+            out.extend(fake.synthetic_sends[pre:])
         return out
 
     @staticmethod

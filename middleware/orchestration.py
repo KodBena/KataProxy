@@ -34,7 +34,7 @@ import asyncio
 import functools
 import logging
 import uuid
-from typing import Any, AsyncIterator, Callable, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Optional, Union
 
 import sproxy_config as cfg
 from AbstractProxy.proxy_core import ClientId
@@ -145,12 +145,11 @@ class OrchestrationContext:
         self._original_received = 0
         # Per-sub-query state. orig_id → _SubQueryRecord.
         self._sub_queries: dict[ClientId, _SubQueryRecord] = {}
-        # Output stream from the coroutine. The driver puts
-        # (parent_id, KataGoResponse) tuples here; handle_response
-        # drains it.
-        self._output_queue: asyncio.Queue[
-            Union[Tuple[ClientId, KataGoResponse], _Sentinel]
-        ] = asyncio.Queue()
+        # NOTE: output delivery is push-based via SessionCapabilities.
+        # send_response (see proxy/docs/roadmap-orchestration-output-
+        # channel.md). The driver task in _drive_coroutine calls
+        # caps.send_response for each yield from the coroutine; there
+        # is no per-context output queue and no drain race.
 
     # ---------------- Static helpers ----------------
 
@@ -468,14 +467,32 @@ class OrchestrationMiddleware(SessionMiddleware):
             if old_task is not None and not old_task.done():
                 old_task.cancel()
             self._contexts.pop(orig_id, None)
+        # v1.0.26 (Phase 3.5 follow-up) — snapshot the query's opaque
+        # dict before the Hub's post-subscribe strip can mutate it
+        # (pubsub_hub.py:494 pops `capabilities`). The coro runs
+        # async-scheduled, so by the time it reads
+        # `parent.opaque["capabilities"]` the Hub has already
+        # processed and stripped. Without this snapshot, every
+        # capability-metadata-aware orchestration middleware (notably
+        # adaptive_reevaluate's worst_quantile / extra_visits / Phase 3
+        # fields) reads stale-empty cap_meta and silently falls back
+        # to closure defaults. Discovered 2026-05-18 when the SPA's
+        # learned-VF dropdown's `value_binding` / `allocation_algorithm`
+        # never reached the substrate.
+        import copy as _copy
+        query_for_coro = KataGoQuery(
+            action=query.action,
+            analyze_turns=query.analyze_turns,
+            opaque=_copy.deepcopy(query.opaque),
+        )
         ctx = OrchestrationContext(
             parent_id=orig_id,
-            parent_query=query,
+            parent_query=query_for_coro,
             session_capabilities=self._caps,
             middleware=self,
         )
         self._contexts[orig_id] = ctx
-        coro = self._coro_factory(query, ctx)
+        coro = self._coro_factory(query_for_coro, ctx)
         task = asyncio.create_task(
             self._drive_coroutine(orig_id, ctx, coro),
             name=f"orchestration:{self.name}:{orig_id}",
@@ -488,14 +505,24 @@ class OrchestrationMiddleware(SessionMiddleware):
         ctx: OrchestrationContext,
         coro: AsyncIterator[KataGoResponse],
     ) -> None:
-        """Iterate the user's coroutine; pump yields into the output queue.
+        """Iterate the user's coroutine; push each yield via
+        SessionCapabilities.send_response.
 
-        On normal completion: the output queue gets a sentinel to
-        signal handle_response that no more outputs are coming.
+        Output is push-based — each yield from the coroutine is
+        delivered directly onto the session's WebSocket via
+        caps.send_response. This decouples output delivery from the
+        timing of incoming wire arrivals, closing the drain/driver
+        race in the prior output-queue + handle_response.drain design.
+        See proxy/docs/roadmap-orchestration-output-channel.md.
+
+        On normal completion: nothing further is required; the
+        coroutine's emissions have all reached the wire.
 
         On exception (other than CancelledError): synthesise a
-        structured error response (per ADR-0002) so the client sees
-        the failure rather than hanging.
+        structured error response (per ADR-0002) and push it via
+        caps.send_response so the client sees the failure rather than
+        hanging. The error path uses the same channel as normal yields,
+        so trailing error responses are NOT stranded either.
 
         On cancellation: re-raise so the asyncio task is genuinely
         cancelled. The finally block runs in either case to clean up
@@ -504,7 +531,8 @@ class OrchestrationMiddleware(SessionMiddleware):
         outcome = "normal"
         try:
             async for resp in coro:
-                await ctx._output_queue.put((parent_id, resp))
+                if self._caps is not None:
+                    await self._caps.send_response(parent_id, resp)
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
@@ -521,7 +549,19 @@ class OrchestrationMiddleware(SessionMiddleware):
             err_response = MetadataResponse(opaque={
                 "error": f"orchestration error in {self.name}: {e}",
             })
-            await ctx._output_queue.put((parent_id, err_response))
+            if self._caps is not None:
+                try:
+                    await self._caps.send_response(parent_id, err_response)
+                except Exception:
+                    self._log.exception(
+                        Event.DIAGNOSTIC,
+                        cid=parent_id,
+                        msg=(
+                            f"orchestration[{self.name}]: send_response "
+                            f"failed while delivering error response for "
+                            f"parent_id={parent_id!r}"
+                        ),
+                    )
         finally:
             # Lifecycle: orchestration coroutine completed (one of
             # three outcomes). Logged once per parent query at INFO
@@ -548,8 +588,6 @@ class OrchestrationMiddleware(SessionMiddleware):
                             f"already cleaned up)"
                         ),
                     )
-            # Signal handle_response that the coroutine is done.
-            await ctx._output_queue.put(_SENTINEL)
             # Drop registry entries.
             self._contexts.pop(parent_id, None)
             self._tasks.pop(parent_id, None)
@@ -562,62 +600,50 @@ class OrchestrationMiddleware(SessionMiddleware):
         response: KataGoResponse,
         submit_query: SubmitQuery,
     ) -> ResponseStream:
-        """Route the response to the right consumer; drain coroutine outputs.
+        """Route the response to the right consumer.
 
         Routing rules:
           - orig_id is a known parent (in _contexts) → push to that
-            parent's original_stream.
-          - orig_id is a known sub-query (in _sub_to_parent) → push to
-            the parent's spawn iterator for that sub-query.
+            parent's original_stream. The orchestration coroutine
+            consumes the response asynchronously; its yields reach
+            the wire via caps.send_response, not via this
+            handle_response's yields.
+          - orig_id is a known sub-query (in _sub_to_parent) → push
+            to the parent's spawn iterator for that sub-query. Same
+            asynchronous flow: yields go via caps.send_response.
           - else → not orchestrated; pass through unchanged.
 
-        After routing, yield to the event loop so the coroutine can
-        consume the push and produce outputs, then drain the parent's
-        output queue and yield each emission. The yields go to the
-        outer middleware in the chain (which may further wrap them
-        before the WebSocket send loop).
+        Yields nothing for orchestrated orig_ids. The orchestration
+        coroutine's output flows through caps.send_response directly
+        to the WebSocket, bypassing the drain race that the
+        prior output-queue design suffered.
         """
         ctx = self._contexts.get(orig_id)
         if ctx is not None:
             await ctx._push_original(response)
-        else:
-            parent_id = self._sub_to_parent.get(orig_id)
-            if parent_id is None:
-                # Not orchestrated; pass through.
-                yield orig_id, response
-                return
-            ctx = self._contexts.get(parent_id)
-            if ctx is None:
-                # Race: parent's coroutine completed between
-                # _sub_to_parent registration and this response
-                # arrival. Drop silently (the framework's cleanup
-                # path has already cancelled the sub-query).
-                self._log.debug(
-                    Event.DIAGNOSTIC,
-                    cid=parent_id, sub_orig=orig_id,
-                    msg=(
-                        f"orchestration[{self.name}]: sub-query response for "
-                        f"orig_id={orig_id!r} arrived after parent "
-                        f"{parent_id!r} cleaned up; dropping"
-                    ),
-                )
-                return
-            await ctx._push_sub_response(orig_id, response)
-
-        # Yield to the event loop so the coroutine can consume the
-        # push and produce outputs.
-        await asyncio.sleep(0)
-
-        # Drain the parent's output queue (non-blocking).
-        while True:
-            try:
-                item = ctx._output_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(item, _Sentinel):
-                # Coroutine completed; no more outputs.
-                break
-            yield item
+            return
+        parent_id = self._sub_to_parent.get(orig_id)
+        if parent_id is None:
+            # Not orchestrated; pass through.
+            yield orig_id, response
+            return
+        ctx = self._contexts.get(parent_id)
+        if ctx is None:
+            # Race: parent's coroutine completed between
+            # _sub_to_parent registration and this response
+            # arrival. Drop silently (the framework's cleanup
+            # path has already cancelled the sub-query).
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                cid=parent_id, sub_orig=orig_id,
+                msg=(
+                    f"orchestration[{self.name}]: sub-query response for "
+                    f"orig_id={orig_id!r} arrived after parent "
+                    f"{parent_id!r} cleaned up; dropping"
+                ),
+            )
+            return
+        await ctx._push_sub_response(orig_id, response)
 
     # ---------------- Framework-internal hooks for OrchestrationContext ----
 

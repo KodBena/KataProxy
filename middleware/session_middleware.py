@@ -57,6 +57,7 @@ __all__ = [
     "SessionCapabilities",
     "SubmitQuery",
     "TerminateQuery",
+    "SendResponse",
     "ResponseStream",
 ]
 
@@ -73,6 +74,16 @@ __all__ = [
 #   through the now-coalescing-aware terminate path, so middleware-initiated
 #   terminations respect coalescing transparency without extra work.
 #
+# SendResponse: the callback for injecting a synthetic response from a
+#   middleware that produces output decoupled from incoming wire arrivals
+#   (typically the orchestration framework's driver task; see
+#   docs/roadmap-orchestration-output-channel.md). Wire-encodes the
+#   response under the given orig_id, logs lifecycle.forward, sends on
+#   the WebSocket. Bypasses both the transformer chain (the response
+#   was already processed upstream of the middleware producing it) and
+#   the middleware chain itself (the producing middleware is the one
+#   driving the call).
+#
 # ResponseStream: what every handle_response implementation must return. Using
 #   AsyncGenerator (rather than AsyncIterator) aligns the alias with what
 #   Python actually produces from an `async def` + `yield` body, eliminating
@@ -82,7 +93,31 @@ __all__ = [
 
 SubmitQuery = Callable[[ClientId, KataGoQuery], Awaitable[None]]
 TerminateQuery = Callable[[ClientId], Awaitable[None]]
+SendResponse = Callable[[ClientId, KataGoResponse], Awaitable[None]]
 ResponseStream = AsyncIterator[tuple[ClientId, KataGoResponse]]
+
+
+async def _send_response_not_wired(
+    orig_id: ClientId, response: KataGoResponse,
+) -> None:
+    """Default for SessionCapabilities.send_response when a constructor
+    site has not been updated to wire the real implementation.
+
+    Raises NotImplementedError per ADR-0002 (fail loudly): any caller
+    invoking this default has either (a) constructed
+    SessionCapabilities without threading the session's
+    `_send_response` method into it, or (b) constructed it in a test
+    harness that exercises the push-based output channel without
+    providing a stub. Either way, silent no-op would mask a wiring
+    bug; the explicit raise surfaces it.
+    """
+    raise NotImplementedError(
+        "SessionCapabilities.send_response was not wired by the "
+        f"constructor (called for orig_id={orig_id!r}). The push-based "
+        "output channel introduced by the orchestration output-channel "
+        "arc (see proxy/docs/roadmap-orchestration-output-channel.md) "
+        "requires ClientSession-side wiring or a test-harness stub."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +133,16 @@ class SessionCapabilities:
     Frozen to make the contract clear: middleware cannot mutate or extend
     the capability surface.
 
+    ``send_response`` is the push-based output channel: a middleware
+    that produces a response decoupled from incoming-wire arrivals
+    (the orchestration framework's driver task is the worked example)
+    calls this to push the response onto the session's WebSocket. The
+    default raises NotImplementedError per ADR-0002 — constructor
+    sites that don't wire a real implementation get a loud error
+    rather than a silent drop. See
+    ``proxy/docs/roadmap-orchestration-output-channel.md`` for the
+    rationale.
+
     The ``proxy_log`` field is the session-bound structured-logging
     adapter (ProxyLogger). Middleware that emits structured records
     stashes it from on_session_start and refines via .bind() as
@@ -110,6 +155,7 @@ class SessionCapabilities:
     """
     submit_query: SubmitQuery
     terminate_query: TerminateQuery
+    send_response: SendResponse = _send_response_not_wired
     proxy_log: Any = None
 
 
