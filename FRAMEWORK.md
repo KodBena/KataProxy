@@ -159,6 +159,39 @@ ProxyServer construction site to instantiate. Wrap with
 middlewares via `MiddlewareChain` (subject to the algebraic-laws
 limit below).
 
+### The output channel (post-v1.0.27)
+
+The orchestration coroutine's `yield` statements deliver responses
+through a **push-based output channel**: the framework's driver task
+calls `SessionCapabilities.send_response(parent_id, resp)` for each
+yielded response, which wire-encodes it under the parent's orig_id,
+logs `lifecycle.forward` at the kind-driven level, and `ws.send`s
+directly. The output path bypasses both the transformer chain (the
+data was already processed upstream of the middleware producing it)
+and the middleware chain itself (the producing middleware is the one
+driving the call; routing back would recurse or require tagged-bypass
+logic).
+
+This contract is what makes trailing yields — emissions produced
+after the last input response has been consumed (Stage 3
+finalizations in `adaptive_reevaluate`, summary emissions in any
+fork-join coroutine, framework-synthesised error responses) — reach
+the wire reliably. The prior `_output_queue` + `handle_response`
+drain design had a single-event-loop-iteration race that stranded
+such trailing yields; see
+`proxy/docs/roadmap-orchestration-output-channel.md` for the full
+analysis. Middleware authors don't need to think about the output
+channel: writing `yield resp` in the coroutine body is sufficient.
+
+`OrchestrationMiddleware.handle_response` is correspondingly
+input-only for orchestration-managed orig_ids — it routes incoming
+responses into the parent's `_original_queue` or a sub-query's
+`record.queue` and yields nothing back through the
+SessionMiddleware contract. Pass-through (non-orchestrated) orig_ids
+still yield through `handle_response` as the SessionMiddleware ABC
+specifies; outer middleware in a `MiddlewareChain` observes those
+pass-throughs normally.
+
 ### Single-orchestration-per-chain (algebraic-laws limit)
 
 `MiddlewareChain` enforces at most one OrchestrationMiddleware per

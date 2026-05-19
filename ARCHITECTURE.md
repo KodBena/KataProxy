@@ -254,8 +254,20 @@ provides `ctx.spawn(query)` (iterate one sub-query's responses),
 (iterate the parent's responses), and `ctx.discard_originals()`
 (release the original buffer when the coroutine fully replaces
 originals). The framework owns parent-child tracking, lifecycle,
-cleanup, and cancellation; the coroutine owns *what* gets spawned
-and *how results are joined*.
+cleanup, cancellation, and output delivery; the coroutine owns
+*what* gets spawned and *how results are joined*.
+
+The coroutine's `yield` statements deliver responses through a
+**push-based output channel** (post-v1.0.27): the framework's driver
+task calls `SessionCapabilities.send_response(parent_id, resp)` for
+each yield, which lands directly on the WebSocket via the session's
+`_send_response` method. Bypasses both the transformer chain and the
+middleware chain. Trailing yields produced after the last input
+response (Stage 3 finalizations, summary emissions, framework-
+synthesised error responses) reach the wire reliably — the prior
+output-queue + handle_response.drain design had an event-loop-
+iteration race that stranded such trailing emissions. See
+`proxy/docs/roadmap-orchestration-output-channel.md`.
 
 `adaptive_reevaluate` is the worked example, refactored to use this
 surface in v1.0.16. The validation criterion (per the roadmap):
@@ -282,12 +294,13 @@ way to act on the session from outside `handle_response`:
 - `on_session_end()` runs once during `_cleanup`, after orphan
   termination has flushed pending router state. Cancel session-scoped
   tasks and release resources here.
-- `SessionCapabilities` exposes `submit_query` (existing semantics —
-  inject an analyze query) and `terminate_query(orig_id)` (new —
-  cancel an in-flight query by its client-namespace orig_id, routing
-  through the coalescing-aware `_handle_terminate` so middleware-
-  initiated terminations respect coalescing transparency without
-  extra work).
+- `SessionCapabilities` exposes three callbacks: `submit_query`
+  (inject an analyze query), `terminate_query(orig_id)` (cancel an
+  in-flight query by its client-namespace orig_id, routing through
+  the coalescing-aware `_handle_terminate`), and `send_response(
+  orig_id, response)` (push-based output channel; used by the
+  orchestration framework's driver task to deliver coroutine yields
+  to the wire — see the orchestration section above).
 
 The `KeepAliveMiddleware` (`middleware/keep_alive.py`) is the worked example for
 this triple: it stashes capabilities in `on_session_start`, spawns a

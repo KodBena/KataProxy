@@ -1,7 +1,49 @@
 # Roadmap — Orchestration output channel (post-v1.0.26)
 
-- **Status:** `design-note: planned`
-- **Date:** 2026-05-19
+- **Status:** `design-note: implemented`
+- **Date:** 2026-05-19 (planning), 2026-05-19 (implementation landed on
+  proxy branch `feat/orchestration-output-channel`)
+- **Implementation footprint** (delta against `feat/learned-value-fn`
+  HEAD `d918bf8`):
+    - `middleware/session_middleware.py`: `SendResponse` type alias;
+      `send_response` field on `SessionCapabilities` (with
+      `_send_response_not_wired` default that raises
+      `NotImplementedError` per ADR-0002).
+    - `proxy_server.py`: `ClientSession._send_response` method;
+      `SessionCapabilities` construction wired with
+      `send_response=self._send_response`.
+    - `middleware/orchestration.py`: `_drive_coroutine` calls
+      `caps.send_response` for each yield; `_output_queue` and its
+      sentinel-based drain removed from `OrchestrationContext`;
+      `handle_response` is input-only for orchestration-managed
+      orig_ids (pass-through still yields).
+    - `FRAMEWORK.md` and `ARCHITECTURE.md`: orchestration sections
+      describe the push-based output channel.
+    - Regression coverage: new
+      `TestTrailingYieldAfterSpawnPrimitive` class in
+      `tests/test_orchestration_middleware.py` (control passes via
+      direct `ctx.spawn`; regression test against `ctx.parallel`
+      turns green under the fix).
+- **Implementation deltas vs. the planning-time arc:**
+    - The planning-time "Commit 2 — `_deliver_upstream` accepts
+      synthetic responses" was unnecessary; bypassing the
+      middleware chain entirely (rather than threading synthetics
+      through it) meant `_deliver_upstream` needed no changes.
+      `ClientSession._send_response` is self-contained.
+    - "Commit 4 — Orchestration tests rewrite" was merged into the
+      substrate-rewrite commit. Splitting would have left a transient
+      state with ~30 tests red; the cohesive commit ("substrate
+      switches; test fakes updated") keeps the intermediate state
+      compilable and the suite green.
+    - The four downstream test files
+      (`test_phase3_dispatch.py`, `test_capability_negotiation.py`,
+      `test_multi_round_adaptation.py`, `test_allocation_refusal.py`)
+      each had `_make_caps` / `_drive_response` helpers updated in
+      the same commit. Each helper auto-discovers its fake from
+      `m._caps.send_response.__self__`, so individual test
+      assertions did not need touching.
+    - Suite size after implementation: 485 tests pass, 0 fail.
+      `mypy --strict` clean on the three touched production modules.
 - **Scope:** `proxy/middleware/orchestration.py` and the
   `_deliver_upstream` path in `proxy/proxy_server.py`. The
   Layer 1 mechanism by which an orchestration coroutine's yields
