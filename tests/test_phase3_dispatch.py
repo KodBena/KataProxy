@@ -675,6 +675,192 @@ class TestPhase3FinalizationComposition:
         m.on_session_end()
 
     @pytest.mark.asyncio
+    async def test_post_v1027_output_channel_regression_under_multi_round_phase3(
+        self,
+    ) -> None:
+        """Regression for the v1.0.16-through-v1.0.26 output-channel
+        race (closed v1.0.27, see
+        docs/roadmap-orchestration-output-channel.md).
+
+        Pre-fix symptom in user-observed terms: under multi-round
+        Phase 3 (max_rounds=N, N>=2), the SPA saw evidence of
+        roughly one round's worth of deepening data and the query
+        never reaped (no `is_during_search=False` per turn). The
+        proxy's `handle_response` drained `ctx._output_queue` only
+        on the same event-loop iteration as an incoming response
+        push; intermediate task layers (pump tasks from
+        `_stream_parallel_spawns`, collect tasks from
+        `ctx.parallel`) deferred the driver's wake-up to the next
+        iteration, so trailing yields produced after the LAST
+        sub-query response of any round were stranded. The LAST
+        round's Stage 2 previews and the WHOLE finalization stage
+        (Stage 3) were lost.
+
+        Post-fix: every coroutine yield reaches the wire via
+        `caps.send_response`, independent of asyncio scheduling.
+        This test asserts the multi-round-specific contract:
+
+          (a) Stage 3 emits one `is_during_search=False` per
+              analyzed turn (the protocol's reaping signal).
+          (b) Stage 2 emits one preview per round per
+              allocator-deepened turn (every round's per-spawn
+              preview reaches the wire — not just round 1's).
+          (c) Total emission count matches what multi-round
+              dispatch would produce, not what single-round-only
+              stranding would produce.
+
+        Discriminating axis vs the pre-fix substrate: under the
+        old _output_queue + handle_response.drain pattern, claims
+        (a) and (b)'s last-round component would fail (yields
+        stranded). The current substrate's `caps.send_response`
+        delivers them. If a future regression reverts the
+        push-based output channel, this test catches it.
+        """
+        c, caps = _make_caps()
+        m = adaptive_reevaluate(window_size=1)()
+        m.on_session_start(caps)
+        N_TURNS = 6
+        N_ROUNDS = 3
+        q = KataGoQuery(
+            action=KataGoAction.ANALYZE,
+            analyze_turns=list(range(N_TURNS)),
+            opaque={
+                "rules": "tromp-taylor", "komi": 7.5,
+                "boardXSize": 19, "moves": [["B", "Q4"], ["W", "D16"]],
+                "maxVisits": 100,
+                "capabilities": {"adaptive_reevaluate":
+                    _phase3_capabilities(
+                        extra_visits=300, max_rounds=N_ROUNDS,
+                    )},
+                "analysis_config": _phase3_analysis_config(expression="1.0"),
+            },
+        )
+        m.on_query(ClientId("eid-1"), q)
+
+        # Stage 1: drive originals. Turn 0 is the bad-final (worst-
+        # delta), others neutral. Drives selector into picking the
+        # worst-quantile subset for deepening.
+        for turn in range(N_TURNS):
+            await _drive(
+                m, ClientId("eid-1"),
+                _bad_final(0) if turn == 0 else _neutral_final(turn),
+            )
+
+        # Per round, drive each spawn's final. Constant value_fn +
+        # window_size=1 means the worst-set is stable across rounds,
+        # so each round picks the same subset; spawn count per round
+        # = floor(extra_visits / V_int_extra) = 300/800 ≈ 0 OR
+        # (with the visit-scaling-model's expansion of the candidate
+        # set) the actual N — derived empirically below.
+        round_spawn_counts: list[int] = []
+        seen_so_far = 0
+        for round_idx in range(N_ROUNDS):
+            # Wait for THIS round's spawns to appear (the new ones
+            # past the prior accumulated total).
+            #
+            # We don't know spawn-count-per-round a priori (depends
+            # on the allocator's slope ordering against the budget);
+            # let the loop wait until c.submitted stops growing
+            # for a short window, then record this round's batch.
+            stable_since = asyncio.get_event_loop().time()
+            stable_count = len(c.submitted)
+            settle_after_s = 0.05
+            deadline = asyncio.get_event_loop().time() + 1.0
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.005)
+                cur = len(c.submitted)
+                if cur != stable_count:
+                    stable_count = cur
+                    stable_since = asyncio.get_event_loop().time()
+                elif (asyncio.get_event_loop().time() - stable_since
+                      > settle_after_s and cur > seen_so_far):
+                    break
+            this_round_spawns = c.submitted[seen_so_far:stable_count]
+            assert this_round_spawns, (
+                f"round {round_idx+1}: expected at least one spawn "
+                f"but no new spawns appeared in c.submitted"
+            )
+            round_spawn_counts.append(len(this_round_spawns))
+            for spawn_oid, spawn_q in this_round_spawns:
+                turn = int(spawn_q.analyze_turns[0])
+                await _drive(
+                    m, spawn_oid,
+                    _spawn_final(turn, marker=f"round{round_idx+1}"),
+                )
+            seen_so_far = stable_count
+
+        # After all rounds, let the coroutine reach Stage 3 + finally.
+        await _settle_and_drain(m, ClientId("eid-1"))
+
+        # Harvest everything that reached caps.send_response — that
+        # IS the production output path under the post-v1.0.27
+        # substrate. Anything stranded under the pre-fix race would
+        # not be in this list.
+        sends = c.synthetic_sends
+
+        # (a) Exactly one authoritative final per analyzed turn.
+        auths = [
+            r for _, r in sends
+            if isinstance(r, AnalyzeResponse) and not r.is_during_search
+        ]
+        auth_turns = sorted(r.turn_number for r in auths)
+        assert auth_turns == list(range(N_TURNS)), (
+            f"Stage 3 stranding regression: expected one authoritative "
+            f"per analyzed turn ({list(range(N_TURNS))}); got "
+            f"{auth_turns}. Pre-v1.0.27 the drain race stranded these "
+            f"in ctx._output_queue with no future handle_response to "
+            f"drain them."
+        )
+
+        # (b) Stage 2 emits per-round previews via the push channel.
+        # Each round produces one preview per deepened-turn-spawn
+        # (the coroutine yields `replace(resp, is_during_search=True)`
+        # on each spawn's final). Total preview count for spawn-
+        # sourced packets ≈ sum of per-round spawn counts.
+        spawn_previews = [
+            r for _, r in sends
+            if isinstance(r, AnalyzeResponse)
+            and r.is_during_search
+            and "from_phase3" not in (r.opaque or {})  # exclude Stage 1
+        ]
+        spawn_preview_count = len([
+            r for _, r in sends
+            if isinstance(r, AnalyzeResponse)
+            and r.is_during_search
+        ])
+        expected_spawn_previews_lower = sum(round_spawn_counts)
+        # Note: spawn previews are interleaved with Stage 1's
+        # "originals-as-previews", which add N_TURNS more. The total
+        # `is_during_search=True` count should be ≥ N_TURNS (Stage 1)
+        # + sum(round_spawn_counts) (Stage 2 per round).
+        expected_total_previews_lower = N_TURNS + expected_spawn_previews_lower
+        assert spawn_preview_count >= expected_total_previews_lower, (
+            f"Last-round Stage 2 preview stranding regression: "
+            f"expected ≥ {expected_total_previews_lower} previews "
+            f"(N_TURNS={N_TURNS} Stage 1 + spawn previews summed "
+            f"across {N_ROUNDS} rounds = "
+            f"{expected_spawn_previews_lower}); got "
+            f"{spawn_preview_count}. Pre-v1.0.27 the last round's "
+            f"spawn previews and the Stage 3 finals stranded together "
+            f"after the last sub-query's handle_response returned."
+        )
+
+        # (c) Total send count matches multi-round shape.
+        total_sends = len(sends)
+        expected_total_lower = expected_total_previews_lower + N_TURNS
+        assert total_sends >= expected_total_lower, (
+            f"Multi-round emission stranding regression: total sends "
+            f"{total_sends} < expected lower bound "
+            f"{expected_total_lower} (={expected_total_previews_lower} "
+            f"previews + {N_TURNS} authoritatives). The single-round-"
+            f"only stranding shape would have given roughly "
+            f"{N_TURNS} (Stage 1) + {round_spawn_counts[0] if round_spawn_counts else 0} (one round's "
+            f"previews) + 0 (no Stage 3) = a much smaller count."
+        )
+
+        m.on_session_end()
+
+    @pytest.mark.asyncio
     async def test_mid_loop_emits_only_previews_under_phase3(self) -> None:
         """v1.0.24's mid-loop invariant carries through Phase 3:
         while the multi-round loop is in flight, every emission is
