@@ -14,8 +14,10 @@ Covers:
     one INFO line announces the replay cache is unbounded. No such line
     when the cache is disabled, and none when it's enabled-but-bounded.
   - query_version capability advertisement: a "cache" entry appears iff
-    the cache is enabled, shaped {"bounded": bool, "max_entries": int}
-    (max_entries present only when bounded).
+    the cache is enabled, shaped {"bounded": bool, "max_entries": int,
+    "key_scope": "engine-facing"} (max_entries present only when
+    bounded; key_scope always present, feature-detecting the
+    engine-facing replay-cache-key semantics).
 
 Run from the proxy directory: `pytest tests/test_hub_cache_disabled.py`.
 
@@ -183,7 +185,11 @@ class TestCacheCapabilityAdvertisement:
         from proxy_server import _build_advertised_capabilities
 
         advertised = _build_advertised_capabilities()
-        assert advertised["cache"] == {"bounded": True, "max_entries": 1024}
+        assert advertised["cache"] == {
+            "bounded": True,
+            "max_entries": 1024,
+            "key_scope": "engine-facing",
+        }
 
     def test_cache_capability_unbounded_when_enabled_and_max_nonpositive(
         self, monkeypatch: pytest.MonkeyPatch
@@ -193,5 +199,8 @@ class TestCacheCapabilityAdvertisement:
         from proxy_server import _build_advertised_capabilities
 
         advertised = _build_advertised_capabilities()
-        assert advertised["cache"] == {"bounded": False}
+        assert advertised["cache"] == {
+            "bounded": False,
+            "key_scope": "engine-facing",
+        }
         assert "max_entries" not in advertised["cache"]

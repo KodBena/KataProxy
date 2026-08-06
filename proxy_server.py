@@ -1340,9 +1340,13 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
             advertised["cache"] = {
                 "bounded": True,
                 "max_entries": cfg.HUB_CACHE_MAX,
+                "key_scope": "engine-facing",
             }
         else:
-            advertised["cache"] = {"bounded": False}
+            advertised["cache"] = {
+                "bounded": False,
+                "key_scope": "engine-facing",
+            }
     return advertised
 
 

@@ -57,6 +57,7 @@ __all__ = [
     "translate_response_to_wire",
     "register_query_completion",
     "KATAGO_QUERY_PRISMS",
+    "CACHE_KEY_EXCLUDED_FIELDS",
     "CompletionTracker",
     # Game-tree indexing brands (v1.0.22; see
     # docs/roadmap-adaptive-type-branding.md).
@@ -502,6 +503,42 @@ _PROXY_ONLY_FIELDS: frozenset[str] = frozenset({
     # to choose the upstream; the central strip handles the wire side.
     "model",
 })
+
+
+# The replay-cache key (pubsub_hub.py:PubSubHub._compute_cache_key) must
+# cover exactly the ENGINE-FACING query — the parameters that actually
+# shape the raw backend stream the cache records. A proxy-only field is
+# excluded from that key UNLESS it also affects engine output.
+#
+# Classification rule, applied to every member of `_PROXY_ONLY_FIELDS`:
+#   - `cache` / `lookup_cache` / `replay_final_only` — cache-control
+#     flags, popped from opaque before either hash is ever computed
+#     (pubsub_hub.subscribe step 1). Never reach the engine, never
+#     discriminate its output.
+#   - `analysis_config` — the user's enrichment palette, consumed
+#     exclusively by transformers/analysis_enricher.py *after* the raw
+#     backend stream is recorded (on_response runs downstream of the
+#     cache write). The engine never sees it and its value cannot
+#     change the raw stream the cache stores; discriminating the cache
+#     key on it defeats FRAMEWORK.md §3's "replay through transformers
+#     with new parameters" purpose.
+#   - `capabilities` — gates which per-session transformers/middleware
+#     engage, not what the engine computes. Same reasoning as
+#     `analysis_config`: proxy-side-only effect, must not discriminate
+#     the engine-facing cache key.
+#   - `model` — SELECTOR reads this to choose the upstream KataGo
+#     instance a query is routed to. Different models produce
+#     genuinely different engine output, so `model` DOES affect the
+#     raw backend stream and must stay in the cache key despite being
+#     proxy-only (stripped from the wire, never seen by the chosen
+#     engine itself, but it changes *which* engine answers).
+#
+# This enumeration is load-bearing: every future addition to
+# `_PROXY_ONLY_FIELDS` must explicitly decide its membership here rather
+# than inheriting a default. `pubsub_hub.py` imports this frozenset and
+# applies it directly — it must never hand-copy or re-derive the field
+# list, so there is exactly one writer of this classification.
+CACHE_KEY_EXCLUDED_FIELDS: frozenset[str] = _PROXY_ONLY_FIELDS - {"model"}
 
 
 def translate_query_to_wire(query: KataGoQuery, envelope_id: str) -> dict[str, Any]:

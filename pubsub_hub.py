@@ -30,14 +30,31 @@ query or become a new one.
 
 Cache semantics (analysis-level query cache)
 ────────────────────────────────────────────
-Separate from the coalescing content_hash.  The replay cache keys on the
-FULL query payload (action + analyzeTurns + every opaque field) except the
-client-specific "id" and the three control flags (cache, lookup_cache,
-replay_final_only).  This guarantees that a replayed stream exactly matches
-the parameters that would have been sent to the backend.
+Separate from the coalescing content_hash.  The cached record is the RAW
+backend stream — captured in on_response *before* any Layer 1 transformer
+runs — so it is palette- and capability-independent by construction.  The
+replay cache key must therefore cover exactly the ENGINE-FACING query: it
+keys on the query payload (action + analyzeTurns + every opaque field)
+except the client-specific "id" and every field in
+`katago.CACHE_KEY_EXCLUDED_FIELDS` — the three control flags (cache,
+lookup_cache, replay_final_only) plus the proxy-only fields that are
+evaluated entirely on the proxy side and never reach the engine
+(`analysis_config`, the user's enrichment palette consumed by
+transformers/analysis_enricher.py; `capabilities`, which gates per-session
+transformers/middleware).  `model` is proxy-only too but stays IN the key
+— SELECTOR routes it to a different upstream engine, so it genuinely
+discriminates engine output.  `katago/katago_proxy.py:CACHE_KEY_EXCLUDED_FIELDS`
+is the single source of truth for this classification; this module imports
+and applies it rather than re-deriving the field list.  This guarantees
+that a replayed stream exactly matches the parameters that were actually
+sent to the backend, and that changing a proxy-side-only parameter (e.g.
+the analysis_config palette) hits the cache and replays through the
+transformer chain with the new parameters instead of forcing a full
+engine re-run (FRAMEWORK.md §3).
 
   • lookup_cache=True  → short-circuit to replay (if exact match in cache)
-  • cache=True         → record the live backend stream under the full key
+  • cache=True         → record the live backend stream under the full
+                          engine-facing key
   • replay_final_only  → during replay, drop any isDuringSearch=True messages
 
 Return-path design
@@ -71,7 +88,7 @@ from typing import Any, Callable, Optional, Protocol
 from AbstractProxy.proxy_core import CanonicalId, ClientId, InternalId
 from proxy_logging import Event, get_proxy_logger, lifecycle
 
-from katago import KataGoAction, KataGoQuery
+from katago import CACHE_KEY_EXCLUDED_FIELDS, KataGoAction, KataGoQuery
 
 logger = logging.getLogger("kataproxy." + __name__)
 _log = get_proxy_logger(__name__)
@@ -266,7 +283,7 @@ class InFlightEntry:
     """State for one live backend query slot."""
     canonical_id: CanonicalId     # the id sent to the backend router
     content_hash: str             # for coalescing / logging
-    cache_key: str                # FULL analysis-level key for replay cache
+    cache_key: str                # ENGINE-FACING key for replay cache
     subscribers: list[Subscriber] = field(default_factory=list)
     # Replay-cache support
     record_cache: bool = False
@@ -336,11 +353,25 @@ class PubSubHub:
     # -----------------------------------------------------------------------
 
     def _compute_cache_key(self, query: KataGoQuery) -> str:
-        """Compute stable hash of the *entire* query (analysis-level cache key).
+        """Compute stable hash of the ENGINE-FACING query (analysis-level
+        cache key).
 
-        Includes: action, analyzeTurns (sorted), and every field in opaque
-        EXCEPT the client-specific "id" and the three control flags
-        (already stripped in subscribe()).
+        The cached record is the raw backend stream, captured in
+        on_response *before* any transformer runs — it is therefore
+        palette- and capability-independent by construction. The cache
+        key must cover exactly the parameters that shape that raw
+        stream: action, analyzeTurns (sorted), and every opaque field
+        EXCEPT the client-specific "id" and
+        ``katago.CACHE_KEY_EXCLUDED_FIELDS`` (the proxy-only fields that
+        do not affect engine output — the three cache-control flags,
+        already stripped in subscribe(), plus `analysis_config` and
+        `capabilities`, which are evaluated by proxy-side transformers/
+        middleware and never reach the engine). `model` is a proxy-only
+        field too, but it routes to a different upstream engine under
+        SELECTOR and so stays in the key — see the classification rule
+        at `katago/katago_proxy.py:CACHE_KEY_EXCLUDED_FIELDS`, the
+        single source of truth for this exclusion; this hub applies it,
+        never hand-copies it.
         This is deliberately different from the coalescing content_hash.
         """
         data: dict[str, Any] = {
@@ -349,9 +380,10 @@ class PubSubHub:
         if query.analyze_turns:
             data["analyzeTurns"] = sorted(query.analyze_turns)
 
-        # All opaque fields, dropping client "id" if present
+        # All opaque fields, dropping client "id" and any engine-opaque
+        # (proxy-only, non-engine-affecting) field.
         for k, v in query.opaque.items():
-            if k != "id":
+            if k != "id" and k not in CACHE_KEY_EXCLUDED_FIELDS:
                 data[k] = v
 
         # Stable JSON (sort_keys guarantees same hash for semantically equal queries)
