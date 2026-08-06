@@ -140,6 +140,23 @@ HASH_RING_REPLICAS: int = int(os.environ.get("HASH_RING_REPLICAS", "150"))
 
 HUB_CACHE_MAX: int = int(os.environ.get("PROXY_HUB_CACHE_MAX", "1024"))
 
+# When True, the Hub replay cache is disabled entirely: ProxyServer passes
+# cache_store=None to PubSubHub instead of constructing an LRUCacheStore, so
+# {"cache": true} / {"lookup_cache": true} queries never populate or hit a
+# store — the hub's cache short-circuit paths become permanent no-ops
+# (PubSubHub._get_record / _save_record already handle cache_store=None as
+# "no cache", used today by callers/tests that omit cache_store).
+#
+# Default False: the bounded LRUCacheStore wired above stays the default
+# behaviour. Set PROXY_HUB_CACHE_DISABLED=true (or 1, yes, on) for operators
+# who want to categorically rule out replay-cache memory usage rather than
+# rely on PROXY_HUB_CACHE_MAX=0's "bounded to unbounded" degrade.
+
+HUB_CACHE_DISABLED: bool = (
+    os.environ.get("PROXY_HUB_CACHE_DISABLED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 
 # ---------------------------------------------------------------------------
 # JSON structural depth bound (v1.0.4)

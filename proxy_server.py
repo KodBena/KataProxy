@@ -1085,8 +1085,23 @@ class ProxyServer:
         # LRUCacheStore implementation degrades to a plain dict when its
         # maxsize is non-positive, so PROXY_HUB_CACHE_MAX=0 restores
         # pre-v1.0.4 unbounded semantics for operators who explicitly want
-        # them.
-        self._hub_cache = LRUCacheStore(maxsize=cfg.HUB_CACHE_MAX)
+        # them. PROXY_HUB_CACHE_DISABLED=true skips LRUCacheStore
+        # construction altogether — cache_store=None makes the hub's
+        # cache short-circuit paths permanent no-ops (PubSubHub._get_record
+        # / _save_record already treat cache_store=None as "no cache").
+        self._hub_cache: Optional[LRUCacheStore] = (
+            None if cfg.HUB_CACHE_DISABLED
+            else LRUCacheStore(maxsize=cfg.HUB_CACHE_MAX)
+        )
+        if self._hub_cache is not None and cfg.HUB_CACHE_MAX <= 0:
+            _log.info(
+                Event.DIAGNOSTIC,
+                msg=(
+                    "Hub replay cache is unbounded "
+                    "(PROXY_HUB_CACHE_MAX <= 0) — growth is bounded only "
+                    "by client-driven {\"cache\": true} traffic"
+                ),
+            )
         self._hub = PubSubHub(cache_store=self._hub_cache)
         self._router: Optional[BackendRouter] = None
         self._rr_state: Dict[str, Any] = {"counter": 0}
@@ -1314,6 +1329,20 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
         pass
     if cfg.ROLE.upper() == "SELECTOR":
         advertised["selector"] = {}
+    # cache (this feature) — advertised iff the Hub replay cache is
+    # enabled (PROXY_HUB_CACHE_DISABLED is false), so capability-aware
+    # clients can tell whether {"cache": true} / {"lookup_cache": true}
+    # queries will have any effect. "bounded" mirrors the same
+    # HUB_CACHE_MAX <= 0 "unbounded" degrade LRUCacheStore already
+    # implements; max_entries is present only when bounded.
+    if not cfg.HUB_CACHE_DISABLED:
+        if cfg.HUB_CACHE_MAX > 0:
+            advertised["cache"] = {
+                "bounded": True,
+                "max_entries": cfg.HUB_CACHE_MAX,
+            }
+        else:
+            advertised["cache"] = {"bounded": False}
     return advertised
 
 
