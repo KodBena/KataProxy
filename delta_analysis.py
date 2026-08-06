@@ -93,10 +93,16 @@ class DeltaAnalysisState:
               │   (black_cwt_pipe)                 (white_cwt_pipe)
               └─────────────────────────────────────────────┘
 
-    Move-to-color assignment (black_first=True, 0-indexed moves):
-      Move 0 = Black, Move 1 = White, Move 2 = Black, ...
+    Move-to-color assignment (derived from the moves list's own colors,
+    0-indexed moves):
       delta[j] = f(packet[j-1], packet[j]) — caused by move j-1.
-      delta[1] ← Black, delta[2] ← White, delta[3] ← Black, …
+      delta[j] is assigned to whichever color moves[j-1][0] names
+      ('B'/'b' → Black, 'W'/'w' → White). This is NOT a parity rule —
+      it is read off the actual per-move colors the caller supplies,
+      so it is correct for white-first games, handicap/setup
+      sequences, and any other non-strictly-alternating move list.
+      An unrecognized color token raises ValueError (ADR-0002: fail
+      loudly rather than guess).
 
     Parameters
     ----------
@@ -110,8 +116,6 @@ class DeltaAnalysisState:
     summary_fn : Callable[[list], Any]
         Aggregates a list of deltas across an interval [s, t].
         Defaults to arithmetic mean.
-    black_first : bool
-        If True (default), move 0 is Black.
     triangular : bool
         Build the multi-resolution triangular analysis matrices (default True).
     state_fns : dict, optional
@@ -171,7 +175,6 @@ class DeltaAnalysisState:
         delta_fn: Callable[[List[Any]], Any],
         summary_fn: Optional[Callable[[List[Any]], Any]] = None,
         *,
-        black_first: bool = True,
         triangular: bool = True,
         state_fns: Optional[Dict[str, Callable[[Any], Any]]] = None,
         cwt_fns: Optional[Dict[str, Callable[[List[Any]], Any]]] = None,
@@ -245,16 +248,26 @@ class DeltaAnalysisState:
 
         # ------------------------------------------------------------------
         # Color index assignment.
-        # delta[j] is caused by the play at move j-1:
-        #   j-1 even → Black (if black_first) → j odd
-        #   j-1 odd  → White (if black_first) → j even (j > 0)
+        # delta[j] is caused by the play at move j-1. Read the color off
+        # moves[j-1][0] itself — NOT a parity rule — so white-first
+        # games, handicap/setup sequences, and consecutive same-color
+        # moves all land in the right bucket. A color token that is
+        # neither a black nor a white spelling is a caller-data
+        # violation, not a guessable default (ADR-0002: fail loudly).
         # ------------------------------------------------------------------
-        if black_first:
-            black_delta_indices = list(range(1, n_moves + 1, 2))   # j=1,3,5,…
-            white_delta_indices = list(range(2, n_moves + 1, 2))   # j=2,4,6,…
-        else:
-            white_delta_indices = list(range(1, n_moves + 1, 2))
-            black_delta_indices = list(range(2, n_moves + 1, 2))
+        black_delta_indices: List[int] = []
+        white_delta_indices: List[int] = []
+        for j in range(1, n_moves + 1):
+            color_token = self._moves[j - 1][0]
+            if color_token in ("B", "b"):
+                black_delta_indices.append(j)
+            elif color_token in ("W", "w"):
+                white_delta_indices.append(j)
+            else:
+                raise ValueError(
+                    f"invalid move color token {color_token!r} at move "
+                    f"index {j - 1}; expected one of 'B', 'b', 'W', 'w'"
+                )
 
         self._black_delta_indices = black_delta_indices
         self._white_delta_indices = white_delta_indices
@@ -441,9 +454,10 @@ class DeltaAnalysisState:
         for color in ("black", "white"):
             mapping = self._black_to_local if color == "black" else self._white_to_local
             if move_idx not in mapping:
-                # This slot isn't this color's responsibility — black
-                # owns odd global slots (1, 3, 5, …) under black_first;
-                # white owns the even ones. Skip the read.
+                # This slot isn't this color's responsibility — color
+                # ownership of each global delta index is derived from
+                # the moves list's own colors (see __init__), not from
+                # parity. Skip the read.
                 continue
             local_idx = mapping[move_idx]
             if local_idx in result[color]["deltas"]:
