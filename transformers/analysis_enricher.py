@@ -11,6 +11,68 @@ analysis expressions against a curated stdlib), and on each response
 attaches the analysis result to ``r.opaque['extra']``.
 
 (Renamed and relocated in v1.0.13 from baduk.py at the proxy root.)
+
+``extra_status`` — typed absence for the wire (v1.0.28+)
+----------------------------------------------------------
+Setup (RegistryInterpreter compile error, DeltaAnalysisState's own
+n_moves<2 / invalid-color-token ValueErrors, or a TypeError from the
+curated stdlib) can fail at ``on_query`` time, and per-packet
+enrichment can raise at ``on_response`` time; per ADR-0002 both cases
+log and let the query proceed unenriched. Historically the client had
+no way to distinguish "enrichment skipped/failed" from "not
+requested" or "no delta yet" — absence of ``r.opaque['extra']`` was
+the only signal, and it was ambiguous.
+
+This module is the **single source of truth** for
+``r.opaque['extra_status']``, attached to every response of a query
+that carried ``analysis_config`` on an ``ANALYZE`` action (i.e. every
+response of a query for which enrichment was *in play* — regardless
+of whether it went on to succeed). Responses of queries that never
+carried ``analysis_config`` on ANALYZE get **no** ``extra_status`` key
+at all, so old clients and non-enrichment traffic see no wire change.
+
+Closed vocabulary:
+
+* ``{"state": "computed"}`` — this response's enrichment ran
+  ``push_packet`` successfully and ``extra`` is attached.
+* ``{"state": "skipped", "reason": <token>}`` — analyzer setup failed
+  at ``on_query`` time; this response (and every other response of the
+  same query) is unenriched. ``reason`` is one of:
+
+  - ``"config_error"`` — ``RegistryInterpreter`` asteval compile
+    failure (syntax error, symbol shadow), or a ``TypeError`` /
+    non-moves ``ValueError`` from the curated stdlib's own
+    range/dtype/shape checks (malformed ``analysis_config``, not a
+    moves-list problem).
+  - ``"too_few_moves"`` — the ``on_query`` moves-length gate
+    (``len(moves) <= 1``) or ``DeltaAnalysisState``'s own
+    ``n_moves must be >= 2`` guard.
+  - ``"invalid_moves"`` — ``DeltaAnalysisState``'s invalid-color-token
+    guard (a move color that is not one of ``'B'``, ``'b'``, ``'W'``,
+    ``'w'``), or a similar per-move data violation.
+* ``{"state": "failed", "reason": "enrichment_exception"}`` — setup
+  succeeded but *this* response's ``push_packet`` call raised.
+* ``{"state": "not_applicable"}`` — enrichment was in play for the
+  query, but this particular response cannot be enriched (not an
+  ``AnalyzeResponse``, or no ``moveInfos`` — errors / interrupted
+  searches, per the existing gate in ``on_response``).
+
+**Coupling invariant** (load-bearing): ``r.opaque['extra']`` is
+present on a response **iff** ``r.opaque['extra_status']['state'] ==
+"computed"``. Enforced by construction below — ``extra`` and the
+``computed`` status are set together in the same success branch, never
+independently — and asserted by the tests in
+``tests/test_analysis_enricher_extra_status.py``.
+
+``extra_status`` is response-side only: it is written in ``on_response``
+and never read back off ``q.opaque`` by any query-building path (the
+only opaque-cloning query builder, ``adaptive_reevaluate._build_deeper_query``,
+clones a ``KataGoQuery``'s opaque, never a response's), so it cannot
+reach KataGo — there is nothing to add to
+``katago/katago_proxy.py:_PROXY_ONLY_FIELDS`` for it.
+
+The SPA-side consumer of this field is explicitly out of scope here
+and is dispatched separately.
 """
 
 from scipy.stats import entropy
@@ -49,10 +111,40 @@ def sliding_median(arr: Any, window: int) -> Any:
 
 from registry_interpreter import RegistryInterpreter
 
+
+def _classify_setup_error(e: Exception) -> str:
+    """Map an on_query enrichment-setup exception to the closed
+    ``extra_status`` "skipped" reason vocabulary (see module docstring).
+
+    Honest-mapping posture: only the two named, message-identified
+    ``DeltaAnalysisState`` guards get their own dedicated reason token;
+    everything else (the ``RegistryInterpreter`` compile-time
+    ``RuntimeError``, any other ``ValueError``, and every ``TypeError``
+    from the curated stdlib's range/dtype/shape checks) is a malformed-
+    ``analysis_config`` problem, not a moves-list problem, so it maps to
+    ``"config_error"``.
+    """
+    if isinstance(e, ValueError):
+        msg = str(e)
+        if "n_moves must be" in msg:
+            return "too_few_moves"
+        if "invalid move color token" in msg:
+            return "invalid_moves"
+    return "config_error"
+
+
 def analysis_enricher(
     link: ProxyLink[ClientId, InternalId],
 ) -> Transformer[KataGoQuery, KataGoResponse]:
     request_cache: Dict[ClientId, DeltaAnalysisState] = {}
+    # Per-eid skip reason, set at on_query time when enrichment setup
+    # failed for a query that was otherwise "in play" (ANALYZE action +
+    # analysis_config present). Consumed in on_response to attach
+    # extra_status; cleaned up on the same forward(eid)-is-None
+    # condition request_cache already uses. eid is never a key in both
+    # dicts at once — a given on_query call either lands the analyzer
+    # in request_cache (success) or a reason here (failure), not both.
+    skip_reasons: Dict[ClientId, str] = {}
 
     def on_query(eid: ClientId, q: KataGoQuery) -> Optional[KataGoQuery]:
         # Read `analysis_config` non-destructively (v1.0.21). The
@@ -78,12 +170,19 @@ def analysis_enricher(
         # central wire-strip is what closes that exposure.
         config = q.opaque.get('analysis_config')
 
-        if (
-            q.action == KataGoAction.ANALYZE
-            and config
-            and q.opaque.get('moves')
-            and len(q.opaque['moves']) > 1
-        ):
+        # "In play" per the extra_status wire contract (module docstring):
+        # ANALYZE action + a truthy analysis_config, independent of
+        # whether the moves-length gate or setup below goes on to
+        # succeed. Every response of an in-play query gets an
+        # extra_status key; queries that are never in play get none.
+        in_play = q.action == KataGoAction.ANALYZE and bool(config)
+
+        if in_play:
+            moves = q.opaque.get('moves')
+            if not moves or len(moves) <= 1:
+                skip_reasons[eid] = "too_few_moves"
+                return q
+
             _log.debug(
                 Event.DIAGNOSTIC, orig=eid,
                 msg=f"analysis_config setup for eid={eid!r}",
@@ -124,6 +223,7 @@ def analysis_enricher(
                         f"Query proceeds without enrichment."
                     ),
                 )
+                skip_reasons[eid] = _classify_setup_error(e)
                 return q
             request_cache[eid] = analyzer
         return q
@@ -131,31 +231,53 @@ def analysis_enricher(
     def on_response(eid: ClientId, r: KataGoResponse) -> Optional[KataGoResponse]:
         # 1. Attempt enrichment
         req_analyzer = request_cache.get(eid)
+        skip_reason = skip_reasons.get(eid)
+        # "In play" per the extra_status wire contract: either a live
+        # analyzer (setup succeeded) or a recorded skip reason (setup
+        # failed) is cached for this eid. request_cache and skip_reasons
+        # are disjoint by construction (on_query populates exactly one
+        # of them per eid), so branching on req_analyzer then skip_reason
+        # below is exhaustive over the "in play" / "not in play" split.
+
         # Tighten the gate from "moveInfos in opaque" (which was already
         # an analyze-only check structurally) to the explicit isinstance
         # narrowing the type system needs. moveInfos remains the second
         # gate because not every analyze response carries it (errors,
         # interrupted searches).
-        if (
-            req_analyzer is not None
-            and isinstance(r, AnalyzeResponse)
-            and "moveInfos" in r.opaque
-        ):
-            try:
-                analysis = req_analyzer.push_packet(r.turn_number, (r.turn_number, r.opaque))
-                r.opaque['extra'] = deepcopy(analysis)
-            except Exception:
-                # asteval defers name resolution inside def-bodies to call
-                # time, so a body that referenced a no-longer-exposed name
-                # (e.g. legacy `np.median(x)`) may compile cleanly in
-                # on_query and only fail here on the first real packet.
-                _log.exception(
-                    Event.DIAGNOSTIC, orig=eid,
-                    msg=f"enrichment failed for eid={eid!r}",
-                )
+        if req_analyzer is not None:
+            if isinstance(r, AnalyzeResponse) and "moveInfos" in r.opaque:
+                try:
+                    analysis = req_analyzer.push_packet(r.turn_number, (r.turn_number, r.opaque))
+                    # extra and the "computed" extra_status are set together,
+                    # in this branch only — this is what makes the coupling
+                    # invariant ("extra present iff extra_status.state ==
+                    # computed") true by construction rather than by
+                    # convention.
+                    r.opaque['extra'] = deepcopy(analysis)
+                    r.opaque['extra_status'] = {"state": "computed"}
+                except Exception:
+                    # asteval defers name resolution inside def-bodies to call
+                    # time, so a body that referenced a no-longer-exposed name
+                    # (e.g. legacy `np.median(x)`) may compile cleanly in
+                    # on_query and only fail here on the first real packet.
+                    _log.exception(
+                        Event.DIAGNOSTIC, orig=eid,
+                        msg=f"enrichment failed for eid={eid!r}",
+                    )
+                    r.opaque['extra_status'] = {
+                        "state": "failed", "reason": "enrichment_exception",
+                    }
+            else:
+                # Enrichment was in play for the query but this particular
+                # response isn't enrichable (not an AnalyzeResponse, or no
+                # moveInfos — errors / interrupted searches).
+                r.opaque['extra_status'] = {"state": "not_applicable"}
+        elif skip_reason is not None:
+            r.opaque['extra_status'] = {"state": "skipped", "reason": skip_reason}
 
         if link.mapping.forward(eid) is None:
             request_cache.pop(eid, None)
+            skip_reasons.pop(eid, None)
 
         return r
 
