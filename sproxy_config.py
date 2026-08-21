@@ -312,9 +312,12 @@ ADVERTISE_CAPABILITIES: bool = (
 # field on analysis queries is matched against these labels; the
 # corresponding URL receives the forwarded query.
 #
-# Format: comma-separated `label=url` entries.
+# Format: comma-separated `label=url` or `label=url|engineModel`
+# entries (the optional `|engineModel` component is v1.0.30
+# engine-model injection; see _parse_selector_models).
 #
 #   SELECTOR_MODELS=strong=ws://host1:41948,weak=ws://host2:41948
+#   SELECTOR_MODELS=main=ws://h:41948|b6c96-s566...,alt=ws://h:41948|b6c96-s694...
 #
 # Whitespace around entries / labels / URLs is trimmed. Empty entries
 # (consecutive commas, leading/trailing whitespace) are skipped.
@@ -329,15 +332,28 @@ ADVERTISE_CAPABILITIES: bool = (
 # var puts the structural difference in configuration space and
 # leaves UPSTREAM_URLS untouched for RELAY / REDIRECT operators.
 
-def _parse_selector_models(raw: str) -> tuple[tuple[str, str], ...]:
-    """Parse SELECTOR_MODELS into an ordered tuple of (label, url) pairs.
+def _parse_selector_models(
+    raw: str,
+) -> tuple[tuple[str, str, Optional[str]], ...]:
+    """Parse SELECTOR_MODELS into (label, url, engine_model) triples.
+
+    Entry format: ``label=url`` or ``label=url|engineModel`` (v1.0.30).
+    The optional ``|engineModel`` component names the engine-side model
+    internalName the SELECTOR mints onto forwarded analyzes for that
+    label — the bridge between the SELECTOR's label namespace and a
+    multi-model engine's internalName namespace. `|` is safe as the
+    separator: it is not a legal unencoded character in a ws URL and
+    does not occur in engine internalNames. Entries without the
+    component parse to engine_model=None and behave exactly as before.
 
     Returns an empty tuple when the env var is absent or blank.
-    Raises ValueError on a malformed entry (no `=` separator); names
-    the offending entry in the message so the operator can locate
-    the problem in their configuration.
+    Raises ValueError on a malformed entry (no `=` separator; empty
+    label, url, or engine-model component); names the offending entry
+    in the message so the operator can locate the problem in their
+    configuration. An empty component after `|` is an error, not a
+    silent None — a trailing `|` is always a config typo.
     """
-    pairs: list[tuple[str, str]] = []
+    triples: list[tuple[str, str, Optional[str]]] = []
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
@@ -346,11 +362,14 @@ def _parse_selector_models(raw: str) -> tuple[tuple[str, str], ...]:
             raise ValueError(
                 f"SELECTOR_MODELS entry {entry!r} is missing a `label=url` "
                 f"separator; expected format is "
-                f"`label1=ws://host1:port1,label2=ws://host2:port2`"
+                f"`label1=ws://host1:port1,label2=ws://host2:port2"
+                f"[|engineModelInternalName]`"
             )
-        label, _, url = entry.partition("=")
+        label, _, rest = entry.partition("=")
         label = label.strip()
-        url = url.strip()
+        url_part, pipe, engine_part = rest.partition("|")
+        url = url_part.strip()
+        engine_model: Optional[str] = engine_part.strip() if pipe else None
         if not label:
             raise ValueError(
                 f"SELECTOR_MODELS entry {entry!r} has an empty label"
@@ -359,11 +378,18 @@ def _parse_selector_models(raw: str) -> tuple[tuple[str, str], ...]:
             raise ValueError(
                 f"SELECTOR_MODELS entry {entry!r} has an empty url"
             )
-        pairs.append((label, url))
-    return tuple(pairs)
+        if pipe and not engine_model:
+            raise ValueError(
+                f"SELECTOR_MODELS entry {entry!r} has a `|` separator "
+                f"but an empty engine-model component; drop the `|` for "
+                f"default-model behaviour or name the engine model "
+                f"(an internalName from the upstream's query_models)"
+            )
+        triples.append((label, url, engine_model))
+    return tuple(triples)
 
 
-SELECTOR_MODELS: tuple[tuple[str, str], ...] = _parse_selector_models(
+SELECTOR_MODELS: tuple[tuple[str, str, Optional[str]], ...] = _parse_selector_models(
     os.environ.get("SELECTOR_MODELS", "")
 )
 

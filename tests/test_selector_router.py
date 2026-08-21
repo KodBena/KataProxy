@@ -7,7 +7,10 @@ Covers all of Phase 2+3's pure and effectful units:
     malformed entries raise ValueError naming the entry).
   - CoalescingPolicy includes "model" in capturing_fields, so two
     queries differing only in `model` produce different content_hashes.
-  - translate_query_to_wire strips "model" via _PROXY_ONLY_FIELDS.
+  - translate_query_to_wire passes "model" through (engine-facing
+    since the v1.0.30 reclassification); SelectorRouter._forward is
+    the single boundary that consumes the label and mints the
+    configured engine internalName (TestEngineModelInjection).
   - SelectorRouter.start validates configuration: empty SELECTOR_MODELS
     and duplicate labels both raise SelectorStartupError.
   - SelectorRouter.dispatch matrix:
@@ -125,9 +128,11 @@ def _populate_post_start_state(
     disconnected_labels = disconnected_labels or []
     unhealthy_labels = unhealthy_labels or []
     sockets: Dict[str, _MockWebSocket] = {}
-    for label, url in router._models:
-        router._url_for_label[label] = url
-        router._failure_budget[label] = router._max_connect_failures
+    for spec in router._models:
+        router._url_for_label[spec.label] = spec.url
+        if spec.engine_model is not None:
+            router._engine_model_for_label[spec.label] = spec.engine_model
+        router._failure_budget[spec.label] = router._max_connect_failures
     for label in healthy_labels:
         ws = _MockWebSocket()
         router._connections[label] = ws
@@ -163,22 +168,46 @@ def _make_analyze_query(
 class TestSelectorModelsParser:
     def test_well_formed_pair(self) -> None:
         assert _parse_selector_models("strong=ws://h1:1") == \
-               (("strong", "ws://h1:1"),)
+               (("strong", "ws://h1:1", None),)
 
     def test_multiple_entries(self) -> None:
         assert _parse_selector_models("strong=ws://h1:1,weak=ws://h2:2") == \
-               (("strong", "ws://h1:1"), ("weak", "ws://h2:2"))
+               (("strong", "ws://h1:1", None), ("weak", "ws://h2:2", None))
+
+    def test_engine_model_component_parsed(self) -> None:
+        assert _parse_selector_models(
+            "main=ws://h:1|b6c96-s1-d1,alt=ws://h:1|b6c96-s2-d2"
+        ) == (
+            ("main", "ws://h:1", "b6c96-s1-d1"),
+            ("alt", "ws://h:1", "b6c96-s2-d2"),
+        )
+
+    def test_engine_model_component_whitespace_trimmed(self) -> None:
+        assert _parse_selector_models(" main = ws://h:1 | b6c96-s1-d1 ") == \
+               (("main", "ws://h:1", "b6c96-s1-d1"),)
+
+    def test_mixed_entries_with_and_without_component(self) -> None:
+        assert _parse_selector_models(
+            "plain=ws://h1:1,tuned=ws://h2:2|b6c96-s1-d1"
+        ) == (
+            ("plain", "ws://h1:1", None),
+            ("tuned", "ws://h2:2", "b6c96-s1-d1"),
+        )
+
+    def test_trailing_pipe_with_empty_component_rejected(self) -> None:
+        with pytest.raises(ValueError, match="empty engine-model"):
+            _parse_selector_models("main=ws://h:1|")
 
     def test_empty_string(self) -> None:
         assert _parse_selector_models("") == ()
 
     def test_whitespace_trimmed(self) -> None:
         assert _parse_selector_models("  strong  =  ws://h1:1  ,  weak=ws://h2:2  ") == \
-               (("strong", "ws://h1:1"), ("weak", "ws://h2:2"))
+               (("strong", "ws://h1:1", None), ("weak", "ws://h2:2", None))
 
     def test_consecutive_commas_skipped(self) -> None:
         assert _parse_selector_models("strong=ws://h1:1,,weak=ws://h2:2") == \
-               (("strong", "ws://h1:1"), ("weak", "ws://h2:2"))
+               (("strong", "ws://h1:1", None), ("weak", "ws://h2:2", None))
 
     def test_missing_separator_raises(self) -> None:
         with pytest.raises(ValueError, match="missing a `label=url` separator"):
@@ -200,7 +229,7 @@ class TestSelectorModelsParser:
         # Configuration order matters: _first_healthy_label walks
         # this order, so the parser must preserve insertion order.
         result = _parse_selector_models("c=ws://3,a=ws://1,b=ws://2")
-        assert [label for label, _ in result] == ["c", "a", "b"]
+        assert [label for label, _url, _em in result] == ["c", "a", "b"]
 
 
 # ===========================================================================
@@ -235,24 +264,104 @@ class TestCoalescingWithModel:
 
 
 # ===========================================================================
-# Wire-strip: model excluded from emitted wire
+# Wire classification (v1.0.30): `model` is engine-facing and passes
+# through the central wire-builder at every role; the SELECTOR's
+# _forward is the single boundary that consumes it (tested in
+# TestEngineModelInjection below). The pre-v1.0.30 pin asserting
+# "model not in wire" enshrined the stale vanilla-KataGo rationale.
 # ===========================================================================
 
 
-class TestWireStripIncludesModel:
-    def test_model_excluded_from_wire(self) -> None:
-        q = _make_analyze_query(model="strong")
+class TestWireModelClassification:
+    def test_model_passes_through_wire_builder(self) -> None:
+        q = _make_analyze_query(model="b6c96-s1-d1")
         wire = translate_query_to_wire(q, "eid-1")
-        assert "model" not in wire
+        assert wire["model"] == "b6c96-s1-d1"
 
-    def test_other_proxy_only_fields_still_excluded(self) -> None:
-        # Sanity: confirm the prior _PROXY_ONLY_FIELDS members still
-        # excluded after the model addition.
+    def test_proxy_only_fields_still_excluded(self) -> None:
         for f in ("cache", "lookup_cache", "replay_final_only",
                   "analysis_config", "capabilities"):
             q = _make_analyze_query(extra_opaque={f: {"any": "value"}})
             wire = translate_query_to_wire(q, "eid-1")
             assert f not in wire, f"{f} leaked through wire-strip"
+
+
+# ===========================================================================
+# Engine-model injection (v1.0.30): _forward is THE label→engine-model
+# boundary. The client's label is consumed unconditionally; the
+# configured engine internalName (if any) is minted in its place —
+# sole writer on the forwarded side.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestEngineModelInjection:
+    async def test_configured_label_mints_engine_model(self) -> None:
+        router = _make_router(models=(
+            ("main", "ws://h1:1", "b6c96-s1-d1"),
+            ("alt", "ws://h1:1", "b6c96-s2-d2"),
+        ))
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["main", "alt"]
+        )
+
+        async def on_response(_c: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_c: CanonicalId) -> None: pass
+
+        q = _make_analyze_query(model="alt")
+        wire = translate_query_to_wire(q, "cid-inj")
+        assert wire["model"] == "alt"  # label present pre-boundary
+        await router.dispatch(CanonicalId("cid-inj"), wire, q, on_response, on_complete)
+
+        sent = json.loads(sockets["alt"].sent[0])
+        assert sent["model"] == "b6c96-s2-d2"
+        assert sockets["main"].sent == []
+        # The caller's wire_dict is not mutated (copy-on-write).
+        assert wire["model"] == "alt"
+
+    async def test_unconfigured_label_forwards_no_model(self) -> None:
+        # A label without an engine_model component must never leak the
+        # label upstream (a multi-model engine would refuse it as an
+        # unknown internalName) — byte-identical to pre-v1.0.30 wire.
+        router = _make_router()  # default fixture: no engine models
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["strong", "weak"]
+        )
+
+        async def on_response(_c: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_c: CanonicalId) -> None: pass
+
+        q = _make_analyze_query(model="strong")
+        wire = translate_query_to_wire(q, "cid-noinj")
+        await router.dispatch(CanonicalId("cid-noinj"), wire, q, on_response, on_complete)
+        assert "model" not in json.loads(sockets["strong"].sent[0])
+
+    async def test_broadcast_never_carries_model(self) -> None:
+        # Broadcast actions reach EVERY upstream; a label (or any
+        # client-supplied model value) has no meaning there and a
+        # multi-model engine would hard-refuse it.
+        router = _make_router(models=(
+            ("main", "ws://h1:1", "b6c96-s1-d1"),
+            ("alt", "ws://h2:2", "b6c96-s2-d2"),
+        ))
+        sockets = _populate_post_start_state(
+            router, healthy_labels=["main", "alt"]
+        )
+
+        async def on_response(_c: CanonicalId, _w: Dict[str, Any]) -> None: pass
+        async def on_complete(_c: CanonicalId) -> None: pass
+
+        q = KataGoQuery(
+            action=KataGoAction.QUERY_VERSION,
+            opaque={"model": "main"},
+        )
+        wire = translate_query_to_wire(q, "cid-bc")
+        await router.dispatch(CanonicalId("cid-bc"), wire, q, on_response, on_complete)
+        for label, ws in sockets.items():
+            for frame in ws.sent:
+                assert "model" not in json.loads(frame), (
+                    f"model leaked to {label} on broadcast"
+                )
 
 
 # ===========================================================================
@@ -367,9 +476,9 @@ class TestSelectorDispatch:
         # Forwarded to "strong", not "weak".
         assert len(sockets["strong"].sent) == 1
         assert sockets["weak"].sent == []
-        # Wire forwarded does not have `model` (stripped by
-        # translate_query_to_wire — verified above in TestWireStripIncludesModel).
         sent_wire = json.loads(sockets["strong"].sent[0])
+        # v1.0.30: the label is consumed at the _forward boundary; with
+        # no engine_model configured, nothing replaces it.
         assert "model" not in sent_wire
         # No synthetic response yet — it comes from the upstream.
         assert responses == []

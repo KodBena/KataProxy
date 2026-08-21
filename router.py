@@ -40,7 +40,7 @@ import logging
 import secrets
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Any, Awaitable, Callable, Deque, Optional
+from typing import Any, Awaitable, Callable, Deque, NamedTuple, Optional
 
 from AbstractProxy.proxy_core import CanonicalId, WireId
 
@@ -1080,6 +1080,22 @@ class LeafRouter(BackendRouter):
 class RelayRouter(BackendRouter):
     """Routes queries to upstream SovereignProxy nodes via WebSocket.
 
+    MODEL-ROSTER CONTRACT (v1.0.30, documented — not yet mechanically
+    checked): since ``model`` is engine-facing and forwarded verbatim
+    (see katago/katago_proxy.py:_PROXY_ONLY_FIELDS), the RELAY's
+    "interchangeable upstreams" invariant extends to the model roster —
+    every ring member must honor the same set of engine internalNames.
+    A divergent member is not silent: the engine's own structured
+    refusal (naming its selectable models) propagates to the asking
+    client, and hash-ring determinism means a given query lands on the
+    same member consistently — loud, but a misconfiguration the
+    operator must fix by upgrading/aligning ring members. A mechanical
+    admission-time roster check (query_models on connect, refuse
+    divergent members) is the ADR-0016-shaped follow-up; it is not
+    bundled here because vanilla-engine rings cannot answer
+    query_models and the check adds a connect-time handshake state
+    machine that needs its own arc.
+
     Selection policy (single-target, per-query actions):
       1. Hash canonical_id through the ring → preferred upstream.
       2. Walk the ring until a connected node with load < max_load is found.
@@ -1596,6 +1612,29 @@ class RelayRouter(BackendRouter):
 # SelectorRouter
 # ---------------------------------------------------------------------------
 
+class SelectorModel(NamedTuple):
+    """One SELECTOR_MODELS entry: a label, its upstream, and optionally
+    the engine-side model the SELECTOR mints onto forwarded analyzes.
+
+    `engine_model` (v1.0.30) is the OPTIONAL engine internalName
+    injected as the forwarded wire's "model" field by `_forward` —
+    the composition bridge between the SELECTOR's label namespace and
+    a multi-model engine's internalName namespace
+    (`SELECTOR_MODELS=label=ws://host:port|internalName`). `None`
+    (the default, and the parse result for entries without a `|`
+    component) preserves the pre-v1.0.30 wire byte-identically: the
+    upstream engine answers with its own default model.
+
+    NamedTuple (not a dataclass) so pre-existing `(label, url)`
+    2-tuples — every deployed config and test constructor — normalise
+    via `SelectorModel(*pair)` with `engine_model` defaulting to None.
+    """
+
+    label: str
+    url: str
+    engine_model: Optional[str] = None
+
+
 class SelectorRouter(BackendRouter):
     """Routes queries by `model` field to labelled upstream LEAFs.
 
@@ -1672,10 +1711,16 @@ class SelectorRouter(BackendRouter):
 
     def __init__(
         self,
-        models: tuple[tuple[str, str], ...],
+        models: tuple[tuple[str, ...], ...],
         max_connect_failures: Optional[int] = None,
     ) -> None:
-        self._models = models
+        # Normalise: accept both legacy (label, url) 2-tuples and
+        # (label, url, engine_model) 3-tuples / SelectorModel entries.
+        # One normalisation site, so everything downstream reads the
+        # typed record instead of positional unpacking.
+        self._models: tuple[SelectorModel, ...] = tuple(
+            SelectorModel(*m) for m in models
+        )
         self._max_connect_failures = (
             self._MAX_CONNECT_FAILURES
             if max_connect_failures is None
@@ -1685,6 +1730,16 @@ class SelectorRouter(BackendRouter):
         # label validation; an explicit dict makes the dispatch lookup
         # explicit rather than scanning the ordered tuple every query.
         self._url_for_label: dict[str, str] = {}
+        # Label → engine internalName to mint onto forwarded analyzes
+        # (v1.0.30 engine-model injection). Populated in start() from
+        # SelectorModel.engine_model; absent label → no injection,
+        # pre-v1.0.30 wire byte-identically. SOLE writer of the
+        # forwarded "model" key BECAUSE _forward unconditionally pops
+        # the client's value (the label) from the wire before minting —
+        # the wire-builder passes "model" through since the v1.0.30
+        # reclassification, so the pop at the boundary, not any central
+        # strip, is what makes this config the only upstream source.
+        self._engine_model_for_label: dict[str, str] = {}
         # Label → live websocket. Absent → not currently connected
         # (either reconnecting within budget or marked unhealthy).
         # ws is typed as Any because the websockets library has no
@@ -1737,16 +1792,18 @@ class SelectorRouter(BackendRouter):
                 "label1=ws://host1:port1,label2=ws://host2:port2)"
             )
         seen: set[str] = set()
-        for label, url in self._models:
-            if label in seen:
+        for spec in self._models:
+            if spec.label in seen:
                 raise SelectorStartupError(
-                    f"duplicate label {label!r} in SELECTOR_MODELS; "
+                    f"duplicate label {spec.label!r} in SELECTOR_MODELS; "
                     f"each label must be unique so the routing table "
                     f"is unambiguous"
                 )
-            seen.add(label)
-            self._url_for_label[label] = url
-            self._failure_budget[label] = self._max_connect_failures
+            seen.add(spec.label)
+            self._url_for_label[spec.label] = spec.url
+            if spec.engine_model is not None:
+                self._engine_model_for_label[spec.label] = spec.engine_model
+            self._failure_budget[spec.label] = self._max_connect_failures
 
         labels = list(self._url_for_label.keys())
         self._log.info(
@@ -2014,9 +2071,9 @@ class SelectorRouter(BackendRouter):
         the SPA.
         """
         return [
-            label for label, _url in self._models
-            if label in self._connections
-            and label not in self._unhealthy_models
+            spec.label for spec in self._models
+            if spec.label in self._connections
+            and spec.label not in self._unhealthy_models
         ]
 
     async def _send_synthetic_response(
@@ -2084,8 +2141,8 @@ class SelectorRouter(BackendRouter):
             await self._send_synthetic_response(
                 canonical_id,
                 {"models": [
-                    {"label": label, "healthy": label in healthy}
-                    for label, _ in self._models
+                    {"label": spec.label, "healthy": spec.label in healthy}
+                    for spec in self._models
                 ]},
                 on_response,
                 on_complete,
@@ -2203,10 +2260,16 @@ class SelectorRouter(BackendRouter):
     ) -> None:
         """Forward wire_dict to the labelled upstream's WebSocket.
 
-        ``wire_dict`` already has ``model`` stripped by the central
-        wire-strip in ``translate_query_to_wire`` (the ``model`` field
-        is in ``_PROXY_ONLY_FIELDS``). Vanilla KataGo on the upstream
-        side never sees the field.
+        THE namespace boundary (v1.0.30): ``wire_dict`` arrives
+        carrying the client's ``model`` — the SELECTOR *label* that
+        chose this upstream. The label is meaningful only on the
+        client↔SELECTOR edge, so it is unconditionally consumed here;
+        when the label's config carries an ``engine_model`` component,
+        that engine internalName is minted in its place (sole writer on
+        the forwarded side — the client's value never crosses).
+        Labels without the component forward no ``model`` at all —
+        byte-identical to the pre-v1.0.30 wire, so vanilla upstreams
+        and default-model behaviour are untouched.
 
         Disconnected (within retry budget) → structured error: the
         operator may have a transient blip; the SPA can retry. We don't
@@ -2233,6 +2296,18 @@ class SelectorRouter(BackendRouter):
                 field="model",
             )
             return
+        # Label → engine-model translation (v1.0.30). Copy-on-write —
+        # the caller's dict is not mutated. The pop is UNCONDITIONAL:
+        # a label leaking upstream would be refused by a multi-model
+        # engine as an unknown internalName, breaking every deployed
+        # label-only config. The mint is guarded to ANALYZE for
+        # totality under dispatch drift: today _forward only serves
+        # ANALYZE, and the engine hard-refuses "model" on any other
+        # action.
+        wire_dict = {k: v for k, v in wire_dict.items() if k != "model"}
+        injected = self._engine_model_for_label.get(label)
+        if injected is not None and query.action == KataGoAction.ANALYZE:
+            wire_dict = {**wire_dict, "model": injected}
         lifecycle.dispatch(
             self._log, cid=canonical_id, orig=canonical_id,
             action=query.action.name, label=label,
@@ -2307,6 +2382,27 @@ class SelectorRouter(BackendRouter):
         upstream's send raised); a structured error is returned in
         that case rather than a hung canonical.
         """
+        # v1.0.30: at the SELECTOR tier a wire "model" value is
+        # label-namespace and must not leak upstream (the label→engine
+        # translation in _forward has no meaning on a broadcast that
+        # reaches EVERY upstream, and a multi-model engine would
+        # hard-refuse the unknown name). Broadcast actions carry no
+        # model semantics; drop the field — logged, since this is a
+        # discard of client input at a boundary that otherwise refuses
+        # loudly (byte-compatible with the pre-v1.0.30 central strip).
+        if "model" in wire_dict:
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                cid=canonical_id,
+                msg=(
+                    f"dropping label-namespace model="
+                    f"{wire_dict['model']!r} from broadcast "
+                    f"{query.action.name} (no model semantics on fanout)"
+                ),
+            )
+            wire_dict = {
+                k: v for k, v in wire_dict.items() if k != "model"
+            }
         healthy = self._healthy_labels()
         if not healthy:
             self._log.error(

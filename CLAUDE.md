@@ -259,6 +259,29 @@ The companion regression-test files are:
     `tests/diagnose_watchdog_relay.py` (topology-level RELAY + N
     phantom upstreams heartbeat broadcast).
 
+## The model field and the label→engine boundary (v1.0.30)
+
+The wire key `model` is ENGINE-FACING everywhere except the
+client↔SELECTOR edge. The engine (multi-model builds) reads it as a
+hosted-model internalName and refuses unknown names loudly; RELAY and
+LEAF forward it verbatim (stripping it was the cache-poisoning shape:
+both hub keys discriminated on a value the wire discarded). The ONE
+namespace boundary is `SelectorRouter._forward`: the client's value is
+a SELECTOR label, consumed unconditionally there and replaced by the
+label's configured engine internalName
+(`SELECTOR_MODELS=label=url|internalName`) or by nothing. Three
+consequences any new router author must preserve:
+
+  1. Single-writer: on the SELECTOR's forwarded side, only config ever
+     populates `model`. Client values die at the boundary.
+  2. RELAY ring members must share a model roster (documented contract;
+     the engine's per-query refusal is the loud backstop; a mechanical
+     admission-time query_models check is the named follow-up).
+  3. The replay-cache key is salted with the SELECTOR's
+     label→url|engine mapping (`PubSubHub.cache_key_salt`), so a config
+     remap misses instead of replaying the old mapping's streams. Any
+     future config hot-reload must rebuild the hub (or the salt) too.
+
 ## Logging conventions (load-bearing for the structured envelope)
 
 The proxy's log surface is structured: a closed `Event` vocabulary,

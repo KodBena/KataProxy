@@ -208,11 +208,15 @@ class CoalescingPolicy:
         # after the hash is computed (see also the central wire-strip
         # discipline in katago/katago_proxy.py:translate_query_to_wire).
         "capabilities",
-        # Same shape as `capabilities`: SELECTOR routes by `model`,
-        # so two queries differing only in `model` go to different
-        # upstreams and produce different responses. Stripped post-hash
-        # in subscribe(); excluded from the wire by the central
-        # _PROXY_ONLY_FIELDS strip.
+        # `model` participates in coalescing identity at every tier:
+        # at SELECTOR it is the routing label (different labels →
+        # different upstreams), at RELAY/LEAF it is the engine-facing
+        # internalName (different models → different engine output;
+        # engine-facing since the v1.0.30 reclassification — see
+        # katago/katago_proxy.py:_PROXY_ONLY_FIELDS). NOT popped in
+        # subscribe(): SelectorRouter reads it from query.opaque, and
+        # the SELECTOR's _forward is the single boundary that consumes
+        # it from the forwarded wire.
         "model",
     )
 
@@ -307,10 +311,23 @@ class PubSubHub:
         policy: CoalescingPolicy = DEFAULT_POLICY,
         canonical_id_generator: Optional[Callable[[], CanonicalId]] = None,
         cache_store: Optional[CacheStore] = None,
+        cache_key_salt: str = "",
     ) -> None:
         self._policy = policy
         self._gen = canonical_id_generator or _default_canonical_id
         self._cache_store = cache_store
+        # Deployment-configuration salt folded into every replay-cache
+        # key (v1.0.30). Injected by the composition root (ProxyServer)
+        # so the hub stays free of router/config knowledge. Rationale:
+        # a cached raw stream is only replayable while the deployment
+        # mapping that produced it holds (e.g. SELECTOR label →
+        # engine-model injection: remapping a label must MISS, not
+        # replay the old model's answers). In-process memory caches
+        # get this for free today; the salt makes the soundness local
+        # and unconditional — including under the CacheStore Protocol's
+        # invited persistent backends — instead of resting on
+        # "no persistence, no reload" preconditions.
+        self._cache_key_salt = cache_key_salt
         # content_hash → InFlightEntry. The content_hash is a hex digest
         # — NOT an identity in the namespace sense; stays `str`.
         self._by_hash: dict[str, InFlightEntry] = {}
@@ -366,17 +383,23 @@ class PubSubHub:
         do not affect engine output — the three cache-control flags,
         already stripped in subscribe(), plus `analysis_config` and
         `capabilities`, which are evaluated by proxy-side transformers/
-        middleware and never reach the engine). `model` is a proxy-only
-        field too, but it routes to a different upstream engine under
-        SELECTOR and so stays in the key — see the classification rule
-        at `katago/katago_proxy.py:CACHE_KEY_EXCLUDED_FIELDS`, the
-        single source of truth for this exclusion; this hub applies it,
-        never hand-copies it.
+        middleware and never reach the engine). `model` is an ordinary
+        engine-facing opaque field since v1.0.30 and participates in
+        the key by default (at SELECTOR it selects which upstream
+        answers; at RELAY/LEAF which hosted model computes) — see the
+        classification rule at
+        `katago/katago_proxy.py:CACHE_KEY_EXCLUDED_FIELDS`, the single
+        source of truth for this exclusion; this hub applies it, never
+        hand-copies it. The deployment salt (`cache_key_salt`,
+        constructor) is folded in additionally, so a changed SELECTOR
+        label→engine mapping misses instead of replaying stale streams.
         This is deliberately different from the coalescing content_hash.
         """
         data: dict[str, Any] = {
             "action": query.action.name,
         }
+        if self._cache_key_salt:
+            data["__deployment_salt"] = self._cache_key_salt
         if query.analyze_turns:
             data["analyzeTurns"] = sorted(query.analyze_turns)
 

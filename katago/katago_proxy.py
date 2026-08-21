@@ -521,15 +521,23 @@ _PROXY_ONLY_FIELDS: frozenset[str] = frozenset({
     "replay_final_only",
     "analysis_config",
     "capabilities",
-    # SELECTOR (v1.0.15): the `model` field is read by SelectorRouter
-    # to choose which upstream LEAF receives the query, then stripped
-    # by this central wire-strip before forwarding. Vanilla KataGo does
-    # not understand the field; this discipline prevents leakage into
-    # the engine regardless of which router serves the role. The field
-    # is intentionally NOT popped in pubsub_hub.subscribe (unlike
-    # `capabilities`), so SelectorRouter can read it from query.opaque
-    # to choose the upstream; the central strip handles the wire side.
-    "model",
+    # `model` (v1.0.15 – v1.0.29) used to be a member: SelectorRouter
+    # read it as a routing label and this central strip erased it from
+    # every forwarded wire, at every role, on the rationale "vanilla
+    # KataGo does not understand the field". That rationale is stale:
+    # the engine now hosts multiple models and reads a top-level
+    # "model" (an engine internalName) as a first-class query
+    # parameter, refusing unknown names loudly. `model` is therefore
+    # reclassified (v1.0.30) as an ENGINE-FACING field: RELAY and LEAF
+    # forward it verbatim (the engine owns validation — silent
+    # stripping was the cache-poisoning shape: both hub keys
+    # discriminate on a value the wire discarded), and the ONE
+    # namespace boundary is SelectorRouter._forward, which
+    # unconditionally consumes the client's label from the wire and
+    # mints the label's configured engine internalName in its place
+    # (or forwards no model at all when none is configured). The field
+    # is still intentionally NOT popped in pubsub_hub.subscribe, so
+    # SelectorRouter can read the label from query.opaque.
 })
 
 
@@ -554,19 +562,22 @@ _PROXY_ONLY_FIELDS: frozenset[str] = frozenset({
 #     engage, not what the engine computes. Same reasoning as
 #     `analysis_config`: proxy-side-only effect, must not discriminate
 #     the engine-facing cache key.
-#   - `model` — SELECTOR reads this to choose the upstream KataGo
-#     instance a query is routed to. Different models produce
-#     genuinely different engine output, so `model` DOES affect the
-#     raw backend stream and must stay in the cache key despite being
-#     proxy-only (stripped from the wire, never seen by the chosen
-#     engine itself, but it changes *which* engine answers).
+#   - `model` — no longer a member (reclassified engine-facing in
+#     v1.0.30; see the `_PROXY_ONLY_FIELDS` comment). As an ordinary
+#     opaque field it participates in the cache key by default, which
+#     is correct twice over: at RELAY/LEAF it selects which hosted
+#     model the engine computes with, and at SELECTOR it is the label
+#     that selects which upstream answers. The SELECTOR's label →
+#     engine-model config additionally salts the whole key
+#     (PubSubHub.cache_key_salt), so remapping a label can never
+#     replay the old mapping's streams.
 #
 # This enumeration is load-bearing: every future addition to
 # `_PROXY_ONLY_FIELDS` must explicitly decide its membership here rather
 # than inheriting a default. `pubsub_hub.py` imports this frozenset and
 # applies it directly — it must never hand-copy or re-derive the field
 # list, so there is exactly one writer of this classification.
-CACHE_KEY_EXCLUDED_FIELDS: frozenset[str] = _PROXY_ONLY_FIELDS - {"model"}
+CACHE_KEY_EXCLUDED_FIELDS: frozenset[str] = _PROXY_ONLY_FIELDS
 
 
 def translate_query_to_wire(query: KataGoQuery, envelope_id: str) -> dict[str, Any]:

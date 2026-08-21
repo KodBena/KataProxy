@@ -265,10 +265,10 @@ class TestSelectorCoverage:
             max_connect_failures=3,
         )
         # Bypass start(): populate state.
-        for label, url in router._models:
+        for label, url, _em in router._models:
             router._url_for_label[label] = url
             router._failure_budget[label] = router._max_connect_failures
-        sockets = {label: _MockWebSocket(label) for label, _ in router._models}
+        sockets = {label: _MockWebSocket(label) for label, _u, _e in router._models}
         for label, ws in sockets.items():
             router._connections[label] = ws
 
@@ -290,10 +290,10 @@ class TestSelectorCoverage:
         router = SelectorRouter(
             models=(("strong", "ws://h1:1"), ("weak", "ws://h2:2")),
         )
-        for label, url in router._models:
+        for label, url, _em in router._models:
             router._url_for_label[label] = url
             router._failure_budget[label] = 3
-        for label, _ in router._models:
+        for label, _u, _e in router._models:
             router._connections[label] = _MockWebSocket(label)
 
         async def on_response(_cid: CanonicalId, _w: Dict[str, Any]) -> None: pass

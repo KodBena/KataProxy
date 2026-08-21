@@ -8,6 +8,14 @@ the `selector` capability advertisement (Ask 2). Written 2026-05-09
 against proxy v1.0.14. Authoritative for the `feat/selector-router`
 branch; superseded by the v1.0.15 release notes once tagged.
 
+> **Superseded in part (v1.0.30):** this document's "`model` …
+> never reaches engine, joins `_PROXY_ONLY_FIELDS`" framing describes
+> v1.0.15–v1.0.29. Since v1.0.30 `model` is engine-facing: RELAY/LEAF
+> forward it verbatim, and `SelectorRouter._forward` is the single
+> label→engine-model boundary (see `CLAUDE.md` § "The model field and
+> the label→engine boundary"). The planning-time text below is
+> preserved verbatim as the point-in-time record.
+
 This document is **scoped to the proxy submodule**. Wire-shape
 additions: a new optional `model: string` field on the analysis
 query (proxy-interpreted, never reaches engine, joins

@@ -1255,7 +1255,19 @@ class ProxyServer:
                     "by client-driven {\"cache\": true} traffic"
                 ),
             )
-        self._hub = PubSubHub(cache_store=self._hub_cache)
+        # Replay-cache deployment salt: the SELECTOR's label → upstream
+        # / engine-model mapping shapes which engine answers a query,
+        # so a config change must invalidate replays rather than serve
+        # the old mapping's streams (v1.0.30; empty and inert for the
+        # other roles — cfg.SELECTOR_MODELS is () there).
+        cache_key_salt = (
+            json.dumps(cfg.SELECTOR_MODELS, sort_keys=True)
+            if cfg.SELECTOR_MODELS else ""
+        )
+        self._hub = PubSubHub(
+            cache_store=self._hub_cache,
+            cache_key_salt=cache_key_salt,
+        )
         self._router: Optional[BackendRouter] = None
         self._rr_state: Dict[str, Any] = {"counter": 0}
         # Concurrent-session bookkeeping (audit M-1). Capped via

@@ -14,8 +14,9 @@ transformer runs. Result: changing the palette forced a full engine
 re-run, defeating FRAMEWORK.md §3's documented purpose ("replay through
 transformers with the new parameters ... as if from a live GPU").
 
-The fix: ``katago/katago_proxy.py:CACHE_KEY_EXCLUDED_FIELDS`` (derived
-from ``_PROXY_ONLY_FIELDS`` minus ``"model"``) is the single source of
+The fix: ``katago/katago_proxy.py:CACHE_KEY_EXCLUDED_FIELDS`` (equal to
+``_PROXY_ONLY_FIELDS`` since the v1.0.30 reclassification of ``model``
+as engine-facing) is the single source of
 truth for which proxy-only fields don't affect engine output;
 ``pubsub_hub.py:_compute_cache_key`` imports and applies it instead of
 hashing the full opaque.
@@ -258,6 +259,39 @@ class TestEngineFacingFieldsStillDiscriminate:
         baseline = _engine_query(cache=True, model="b18-fast")
         varied = _engine_query(model="b18-strong")
         await self._assert_miss(baseline, varied)
+
+
+# ---------------------------------------------------------------------------
+# 2b. Deployment salt (v1.0.30): a changed SELECTOR label→engine
+# mapping must MISS rather than replay the old mapping's streams;
+# an empty salt leaves keys exactly as before.
+# ---------------------------------------------------------------------------
+
+
+class TestCacheKeySalt:
+    def test_empty_salt_leaves_key_unchanged(self) -> None:
+        q = _engine_query(model="main")
+        unsalted = PubSubHub()._compute_cache_key(q)
+        empty = PubSubHub(cache_key_salt="")._compute_cache_key(q)
+        assert unsalted == empty
+
+    def test_different_salts_produce_different_keys(self) -> None:
+        q = _engine_query(model="main")
+        k1 = PubSubHub(
+            cache_key_salt='[["main","ws://h:1","b6c96-s1-d1"]]'
+        )._compute_cache_key(q)
+        k2 = PubSubHub(
+            cache_key_salt='[["main","ws://h:1","b6c96-s2-d2"]]'
+        )._compute_cache_key(q)
+        assert k1 != k2
+
+    def test_same_salt_is_stable(self) -> None:
+        q = _engine_query(model="main")
+        salt = '[["main","ws://h:1","b6c96-s1-d1"]]'
+        assert (
+            PubSubHub(cache_key_salt=salt)._compute_cache_key(q)
+            == PubSubHub(cache_key_salt=salt)._compute_cache_key(q)
+        )
 
 
 # ---------------------------------------------------------------------------
