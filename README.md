@@ -290,11 +290,23 @@ defensively (or special-cased the hang) can stop.
   `"model": "<internalName>"`, lists them via `query_models`, and
   refuses unknown names with the selectable set named.
 
-### 4. Engine cache actions (direct-to-engine only)
+### 4. Engine cache actions
 
-The proxy does not forward cache verbs (`cache_attach` etc.) — they now
+~~The proxy does not forward cache verbs (`cache_attach` etc.) — they now
 draw the structured refusal of item 1 instead of hanging. If you drive
-the engine's cache actions DIRECTLY, note (KataGo repo, current branch):
+the engine's cache actions DIRECTLY, note (KataGo repo, current branch):~~
+
+*(Struck 2026-08-21, maintainer-authorized correction, NOT validated
+against the documentation corpus — the full consult that would validate
+it was deliberately not run; trust `c3f4743`'s commit message over this
+paragraph where they disagree.)* Since `c3f4743` the four cache verbs
+(`cache_attach` / `cache_detach` / `cache_dump` / `cache_stats`) ARE in
+the proxy vocabulary: SELECTOR label-routes them like analyze (the
+label's engine-model component is minted onto the verb), LEAF forwards
+them verbatim, RELAY broadcast-aggregates one reply per configured ring
+member (`PROXY_CACHE_VERB_TIMEOUT_S` bounds stragglers). Whether you
+drive the engine's cache actions through the proxy or DIRECTLY, note
+(KataGo repo, current branch):
 
 - The admission bound is `"minObservations"`; the old `"minLookups"`
   key is refused with teaching text. Counts are per-context observation
