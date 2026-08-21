@@ -214,16 +214,33 @@ def response_completion_signal(response: KataGoResponse) -> tuple[int, bool]:
     """Translate a KataGoResponse to the (discriminator, is_partial)
     tuple that CompletionTracker.signal expects.
 
-    Metadata responses are single-shot; the synthetic (0, False) pairs
-    with the `[0]` discriminator set that `register_query_completion`
-    installs for non-analyze queries. This is the one named place where
-    the variant model meets the completion-tracking abstraction;
-    `make_katago_removal_predicate` and the two `tracker.signal` call
-    sites in `router.py` all delegate here so the bridge is spelled
-    once.
+    Metadata responses are single-shot — EXCEPT warning envelopes,
+    which are non-terminal (see the inline comment below); the
+    synthetic (0, False) pairs with the `[0]` discriminator set that
+    `register_query_completion` installs for non-analyze queries. This
+    is the one named place where the variant model meets the
+    completion-tracking abstraction; `make_katago_removal_predicate`
+    and the three `tracker.signal` call sites in `router.py` (the
+    LEAF, RELAY, and SELECTOR read loops) all delegate here so the
+    bridge is spelled once.
     """
     if isinstance(response, AnalyzeResponse):
         return response.turn_number, response.is_during_search
+    # Warning envelopes ({"id", "field", "warning"}, no "error") are
+    # NON-terminal: the engine emits them *before* the responses the
+    # query is still owed (e.g. warnUnusedFields on an analyze with a
+    # stray field), on the same id. Treating them as the single-shot
+    # metadata completion retired the query's outstanding turn at the
+    # router, so the real analyze responses that followed were dropped
+    # at the "no callback" branch and the client hung on a query the
+    # engine answered — witnessed live against the model-and-cache
+    # engine build (2026-08-21; warning relayed, result never
+    # delivered, direct-to-engine control received both). `is_partial=
+    # True` is the honest classification: mid-stream information that
+    # completes nothing. An error envelope stays terminal — the engine
+    # refuses INSTEAD of answering, so the error is the stream's end.
+    if "warning" in response.opaque and "error" not in response.opaque:
+        return 0, True
     return 0, False
 
 
