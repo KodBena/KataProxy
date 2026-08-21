@@ -230,3 +230,89 @@ the full boundary documentation and downstream redistribution requirements.
 Bug reports and pull requests are welcome via GitHub. There are no formal
 contribution guidelines yet; pragmatic patches with clear commit messages
 are appreciated.
+
+---
+
+## Client impact — 2026-08 cache & model-selection arc
+
+What changed for CLIENTS (OmegaGo and any other consumer of the proxy's
+WebSocket) in commits `2812423..0eca42b`. Written for a reader who saw
+none of the underlying work. Implementation details live in the commit
+messages; this section is only what you observe on the wire.
+
+### 1. Requests that used to hang now get structured errors
+
+Previously some malformed-but-well-meaning requests were logged
+server-side and never answered; the client waited out its own timeout.
+Now every well-formed JSON request gets a reply. One error shape is used
+everywhere, by the proxy and by the engine alike:
+
+```json
+{"id": "<your id, when safely echoable>", "error": "<teaching text>", "field": "<offending field>"}
+```
+
+(`id` and `field` may be absent; `error` is always present.)
+
+- Unknown/unmatched `action` values are refused with the accepted action
+  vocabulary named in the text (`2812423`).
+- A query whose `terminateId` names no in-flight query is refused,
+  naming the field and the unresolvable id (`16f8639`).
+- Terminating an already-completed query is still silently tolerated
+  (fire-and-forget terminates keep working exactly as before).
+
+If your code has timeout-based workarounds for "the proxy sometimes
+says nothing", you can replace them with an error handler on this shape.
+
+### 2. Queries with unknown fields no longer hang through the proxy
+
+The engine warns about unexpected fields (`warnUnusedFields`) with a
+`{"id", "field", "warning"}` message BEFORE the real responses. The
+proxy used to treat that warning as the query's completion and drop the
+real answers — the client saw the warning, then silence. Fixed in
+`3c5d05d`: the warning is delivered as non-terminal metadata and the
+analysis results follow normally. Clients that stripped fields
+defensively (or special-cased the hang) can stop.
+
+### 3. Model selection
+
+- Nothing changes in the client vocabulary: on a SELECTOR you still
+  send `"model": "<label>"` on analyze queries, and `query_models`
+  still returns the label list (`{"models": [{"label", "healthy"}]}`).
+- NEW, config-side only (`0eca42b`): a SELECTOR label may carry an
+  engine-model component — `SELECTOR_MODELS=label=url|internalName` —
+  letting one multi-model engine serve several labels. To clients this
+  is invisible except as more labels in `query_models`. Client-supplied
+  `model` values are consumed at the SELECTOR exactly as before; engine
+  internalNames are never a client concern through the proxy.
+- Direct-to-engine clients (no proxy): the KataGo build (`2d82734a`,
+  KataGo repo) hosts extra models via `-extra-model` /
+  `extraModelFile0..N` config keys, selects per-query by
+  `"model": "<internalName>"`, lists them via `query_models`, and
+  refuses unknown names with the selectable set named.
+
+### 4. Engine cache actions (direct-to-engine only)
+
+The proxy does not forward cache verbs (`cache_attach` etc.) — they now
+draw the structured refusal of item 1 instead of hanging. If you drive
+the engine's cache actions DIRECTLY, note (KataGo repo, current branch):
+
+- The admission bound is `"minObservations"`; the old `"minLookups"`
+  key is refused with teaching text. Counts are per-context observation
+  counts (demands for a key), not retrieval counts.
+- Omitting the admission bound defaults to `"minObservations": 2`
+  (store what has been demanded at least twice).
+- Old-format `.nncounts` files (format version 1) are refused with
+  guidance: delete the `.nncounts`, keep the `.nnevals`
+  (FORMAT_VERSION is now 2).
+- `cacheContext` on analyze queries passes through the proxy untouched
+  (it is an ordinary engine-facing field).
+
+### 5. Rollout notes for operators
+
+- All proxy changes above are on `fable-branch`, `2812423..0eca42b`
+  plus this addendum. Running proxies pick them up ONLY on restart.
+- Existing label-only `SELECTOR_MODELS` configs behave byte-identically
+  (witnessed by transcript diff against the pre-change baseline).
+- Upgrade RELAYs before (or together with) any SELECTOR that uses the
+  new `|internalName` component — an old RELAY between them silently
+  strips the injected model.
