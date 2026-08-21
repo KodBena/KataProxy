@@ -85,6 +85,7 @@ from katago import (
     translate_query_to_wire,
     translate_response_to_wire,
     KATAGO_QUERY_PRISMS,
+    SUPPORTED_WIRE_ACTIONS,
 )
 from AbstractProxy.proxy_core import (
     CanonicalId,
@@ -476,6 +477,12 @@ class ClientSession:
                         f"(looks like a query but no prism matched)"
                     ),
                 )
+                # ADR-0012 P2: the boundary refuses what it cannot
+                # honor — to the party that asked, not only to the
+                # operator log above (which stays). Only this branch
+                # replies: alien JSON and non-JSON frames stay silent
+                # so the bot-noise floor never reaches the wire.
+                await self._refuse_unmatched(outer)
             else:
                 self._log.error(
                     Event.PARSE_ERROR,
@@ -501,6 +508,96 @@ class ClientSession:
             # Notify middleware BEFORE routing so it can record expected turn count.
             self._middleware.on_query(orig_id, query)
             await self._handle_query(orig_id, query)
+
+    # Bounds on client-supplied strings the parse-layer refusal echoes
+    # back. An `id` above the echo bound (or of non-str type — a wire
+    # protocol violation in itself) is omitted from the reply rather
+    # than laundered back: the client degrades to today's no-reply
+    # correlation, and the refusal cannot be used as an amplifier for
+    # attacker-chosen payloads. The action excerpt is display-only, so
+    # it truncates instead.
+    _REFUSAL_ID_ECHO_MAX: int = 1024
+    _REFUSAL_ACTION_ECHO_MAX: int = 80
+
+    async def _refuse_unmatched(self, outer: Dict[str, Any]) -> None:
+        """Send a structured refusal for a well-formed JSON dict that
+        looks like a query but matched no prism.
+
+        Closes the request-reply-totality gap witnessed by the
+        `cache_attach` incident: the parse layer's refusal previously
+        had a single consumer — the operator log — and the asking
+        client hung until its own timeout. The reply reuses the
+        proxy's existing structured-error vocabulary
+        (``{"id": ..., "error": ..., "field": ...}``; see
+        `router.py`'s `_send_structured_error` and the LeafRouter
+        engine-dead errors) so clients need exactly one error shape;
+        it parses as a MetadataResponse for proxy-shaped consumers.
+
+        Sent directly on the WebSocket rather than via `_send_queue`:
+        the refused message never entered the id-translation chain, so
+        `_deliver_upstream` would (correctly) drop it at
+        `translate_upstream`. Direct-send precedent:
+        `_send_response`'s push-based output channel. The refusal
+        happens before `middleware.on_query`, so KeepAlive and the
+        heartbeat fanout contract are untouched.
+
+        The case split is total over the reachable no-match shapes:
+        with the current prism set, a dict with an ``id`` and a
+        vocabulary ``action`` (or no ``action`` at all) always
+        matches, so a no-match dict in this branch has either an
+        unrecognized action value or a vocabulary action without an
+        ``id``. The defensive tail keeps totality under future prism
+        drift.
+        """
+        action_val = outer.get("action")
+        if "action" in outer and action_val not in SUPPORTED_WIRE_ACTIONS:
+            shown = repr(action_val)
+            if len(shown) > self._REFUSAL_ACTION_ECHO_MAX:
+                shown = shown[: self._REFUSAL_ACTION_ECHO_MAX] + "...(truncated)"
+            reply: Dict[str, Any] = {
+                "error": (
+                    f"unrecognized action {shown}; accepted actions: "
+                    f"{', '.join(SUPPORTED_WIRE_ACTIONS)} (an analyze "
+                    f'query may also omit "action" entirely)'
+                ),
+                "field": "action",
+            }
+        elif "id" not in outer:
+            reply = {
+                "error": (
+                    'missing required field "id"; every query must '
+                    "carry a string id that responses echo back"
+                ),
+                "field": "id",
+            }
+        else:
+            # Unreachable with the current prism set (see docstring);
+            # kept so prism drift cannot silently reopen the
+            # refused-into-the-log-only class.
+            reply = {
+                "error": (
+                    "malformed protocol message: no protocol shape "
+                    "matched"
+                ),
+            }
+
+        raw_id = outer.get("id")
+        if isinstance(raw_id, str) and len(raw_id) <= self._REFUSAL_ID_ECHO_MAX:
+            reply["id"] = raw_id
+
+        try:
+            await self._ws.send(json.dumps(reply))
+        except Exception:
+            # Receive-loop-survives posture (audit H-3): a refusal that
+            # cannot be delivered (peer already closing) must not tear
+            # down the session.
+            self._log.debug(
+                Event.DIAGNOSTIC,
+                msg=(
+                    f"peer={self._peer} could not deliver parse-layer "
+                    f"refusal (connection closing?)"
+                ),
+            )
 
     async def _handle_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
         """Translate and submit a query through the full Transformer + hub/router pipeline.

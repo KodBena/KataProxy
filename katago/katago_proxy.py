@@ -57,6 +57,7 @@ __all__ = [
     "translate_response_to_wire",
     "register_query_completion",
     "KATAGO_QUERY_PRISMS",
+    "SUPPORTED_WIRE_ACTIONS",
     "CACHE_KEY_EXCLUDED_FIELDS",
     "CompletionTracker",
     # Game-tree indexing brands (v1.0.22; see
@@ -469,6 +470,15 @@ _KATAGO_WIRE_ACTIONS: dict[str, KataGoAction] = {
     "clear_cache": KataGoAction.CLEAR_CACHE,
 }
 
+# Public, read-only view of the closed-set action vocabulary, for
+# refusal surfaces that teach the accepted actions to the refused party
+# (proxy_server's parse-layer structured error). Derived, never
+# duplicated: `_KATAGO_WIRE_ACTIONS` stays the single source of truth.
+# A tuple (not a frozenset) so membership probes with an unhashable
+# client-supplied value (`"action": {}`) compare by equality instead of
+# raising TypeError at the refusal site.
+SUPPORTED_WIRE_ACTIONS: tuple[str, ...] = tuple(sorted(_KATAGO_WIRE_ACTIONS))
+
 
 # Proxy-control fields that the proxy interprets but the engine must
 # never see. The wire builder is the single authoritative line for the
@@ -689,8 +699,12 @@ def _action_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
     # Gate on the closed-set vocabulary so unknown actions fall through
     # to the dispatcher's no-match path, where proxy_server emits the
     # structured "malformed protocol message" ERROR (ADR-0002 loud
-    # surface) without raising into the receive loop (audit H-3).
-    if action not in _KATAGO_WIRE_ACTIONS:
+    # surface) and the parse-layer structured refusal, without raising
+    # into the receive loop (audit H-3). The isinstance gate is part of
+    # that posture: an unhashable action value (`"action": {}`) would
+    # otherwise raise TypeError out of the dict-membership probe and
+    # tear down the receive loop — the same per-connection-DoS surface.
+    if not isinstance(action, str) or action not in _KATAGO_WIRE_ACTIONS:
         return None
     return (d["id"], parse_query_from_wire(d)[1])
 

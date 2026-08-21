@@ -21,6 +21,7 @@ Public exports re-mirror the module's `__all__` for ergonomic imports
 from .katago_proxy import (
     CACHE_KEY_EXCLUDED_FIELDS,
     KATAGO_QUERY_PRISMS,
+    SUPPORTED_WIRE_ACTIONS,
     AnalyzeResponse,
     Color,
     CompletionTracker,
@@ -44,6 +45,7 @@ from .katago_proxy import (
 __all__ = [
     "CACHE_KEY_EXCLUDED_FIELDS",
     "KATAGO_QUERY_PRISMS",
+    "SUPPORTED_WIRE_ACTIONS",
     "AnalyzeResponse",
     "Color",
     "CompletionTracker",
