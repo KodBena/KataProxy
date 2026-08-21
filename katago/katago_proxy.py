@@ -59,6 +59,7 @@ __all__ = [
     "KATAGO_QUERY_PRISMS",
     "SUPPORTED_WIRE_ACTIONS",
     "CACHE_VERB_ACTIONS",
+    "is_content_addressable",
     "structured_error_wire",
     "CACHE_KEY_EXCLUDED_FIELDS",
     "CompletionTracker",
@@ -520,6 +521,30 @@ CACHE_VERB_ACTIONS: frozenset[KataGoAction] = frozenset({
     KataGoAction.CACHE_DUMP,
     KataGoAction.CACHE_STATS,
 })
+
+
+def is_content_addressable(action: KataGoAction) -> bool:
+    """Is this action's reply a pure function of the query content?
+
+    THE single home of the predicate the hub's three gates share
+    (v1.0.32; formerly one comparison hand-written at each site):
+    a content-addressable action may be COALESCED (identical queries
+    share one backend slot), REPLAY-SERVED from the cache, and
+    REPLAY-RECORDED into it. Everything else — metadata probes whose
+    answers change with engine state (query_version, query_models,
+    cache_stats), state-MUTATING actions (terminate*, clear_cache, the
+    cache verbs), and acks — must get a unique coalescing slot and must
+    bypass the replay cache in both directions: replaying a stale
+    stats reply or "serving" a cache_attach from a recording would be
+    the cache-poisoning shape.
+
+    Today exactly ANALYZE qualifies. A future action that genuinely
+    earns coalescing/replay is added HERE, once — the three hub gates
+    (`pubsub_hub.subscribe`'s unique-suffix, replay-lookup, and
+    replay-record sites) all call this predicate and can no longer
+    diverge.
+    """
+    return action == KataGoAction.ANALYZE
 
 # Public, read-only view of the closed-set action vocabulary, for
 # refusal surfaces that teach the accepted actions to the refused party

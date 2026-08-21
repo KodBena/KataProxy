@@ -45,7 +45,12 @@ from katago import (  # noqa: E402
     translate_query_to_wire,
 )
 from pubsub_hub import LRUCacheStore, PubSubHub  # noqa: E402
-from router import InFlightQueryLoad, RelayRouter, SelectorRouter  # noqa: E402
+from router import (  # noqa: E402
+    InFlightQueryLoad,
+    RelayRouter,
+    SelectorRouter,
+    SyntheticCallbackOrigin,
+)
 
 
 class _MockWebSocket:
@@ -219,7 +224,7 @@ class TestRelayCacheVerbAggregate:
             assert sub_id.startswith("cid-agg:cv")
             cb = router._callbacks[sub_id]
             m_resp, m_done, sentinel = cb
-            assert sentinel == "__cache_verb__"
+            assert sentinel is SyntheticCallbackOrigin.CACHE_VERB_AGGREGATE
             engine_reply = {
                 "id": sub_id, "action": "cache_dump",
                 "context": "ctx1", "entriesWritten": 10 + i,

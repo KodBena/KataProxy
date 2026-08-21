@@ -88,7 +88,11 @@ from typing import Any, Callable, Optional, Protocol
 from AbstractProxy.proxy_core import CanonicalId, ClientId, InternalId
 from proxy_logging import Event, get_proxy_logger, lifecycle
 
-from katago import CACHE_KEY_EXCLUDED_FIELDS, KataGoAction, KataGoQuery
+from katago import (
+    CACHE_KEY_EXCLUDED_FIELDS,
+    KataGoQuery,
+    is_content_addressable,
+)
 
 logger = logging.getLogger("kataproxy." + __name__)
 _log = get_proxy_logger(__name__)
@@ -514,7 +518,7 @@ class PubSubHub:
         # -------------------------------------------------------------------
         content_hash = self._policy.query_hash(query)
 
-        if query.action != KataGoAction.ANALYZE:
+        if not is_content_addressable(query.action):
             content_hash = f"{content_hash}:{secrets.token_hex(8)}"
             _log.debug(
                 Event.DIAGNOSTIC,
@@ -557,7 +561,7 @@ class PubSubHub:
         # -------------------------------------------------------------------
         # 4. Replay-cache short-circuit (analysis-level exact match)
         # -------------------------------------------------------------------
-        if lookup_cache_flag and query.action == KataGoAction.ANALYZE:
+        if lookup_cache_flag and is_content_addressable(query.action):
             cached_record = self._get_record(cache_key)
             if cached_record is not None:
                 dummy_canonical_id = CanonicalId(f"replay_{secrets.token_hex(8)}")
@@ -622,7 +626,9 @@ class PubSubHub:
             content_hash=content_hash,
             cache_key=cache_key,
             subscribers=[sub],
-            record_cache=(cache_flag and query.action == KataGoAction.ANALYZE),
+            record_cache=(
+                cache_flag and is_content_addressable(query.action)
+            ),
         )
         self._by_hash[content_hash] = entry
         self._by_canonical[canonical_id] = entry

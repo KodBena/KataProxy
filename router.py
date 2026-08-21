@@ -40,6 +40,7 @@ import logging
 import secrets
 from abc import ABC, abstractmethod
 from collections import deque
+from enum import Enum, auto
 from typing import Any, Awaitable, Callable, Deque, NamedTuple, Optional
 
 from AbstractProxy.proxy_core import CanonicalId, WireId
@@ -1078,6 +1079,31 @@ class LeafRouter(BackendRouter):
 # RelayRouter
 # ---------------------------------------------------------------------------
 
+class SyntheticCallbackOrigin(Enum):
+    """Closed set of NON-upstream origins for a RelayRouter _callbacks
+    entry's third slot (v1.0.32; formerly the bare strings
+    "__broadcast__" / "__cache_verb__").
+
+    The slot's honest type is ``str | SyntheticCallbackOrigin``: a
+    ``str`` is the assigned upstream url of a single-target dispatch
+    (load-tracked, terminate-routable); a member of this enum marks an
+    entry no single upstream owns, so consumers (the read loop's
+    LoadMetric completion, terminate's remembered-url routing) must
+    branch on ``isinstance(slot, str)`` rather than trust the slot as
+    a url. A third synthetic origin can no longer accrete as a bare
+    string — it must be added HERE, where the closed set is named.
+    """
+
+    # First-response-wins metadata fanout (QUERY_VERSION / CLEAR_CACHE
+    # / TERMINATE_ALL): one entry for the whole broadcast; N-1 late
+    # responses drop at "no callback".
+    BROADCAST = auto()
+    # Per-member cache-verb sub-queries (_broadcast_aggregate): one
+    # entry per member sub-id; completion is per member and the
+    # aggregate is synthesised router-side.
+    CACHE_VERB_AGGREGATE = auto()
+
+
 class RelayRouter(BackendRouter):
     """Routes queries to upstream SovereignProxy nodes via WebSocket.
 
@@ -1115,8 +1141,8 @@ class RelayRouter(BackendRouter):
                        broadcast below, first-response-wins does NOT
                        apply — every member's answer matters. See
                        _broadcast_aggregate. LoadMetric skipped via
-                       the "__cache_verb__" sentinel (same shape as
-                       "__broadcast__" below).
+                       SyntheticCallbackOrigin.CACHE_VERB_AGGREGATE
+                       (same shape as .BROADCAST below).
       QUERY_VERSION  → broadcast to every connected upstream. First
       CLEAR_CACHE      response wins; subsequent responses drop at
       TERMINATE_ALL    _read_loop's "no callback" branch. Heartbeat
@@ -1169,7 +1195,10 @@ class RelayRouter(BackendRouter):
         self._reconnect_tasks: set[asyncio.Task[None]] = set()
         self._tracker: CompletionTracker[CanonicalId, int] = CompletionTracker()
         # canonical_id → (on_response, on_complete, url)
-        self._callbacks: dict[str, tuple[OnResponse, OnComplete, str]] = {}
+        self._callbacks: dict[
+            str,
+            tuple[OnResponse, OnComplete, str | SyntheticCallbackOrigin],
+        ] = {}
 
     async def start(self) -> None:
         self._log.info(
@@ -1307,7 +1336,14 @@ class RelayRouter(BackendRouter):
 
                 if sig == CompletionSignal.QUERY_COMPLETE:
                     self._callbacks.pop(canonical_id, None)
-                    self._load_metric.on_query_complete(assigned_url, canonical_id)
+                    # Only single-target dispatches are load-tracked;
+                    # a SyntheticCallbackOrigin marks an entry no one
+                    # upstream owns (broadcast / cache-verb aggregate),
+                    # so there is no count to release.
+                    if isinstance(assigned_url, str):
+                        self._load_metric.on_query_complete(
+                            assigned_url, canonical_id,
+                        )
                     await on_complete(canonical_id)
 
         except Exception as e:
@@ -1469,8 +1505,10 @@ class RelayRouter(BackendRouter):
         knowledge — each member reply completes its own sub-id
         (metadata single-shot per the engine contract) and lands in the
         aggregate via its closure. The URL slot carries the
-        ``"__cache_verb__"`` sentinel, keeping InFlightQueryLoad clean
-        exactly as _broadcast's ``"__broadcast__"`` sentinel does.
+        ``SyntheticCallbackOrigin.CACHE_VERB_AGGREGATE`` discriminant,
+        keeping InFlightQueryLoad clean exactly as _broadcast's
+        ``.BROADCAST`` does (the read loop load-tracks only
+        ``str``-slotted single-target entries).
         Stragglers past the timeout are reported per-member; their late
         replies drop at the "no callback" branch.
 
@@ -1565,7 +1603,10 @@ class RelayRouter(BackendRouter):
             sub_id = f"{canonical_id}:cv{i}"
             self._tracker.register_count(sub_id, 1)
             m_resp, m_done = _member_callbacks(sub_id, url)
-            self._callbacks[sub_id] = (m_resp, m_done, "__cache_verb__")
+            self._callbacks[sub_id] = (
+                m_resp, m_done,
+                SyntheticCallbackOrigin.CACHE_VERB_AGGREGATE,
+            )
             pending[sub_id] = url
             to_send.append((sub_id, url, ws))
 
@@ -1642,13 +1683,12 @@ class RelayRouter(BackendRouter):
         aren't in-flight in the load sense, and tracking N
         on_query_sent calls against a single on_query_complete (the
         first response that pops _callbacks) would leak counts on
-        the (N-1) upstreams that never paired through. The synthetic
-        "__broadcast__" sentinel in the URL slot of the _callbacks
-        entry is what _read_loop sees on the first-response path —
-        it's a no-op for terminate (broadcast actions are not
-        targets of per-query SPA terminate) and is benign through
-        InFlightQueryLoad.on_query_complete (max(0, ...) keeps the
-        synthetic count at 0).
+        the (N-1) upstreams that never paired through. The
+        ``SyntheticCallbackOrigin.BROADCAST`` discriminant in the URL
+        slot of the _callbacks entry is what _read_loop sees on the
+        first-response path — the read loop load-tracks only
+        ``str``-slotted entries, and terminate routes synthetic-origin
+        entries to the synthetic-ack path.
 
         Per-upstream send failures log at error and continue. The
         broadcast aborts only when zero sends succeed; in that case
@@ -1670,7 +1710,7 @@ class RelayRouter(BackendRouter):
 
         _register_query(self._tracker, canonical_id, query)
         self._callbacks[canonical_id] = (
-            on_response, on_complete, "__broadcast__",
+            on_response, on_complete, SyntheticCallbackOrigin.BROADCAST,
         )
 
         sent_to: list[str] = []
@@ -1741,6 +1781,15 @@ class RelayRouter(BackendRouter):
 
         _, _, url = cb
         self._tracker.cancel(canonical_id)
+        if not isinstance(url, str):
+            # Synthetic origin (broadcast / cache-verb aggregate): no
+            # single upstream to route the terminate to, and no load
+            # count to release. Ack synthetically — behaviourally
+            # identical to the pre-v1.0.32 sentinel path, where the
+            # sentinel string missed _connections and fell through to
+            # the synthetic ack.
+            await _send_synthetic_ack()
+            return
         self._load_metric.on_query_complete(url, canonical_id)
 
         ws = self._connections.get(url)
@@ -1953,7 +2002,8 @@ class SelectorRouter(BackendRouter):
         # the routing record consulted by terminate() to send the
         # cancel to the correct upstream.
         self._callbacks: dict[
-            str, tuple[OnResponse, OnComplete, str]
+            str,
+            tuple[OnResponse, OnComplete, str | SyntheticCallbackOrigin],
         ] = {}
 
     # -----------------------------------------------------------------------
@@ -2625,7 +2675,7 @@ class SelectorRouter(BackendRouter):
         # query_version, and TERMINATE_ALL is itself the
         # terminate-shaped action).
         self._callbacks[canonical_id] = (
-            on_response, on_complete, "__broadcast__",
+            on_response, on_complete, SyntheticCallbackOrigin.BROADCAST,
         )
 
         sent_to: list[str] = []
@@ -2721,6 +2771,12 @@ class SelectorRouter(BackendRouter):
 
         _, _, label = cb
         self._tracker.cancel(canonical_id)
+        if not isinstance(label, str):
+            # Synthetic origin (broadcast): no single label to route
+            # the terminate to. Ack synthetically — behaviourally
+            # identical to the pre-v1.0.32 sentinel path.
+            await _send_synthetic_ack()
+            return
 
         ws = self._connections.get(label)
         if ws is None:

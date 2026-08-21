@@ -14,7 +14,8 @@ Coverage:
     target via the hash ring; the broadcast path leaves single-
     target dispatch untouched.
   - QUERY_VERSION / TERMINATE_ALL / CLEAR_CACHE broadcast to every
-    connected upstream; the synthetic "__broadcast__" sentinel
+    connected upstream; SyntheticCallbackOrigin.BROADCAST (v1.0.32;
+    was the "__broadcast__" string)
     occupies the URL slot of `_callbacks` (the value isn't a
     routing key — broadcast canonicals aren't subject to
     SelectorRouter-style per-upstream terminate).
@@ -56,6 +57,7 @@ from AbstractProxy.proxy_core import CanonicalId  # noqa: E402
 from router import (  # noqa: E402
     InFlightQueryLoad,
     RelayRouter,
+    SyntheticCallbackOrigin,
 )
 
 
@@ -160,9 +162,9 @@ class TestSingleTargetDispatch:
         assert "cid-analyze" in router._callbacks
         _, _, recorded_url = router._callbacks["cid-analyze"]
         assert recorded_url in router._urls
-        assert recorded_url != "__broadcast__", (
-            "single-target dispatch must record a real URL, not the "
-            "broadcast sentinel"
+        assert isinstance(recorded_url, str), (
+            "single-target dispatch must record a real URL, not a "
+            "SyntheticCallbackOrigin"
         )
 
     async def test_analyze_load_metric_increments(self) -> None:
@@ -212,11 +214,11 @@ class TestBroadcastDispatch:
                 f"{url} should have received the broadcast heartbeat; "
                 f"got {len(ws.sent)} sends"
             )
-        # _callbacks holds a single entry with the broadcast sentinel
-        # in the URL slot.
+        # _callbacks holds a single entry with the typed broadcast
+        # discriminant in the URL slot (v1.0.32; was "__broadcast__").
         assert "cid-qv" in router._callbacks
         _, _, label_slot = router._callbacks["cid-qv"]
-        assert label_slot == "__broadcast__"
+        assert label_slot is SyntheticCallbackOrigin.BROADCAST
 
     async def test_terminate_all_broadcasts_to_all_connected(self) -> None:
         # SPA expectation for TERMINATE_ALL is "cancel every in-flight

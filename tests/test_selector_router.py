@@ -64,6 +64,7 @@ from pubsub_hub import CoalescingPolicy  # noqa: E402
 from router import (  # noqa: E402
     SelectorRouter,
     SelectorStartupError,
+    SyntheticCallbackOrigin,
 )
 from sproxy_config import _parse_selector_models  # noqa: E402
 
@@ -577,10 +578,11 @@ class TestSelectorDispatch:
         assert len(sockets["strong"].sent) == 1
         assert len(sockets["weak"].sent) == 1
         # _callbacks holds a single entry for the canonical, with the
-        # broadcast sentinel as the label slot.
+        # typed broadcast discriminant as the label slot (v1.0.32;
+        # was "__broadcast__").
         assert "cid-qv" in router._callbacks
         _on_resp, _on_comp, label_slot = router._callbacks["cid-qv"]
-        assert label_slot == "__broadcast__"
+        assert label_slot is SyntheticCallbackOrigin.BROADCAST
         # The SPA hasn't seen a synthetic response — it waits for the
         # first upstream's reply through the read loop.
         assert responses == []

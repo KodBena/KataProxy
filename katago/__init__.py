@@ -42,6 +42,7 @@ from .katago_proxy import (
     response_completion_signal,
     translate_query_to_wire,
     translate_response_to_wire,
+    is_content_addressable,
 )
 
 __all__ = [
@@ -68,4 +69,5 @@ __all__ = [
     "response_completion_signal",
     "translate_query_to_wire",
     "translate_response_to_wire",
+    "is_content_addressable",
 ]
