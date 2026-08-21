@@ -547,13 +547,12 @@ class PubSubHub:
         #     2 without the wire builder needing to see it).
         # -------------------------------------------------------------------
         query.opaque.pop("capabilities", None)
-        # NOTE: `model` is NOT popped here for SELECTOR — the SelectorRouter
-        # reads it from query.opaque to choose the upstream. The central
-        # wire-strip in translate_query_to_wire ensures it is excluded
-        # from the wire emitted to upstream LEAFs (where vanilla KataGo
-        # would not understand it). For non-SELECTOR roles, the field is
-        # harmless if present (LeafRouter writes the wire built by
-        # translate_query_to_wire, which strips it).
+        # NOTE: `model` is NOT popped here — the SelectorRouter reads
+        # it from query.opaque to choose the upstream. Since the
+        # v1.0.30 reclassification the wire-builder passes `model`
+        # through (it is engine-facing at RELAY/LEAF); the SELECTOR's
+        # _forward is the single boundary that consumes the label from
+        # the forwarded wire and mints the configured engine model.
 
         # -------------------------------------------------------------------
         # 4. Replay-cache short-circuit (analysis-level exact match)

@@ -58,6 +58,7 @@ __all__ = [
     "register_query_completion",
     "KATAGO_QUERY_PRISMS",
     "SUPPORTED_WIRE_ACTIONS",
+    "CACHE_VERB_ACTIONS",
     "structured_error_wire",
     "CACHE_KEY_EXCLUDED_FIELDS",
     "CompletionTracker",
@@ -154,6 +155,16 @@ class KataGoAction(Enum):
     QUERY_VERSION = auto()
     QUERY_MODELS = auto()
     CLEAR_CACHE = auto()
+    # Persistent-NN-cache verbs (v1.0.31, proxy-owned broadcast class;
+    # engine-native since the KataGo model-and-cache branch). The
+    # engine serves each natively; the proxy routes them like ANALYZE
+    # at the SELECTOR (label-targeted, engine-model minted) and
+    # broadcast-AGGREGATES them at the RELAY (one reply keyed by
+    # member, partial failure explicit).
+    CACHE_ATTACH = auto()
+    CACHE_DETACH = auto()
+    CACHE_DUMP = auto()
+    CACHE_STATS = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +497,29 @@ _KATAGO_WIRE_ACTIONS: dict[str, KataGoAction] = {
     "query_version": KataGoAction.QUERY_VERSION,
     "query_models": KataGoAction.QUERY_MODELS,
     "clear_cache": KataGoAction.CLEAR_CACHE,
+    "cache_attach": KataGoAction.CACHE_ATTACH,
+    "cache_detach": KataGoAction.CACHE_DETACH,
+    "cache_dump": KataGoAction.CACHE_DUMP,
+    "cache_stats": KataGoAction.CACHE_STATS,
 }
+
+# The persistent-NN-cache verb subset. Routing properties shared by all
+# four (and load-bearing for the routers):
+#   - state-mutating or state-reporting per ENGINE — never replay-cache
+#     served (pubsub_hub gates both lookup and store on ANALYZE), never
+#     coalesced (action queries get a unique content-hash suffix);
+#   - accept an optional engine-facing "model" (internalName; omitted →
+#     the engine's primary model), so the SELECTOR mints the label's
+#     configured engine model exactly as for ANALYZE;
+#   - reply with exactly ONE metadata message per member, so a fanout
+#     tier can aggregate N member replies into one metadata reply
+#     without straining completion tracking.
+CACHE_VERB_ACTIONS: frozenset[KataGoAction] = frozenset({
+    KataGoAction.CACHE_ATTACH,
+    KataGoAction.CACHE_DETACH,
+    KataGoAction.CACHE_DUMP,
+    KataGoAction.CACHE_STATS,
+})
 
 # Public, read-only view of the closed-set action vocabulary, for
 # refusal surfaces that teach the accepted actions to the refused party
@@ -744,8 +777,19 @@ def translate_response_to_wire(
 # returning None here doesn't sacrifice ADR-0002 visibility.
 
 
+# All three previews require the wire "id" to be a STRING, not merely
+# present: the id is the client's correlation handle and every layer
+# downstream (IdMapping keys, CompletionTracker, the hub's relabelling)
+# assumes str. A non-string id previously slipped through the presence
+# check and raised TypeError inside translation — tearing down the
+# receive loop, the audit-H-3 per-connection-DoS surface (same class as
+# the unhashable-action gate above, exposed when the cache verbs joined
+# the vocabulary in v1.0.31). Falling to no-match routes it to the
+# parse-layer structured refusal instead.
+
+
 def _terminate_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
-    if not isinstance(d, dict) or "id" not in d:
+    if not isinstance(d, dict) or not isinstance(d.get("id"), str):
         return None
     if d.get("action") != "terminate":
         return None
@@ -753,7 +797,7 @@ def _terminate_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
 
 
 def _action_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
-    if not isinstance(d, dict) or "id" not in d:
+    if not isinstance(d, dict) or not isinstance(d.get("id"), str):
         return None
     action = d.get("action")
     if action is None or action == "terminate":
@@ -772,7 +816,7 @@ def _action_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
 
 
 def _analyze_preview(d: Any) -> Optional[tuple[str, KataGoQuery]]:
-    if not isinstance(d, dict) or "id" not in d:
+    if not isinstance(d, dict) or not isinstance(d.get("id"), str):
         return None
     if "action" in d:
         return None

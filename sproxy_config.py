@@ -124,6 +124,17 @@ KATAGO_STARTUP_TIMEOUT_S: float = float(
 RELAY_MAX_LOAD: int = int(os.environ.get("RELAY_MAX_LOAD", "10"))
 HASH_RING_REPLICAS: int = int(os.environ.get("HASH_RING_REPLICAS", "150"))
 
+# RELAY cache-verb aggregation (v1.0.31): how long the aggregate waits
+# for member replies before reporting the stragglers per-member as
+# timeouts (the aggregate itself always completes). Sized above the
+# engine's own bounded 20s .nnlock wait plus realistic dump time;
+# same-directory rings serialize their file operations on the shared
+# per-context lock, so aggregate latency is sum-not-max there — raise
+# this for large same-dir rings.
+CACHE_VERB_TIMEOUT_S: float = float(
+    os.environ.get("PROXY_CACHE_VERB_TIMEOUT_S", "120")
+)
+
 # ---------------------------------------------------------------------------
 # Hub replay-cache bound (v1.0.4)
 # ---------------------------------------------------------------------------

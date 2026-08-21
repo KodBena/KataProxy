@@ -95,15 +95,19 @@ def _only_reply(ws: _FakeWs) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def test_unknown_action_gets_structured_refusal() -> None:
+    # The original witnessed defect used "cache_attach", which
+    # graduated into the vocabulary in v1.0.31 — the shape of the
+    # witness (unknown action → teaching refusal) is preserved with a
+    # still-unknown verb.
     session, ws, hub = _make_session()
     await session._handle_incoming(json.dumps(
-        {"id": "att1", "action": "cache_attach",
+        {"id": "att1", "action": "cache_teleport",
          "model": "main", "context": "lvtest1"}
     ))
     reply = _only_reply(ws)
     assert reply["id"] == "att1"
     assert reply["field"] == "action"
-    assert "cache_attach" in reply["error"]
+    assert "cache_teleport" in reply["error"]
     for accepted in SUPPORTED_WIRE_ACTIONS:
         assert accepted in reply["error"]
     assert hub.subscriptions == []
@@ -125,17 +129,32 @@ async def test_vocabulary_action_without_id_refused_on_id_field() -> None:
 async def test_non_string_id_not_echoed() -> None:
     session, ws, _ = _make_session()
     await session._handle_incoming(json.dumps(
-        {"id": {"nested": True}, "action": "cache_attach"}
+        {"id": {"nested": True}, "action": "cache_teleport"}
     ))
     reply = _only_reply(ws)
     assert "id" not in reply
     assert reply["field"] == "action"
 
 
+async def test_known_action_with_non_string_id_refused_on_id() -> None:
+    # v1.0.31: the prisms require a str id, so a vocabulary action with
+    # a non-string id falls to no-match instead of raising TypeError
+    # inside translation (the receive-loop-teardown class).
+    session, ws, hub = _make_session()
+    await session._handle_incoming(json.dumps(
+        {"id": {"nested": True}, "action": "query_version"}
+    ))
+    reply = _only_reply(ws)
+    assert "id" not in reply
+    assert reply["field"] == "id"
+    assert "must be a string" in reply["error"]
+    assert hub.subscriptions == []
+
+
 async def test_oversized_id_not_echoed() -> None:
     session, ws, _ = _make_session()
     await session._handle_incoming(json.dumps(
-        {"id": "x" * 5000, "action": "cache_attach"}
+        {"id": "x" * 5000, "action": "cache_teleport"}
     ))
     reply = _only_reply(ws)
     assert "id" not in reply

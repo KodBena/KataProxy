@@ -67,6 +67,11 @@ _KNOWN_ACTIONS: list[tuple[str, KataGoAction]] = [
     ("query_version", KataGoAction.QUERY_VERSION),
     ("query_models", KataGoAction.QUERY_MODELS),
     ("clear_cache", KataGoAction.CLEAR_CACHE),
+    # Persistent-NN-cache verbs (v1.0.31 proxy-owned broadcast class).
+    ("cache_attach", KataGoAction.CACHE_ATTACH),
+    ("cache_detach", KataGoAction.CACHE_DETACH),
+    ("cache_dump", KataGoAction.CACHE_DUMP),
+    ("cache_stats", KataGoAction.CACHE_STATS),
 ]
 
 

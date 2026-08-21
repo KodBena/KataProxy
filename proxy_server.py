@@ -543,12 +543,12 @@ class ClientSession:
         heartbeat fanout contract are untouched.
 
         The case split is total over the reachable no-match shapes:
-        with the current prism set, a dict with an ``id`` and a
+        with the current prism set, a dict with a STRING ``id`` and a
         vocabulary ``action`` (or no ``action`` at all) always
-        matches, so a no-match dict in this branch has either an
-        unrecognized action value or a vocabulary action without an
-        ``id``. The defensive tail keeps totality under future prism
-        drift.
+        matches, so a no-match dict in this branch has an unrecognized
+        action value, a vocabulary action without an ``id``, or a
+        non-string ``id`` (the prisms require str — v1.0.31). The
+        defensive tail keeps totality under future prism drift.
         """
         raw_id = outer.get("id")
         echo_id: Optional[str] = (
@@ -577,6 +577,17 @@ class ClientSession:
                 (
                     'missing required field "id"; every query must '
                     "carry a string id that responses echo back"
+                ),
+                field="id",
+            )
+        elif not isinstance(outer["id"], str):
+            # Known action, but the id is not a string — the prisms
+            # require a str id (the correlation handle every layer
+            # downstream keys on), so this falls to no-match (v1.0.31).
+            reply = structured_error_wire(
+                (
+                    'field "id" must be a string; every query carries '
+                    "a string id that responses echo back"
                 ),
                 field="id",
             )

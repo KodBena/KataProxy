@@ -46,6 +46,7 @@ from AbstractProxy.proxy_core import CanonicalId, WireId
 
 from AbstractProxy.proxy_core import CompletionSignal, CompletionTracker
 from katago import (
+    CACHE_VERB_ACTIONS,
     KataGoAction,
     KataGoQuery,
     parse_response_from_wire,
@@ -1106,6 +1107,16 @@ class RelayRouter(BackendRouter):
       ANALYZE        → single-target via _select_upstream (above policy).
       TERMINATE      → single-target via remembered routing for the
                        canonical_id (label in _callbacks).
+      CACHE_ATTACH   → broadcast-AGGREGATE to every CONFIGURED ring
+      CACHE_DETACH     member (v1.0.31): per-member sub-queries, ONE
+      CACHE_DUMP       aggregated metadata reply keyed by member url,
+      CACHE_STATS      partial failure explicit, straggler timeout
+                       cfg.CACHE_VERB_TIMEOUT_S. Unlike the metadata
+                       broadcast below, first-response-wins does NOT
+                       apply — every member's answer matters. See
+                       _broadcast_aggregate. LoadMetric skipped via
+                       the "__cache_verb__" sentinel (same shape as
+                       "__broadcast__" below).
       QUERY_VERSION  → broadcast to every connected upstream. First
       CLEAR_CACHE      response wins; subsequent responses drop at
       TERMINATE_ALL    _read_loop's "no callback" branch. Heartbeat
@@ -1382,6 +1393,16 @@ class RelayRouter(BackendRouter):
         on_complete: OnComplete,
     ) -> None:
         action = query.action
+        # Cache verbs (v1.0.31): fan to every ring member and aggregate
+        # per-member replies into ONE response — every member's answer
+        # matters (per-engine state), so first-response-wins does not
+        # apply. See _broadcast_aggregate.
+        if action in CACHE_VERB_ACTIONS:
+            await self._broadcast_aggregate(
+                canonical_id, wire_dict, query, on_response, on_complete,
+            )
+            return
+
         # Broadcast the metadata-shaped fanout actions. See the class
         # docstring's action-routing matrix and _broadcast below.
         if action in (
@@ -1417,6 +1438,170 @@ class RelayRouter(BackendRouter):
             cid=canonical_id, upstream=url,
             msg=f"sent: {json.dumps(wire_dict)}",
         )
+
+    async def _broadcast_aggregate(
+        self,
+        canonical_id: CanonicalId,
+        wire_dict: WireDict,
+        query: KataGoQuery,
+        on_response: OnResponse,
+        on_complete: OnComplete,
+    ) -> None:
+        """Fan a cache verb to every ring member; aggregate into ONE reply.
+
+        Wire contract (v1.0.31): a single metadata response
+
+            {"id": <canonical>, "action": "<verb>",
+             "members": {<upstream url>: <that member's reply>, ...}}
+
+        where each member value is the member's own verbatim reply with
+        its internal wire id stripped (internal ids never reach a
+        client), or — partial failure EXPLICIT — the structured error
+        shape for a member that is disconnected, refused at send, or
+        did not reply within ``cfg.CACHE_VERB_TIMEOUT_S``. Every
+        CONFIGURED ring member appears exactly once; an unavailable
+        member is named, never silently absorbed. First-response-wins
+        does not apply: cache verbs address per-engine state, so every
+        member's answer matters.
+
+        Mechanism: per-member sub-wire-ids (``<canonical>:cv<i>``) with
+        one _callbacks entry each, so _read_loop needs no aggregation
+        knowledge — each member reply completes its own sub-id
+        (metadata single-shot per the engine contract) and lands in the
+        aggregate via its closure. The URL slot carries the
+        ``"__cache_verb__"`` sentinel, keeping InFlightQueryLoad clean
+        exactly as _broadcast's ``"__broadcast__"`` sentinel does.
+        Stragglers past the timeout are reported per-member; their late
+        replies drop at the "no callback" branch.
+
+        Engine facts the contract leans on (KataGo model-and-cache
+        branch): each verb replies with exactly ONE metadata message;
+        attach/detach refuse while other requests are open
+        (openRequestCount named — the operator quiesces and retries;
+        the proxy does not queue); dump serializes on the per-context
+        ``.nnlock`` with the engine's own bounded 20s wait, so
+        same-directory rings aggregate in sum-not-max time.
+        """
+        act_name = wire_dict.get("action", query.action.name.lower())
+        members: dict[str, Any] = {}
+        pending: dict[str, str] = {}  # sub_id → url
+        finalized = False
+
+        async def _finalize() -> None:
+            nonlocal finalized
+            if finalized:
+                return
+            finalized = True
+            # Cancel the straggler-timeout unless WE are it — a task
+            # cancelling itself would abort the aggregate delivery
+            # right here at the next await.
+            if asyncio.current_task() is not timeout_task:
+                timeout_task.cancel()
+            aggregate: WireDict = {
+                "id": canonical_id,
+                "action": act_name,
+                "members": members,
+            }
+            await on_response(canonical_id, aggregate)
+            await on_complete(canonical_id)
+
+        def _member_callbacks(sub_id: str, url: str) -> tuple[OnResponse, OnComplete]:
+            async def member_on_response(_sid: str, wire: Dict[str, Any]) -> None:
+                members[url] = {k: v for k, v in wire.items() if k != "id"}
+
+            async def member_on_complete(_sid: str) -> None:
+                pending.pop(sub_id, None)
+                if not pending:
+                    await _finalize()
+
+            return member_on_response, member_on_complete
+
+        # Phase 1 — register EVERYTHING before the first await: every
+        # configured member gets an entry (live ones a sub-query and a
+        # `pending` slot, unavailable ones an explicit structured
+        # error), and the timeout task is bound. Ordering is
+        # load-bearing: a member's reply can be processed by _read_loop
+        # while a LATER member's `ws.send` has this coroutine suspended
+        # on backpressure — with `pending` pre-populated, that early
+        # completion can never see an empty `pending` (and thus never
+        # finalize) while any member's send is still outstanding, and
+        # `timeout_task` is always bound before _finalize can run
+        # (early-finalize race, out-of-frame audit finding, 2026-08-21).
+        async def _timeout_fill() -> None:
+            try:
+                await asyncio.sleep(cfg.CACHE_VERB_TIMEOUT_S)
+            except asyncio.CancelledError:
+                return
+            for sub_id, url in list(pending.items()):
+                self._tracker.cancel(sub_id)
+                self._callbacks.pop(sub_id, None)
+                pending.pop(sub_id, None)
+                self._log.error(
+                    Event.DISPATCH_ERROR,
+                    cid=canonical_id, orig=canonical_id, upstream=url,
+                    error_kind="cache_verb_timeout",
+                    msg=(
+                        f"no cache-verb reply from {url} within "
+                        f"{cfg.CACHE_VERB_TIMEOUT_S}s"
+                    ),
+                )
+                members[url] = structured_error_wire(
+                    f"no reply within {cfg.CACHE_VERB_TIMEOUT_S}s "
+                    f"(member may still be working; its late reply "
+                    f"is dropped)",
+                    field="action",
+                )
+            await _finalize()
+
+        to_send: list[tuple[str, str, Any]] = []  # (sub_id, url, ws)
+        for i, url in enumerate(self._urls):
+            ws = self._connections.get(url)
+            if ws is None:
+                members[url] = structured_error_wire(
+                    "upstream disconnected; cache verb not served here",
+                    field="action",
+                )
+                continue
+            sub_id = f"{canonical_id}:cv{i}"
+            self._tracker.register_count(sub_id, 1)
+            m_resp, m_done = _member_callbacks(sub_id, url)
+            self._callbacks[sub_id] = (m_resp, m_done, "__cache_verb__")
+            pending[sub_id] = url
+            to_send.append((sub_id, url, ws))
+
+        timeout_task = asyncio.create_task(_timeout_fill())
+
+        # Phase 2 — send; a failed send rolls its member back to an
+        # explicit error entry.
+        for sub_id, url, ws in to_send:
+            member_wire = {**wire_dict, "id": sub_id}
+            try:
+                await ws.send(json.dumps(member_wire))
+            except Exception as e:
+                self._tracker.cancel(sub_id)
+                self._callbacks.pop(sub_id, None)
+                pending.pop(sub_id, None)
+                self._log.error(
+                    Event.DISPATCH_ERROR,
+                    cid=canonical_id, orig=canonical_id, upstream=url,
+                    error_kind="cache_verb_send_failed",
+                    msg=f"cache-verb send failed for {url}: {e}",
+                )
+                members[url] = structured_error_wire(
+                    f"send to upstream failed: {e}",
+                    field="action",
+                )
+
+        lifecycle.dispatch(
+            self._log, cid=canonical_id, orig=canonical_id,
+            action=query.action.name,
+            upstream=f"aggregate[{len(pending)}/{len(self._urls)}]",
+        )
+        if not pending:
+            # Nothing in flight (no members connected, or every send
+            # failed, or every member answered during the send loop):
+            # deliver the aggregate now.
+            await _finalize()
 
     async def _broadcast(
         self,
@@ -2150,15 +2335,21 @@ class SelectorRouter(BackendRouter):
             return
 
         # ANALYZE: route by `model` field.
-        if action == KataGoAction.ANALYZE:
+        # ANALYZE and cache verbs (v1.0.31) are label-routed alike: the
+        # client's `model` is the SELECTOR label naming the addressed
+        # subtree; _forward consumes it and mints the configured engine
+        # model. A label whose upstream is itself a RELAY aggregates
+        # its own ring's replies; the SELECTOR relays that aggregate
+        # verbatim (nested aggregation composes visibly).
+        if action == KataGoAction.ANALYZE or action in CACHE_VERB_ACTIONS:
             requested = query.opaque.get("model")
             if requested is None:
                 self._log.warning(
                     Event.DIAGNOSTIC,
                     cid=canonical_id,
                     msg=(
-                        f"ANALYZE without `model` field; failing loudly "
-                        f"({canonical_id})"
+                        f"{action.name} without `model` field; failing "
+                        f"loudly ({canonical_id})"
                     ),
                 )
                 await self._send_structured_error(
@@ -2296,17 +2487,20 @@ class SelectorRouter(BackendRouter):
                 field="model",
             )
             return
-        # Label → engine-model translation (v1.0.30). Copy-on-write —
-        # the caller's dict is not mutated. The pop is UNCONDITIONAL:
-        # a label leaking upstream would be refused by a multi-model
-        # engine as an unknown internalName, breaking every deployed
-        # label-only config. The mint is guarded to ANALYZE for
-        # totality under dispatch drift: today _forward only serves
-        # ANALYZE, and the engine hard-refuses "model" on any other
-        # action.
+        # Label → engine-model translation (v1.0.30; cache verbs join
+        # in v1.0.31). Copy-on-write — the caller's dict is not
+        # mutated. The pop is UNCONDITIONAL: a label leaking upstream
+        # would be refused by a multi-model engine as an unknown
+        # internalName, breaking every deployed label-only config. The
+        # mint is guarded to the actions the engine accepts "model" on
+        # (ANALYZE and the cache verbs — everything else hard-refuses
+        # the key), for totality under dispatch drift.
         wire_dict = {k: v for k, v in wire_dict.items() if k != "model"}
         injected = self._engine_model_for_label.get(label)
-        if injected is not None and query.action == KataGoAction.ANALYZE:
+        if injected is not None and (
+            query.action == KataGoAction.ANALYZE
+            or query.action in CACHE_VERB_ACTIONS
+        ):
             wire_dict = {**wire_dict, "model": injected}
         lifecycle.dispatch(
             self._log, cid=canonical_id, orig=canonical_id,
