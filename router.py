@@ -41,6 +41,7 @@ import secrets
 from abc import ABC, abstractmethod
 from collections import deque
 from enum import Enum, auto
+from time import monotonic
 from typing import Any, Awaitable, Callable, Deque, NamedTuple, Optional
 
 from AbstractProxy.proxy_core import CanonicalId, WireId
@@ -1079,6 +1080,20 @@ class LeafRouter(BackendRouter):
 # RelayRouter
 # ---------------------------------------------------------------------------
 
+class RosterAdmissionError(Exception):
+    """A RELAY ring member failed the roster admission check (v1.0.33).
+
+    Raised inside `RelayRouter._connect` before the member ever enters
+    `_connections`: either the admission probe (a bare `query_models`)
+    failed (timeout / malformed / refused), or the member's searchable
+    roster diverges from the currently-connected ring's agreed roster.
+    The existing reconnect-with-backoff retries admission, so transient
+    divergence during a rolling restart self-heals and permanent
+    divergence keeps failing loudly instead of surfacing as
+    hash-dependent per-query nondeterminism.
+    """
+
+
 class SyntheticCallbackOrigin(Enum):
     """Closed set of NON-upstream origins for a RelayRouter _callbacks
     entry's third slot (v1.0.32; formerly the bare strings
@@ -1107,21 +1122,26 @@ class SyntheticCallbackOrigin(Enum):
 class RelayRouter(BackendRouter):
     """Routes queries to upstream SovereignProxy nodes via WebSocket.
 
-    MODEL-ROSTER CONTRACT (v1.0.30, documented — not yet mechanically
-    checked): since ``model`` is engine-facing and forwarded verbatim
-    (see katago/katago_proxy.py:_PROXY_ONLY_FIELDS), the RELAY's
-    "interchangeable upstreams" invariant extends to the model roster —
-    every ring member must honor the same set of engine internalNames.
-    A divergent member is not silent: the engine's own structured
-    refusal (naming its selectable models) propagates to the asking
-    client, and hash-ring determinism means a given query lands on the
-    same member consistently — loud, but a misconfiguration the
-    operator must fix by upgrading/aligning ring members. A mechanical
-    admission-time roster check (query_models on connect, refuse
-    divergent members) is the ADR-0016-shaped follow-up; it is not
-    bundled here because vanilla-engine rings cannot answer
-    query_models and the check adds a connect-time handshake state
-    machine that needs its own arc.
+    MODEL-ROSTER CONTRACT (documented v1.0.30; MECHANICALLY CHECKED at
+    admission since v1.0.33): since ``model`` is engine-facing and
+    forwarded verbatim (see katago/katago_proxy.py:_PROXY_ONLY_FIELDS),
+    the RELAY's "interchangeable upstreams" invariant extends to the
+    model roster — every ring member must honor the same set of
+    searchable engine internalNames. ``_connect`` probes each member
+    with a bare ``query_models`` BEFORE admission and refuses a member
+    whose roster diverges from the connected ring's (see
+    ``_probe_roster`` / ``_verify_roster``); the existing
+    reconnect-with-backoff retries admission, so a transient divergence
+    during a rolling restart self-heals and a permanent one keeps
+    failing loudly at the backoff cadence instead of surfacing as
+    hash-dependent per-query refusals. Re-verification on reconnect is
+    COMPLETE coverage: rosters are process-static, so a roster change
+    requires an engine restart, which drops the socket and re-enters
+    admission. (The v1.0.32-era deferral rested on "vanilla-engine
+    rings cannot answer query_models" — factually wrong, operator
+    correction 2026-08-21: vanilla answers with the same response
+    shape, fork-point rev ccdec959; the branch only widens the models
+    array's cardinality.)
 
     Selection policy (single-target, per-query actions):
       1. Hash canonical_id through the ring → preferred upstream.
@@ -1187,6 +1207,16 @@ class RelayRouter(BackendRouter):
         # async iteration) is enforced behaviourally.
         self._connections: dict[str, Any] = {}            # url → websocket
         self._reader_tasks: dict[str, asyncio.Task[None]] = {}  # url → task
+        # Connected members' searchable-model rosters (v1.0.33 roster
+        # admission check): url → frozenset of engine internalNames,
+        # human-profile entries excluded (they are not `model`-
+        # resolvable targets). Written only by _connect on successful
+        # admission, removed by _read_loop's finally on disconnect. The
+        # ring invariant: every value in this dict is EQUAL — enforced
+        # at admission, complete by construction because rosters are
+        # process-static (a roster change requires an engine restart,
+        # which drops the socket and re-enters admission).
+        self._roster_for_url: dict[str, frozenset[str]] = {}
         # Reconnect tasks scheduled by _read_loop's finally block. Tracked
         # so stop() can cancel them; without tracking, a flapping upstream
         # accumulates one orphan task per disconnect cycle indefinitely
@@ -1205,12 +1235,44 @@ class RelayRouter(BackendRouter):
             Event.DIAGNOSTIC,
             msg=f"connecting to {len(self._urls)} upstream(s)",
         )
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(self._connect(url) for url in self._urls),
             return_exceptions=True,
         )
+        # v1.0.33: a member that fails INITIAL admission (unreachable,
+        # or roster-divergent at the moment the RELAY starts — e.g. a
+        # ring member mid-rolling-restart) schedules the same
+        # reconnect-with-backoff the disconnect path uses, so the
+        # self-heal story covers the cold-start path too. Previously a
+        # failed initial connect left the member permanently absent
+        # until a proxy restart — a gap the admission check would have
+        # made materially more likely to bite (out-of-frame audit
+        # finding, 2026-08-21).
+        for url, result in zip(self._urls, results):
+            if isinstance(result, BaseException):
+                self._schedule_reconnect(url)
 
     async def _connect(self, url: str) -> None:
+        """Connect one ring member, roster-check it, and admit it.
+
+        Admission sequence (v1.0.33): open the WebSocket, probe the
+        member's model roster with a bare ``query_models`` BEFORE it
+        enters ``_connections`` (no read loop is running yet, so the
+        probe owns the socket), verify the roster against the
+        currently-connected ring, then admit. A member that fails the
+        probe or diverges is closed and NEVER admitted — refusal at
+        admission instead of hash-dependent per-query nondeterminism.
+
+        Raises on every failure (connect, probe, divergence). This is
+        load-bearing for re-verification: the pre-v1.0.33 shape
+        swallowed failures, which made ``_reconnect_with_backoff``'s
+        ``await self._connect(url); return`` exit after ONE attempt
+        whether or not it succeeded — a failed reconnect silently ended
+        reconnection (and would have silently skipped roster
+        re-verification) forever. ``start()``'s
+        ``gather(return_exceptions=True)`` preserves the initial-
+        connect semantics.
+        """
         import websockets
         self._log.info(
             Event.DIAGNOSTIC,
@@ -1219,18 +1281,155 @@ class RelayRouter(BackendRouter):
         )
         try:
             ws = await websockets.connect(url, max_size=_WS_MAX_SIZE)
-            self._connections[url] = ws
-            task = asyncio.create_task(
-                self._read_loop(url, ws), name=f"relay-reader:{url}"
-            )
-            self._reader_tasks[url] = task
-            lifecycle.upstream_connect(self._log, upstream=url)
         except Exception as e:
             self._log.error(
                 Event.UPSTREAM_DISCONNECT,
                 upstream=url, cause=f"connect_failed: {e}",
                 msg=f"upstream connect failed: {url} ({e})",
             )
+            raise
+        try:
+            roster = await self._probe_roster(ws, url)
+            self._verify_roster(url, roster)
+        except Exception as e:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            self._log.error(
+                Event.UPSTREAM_DISCONNECT,
+                upstream=url, cause=f"roster_admission_refused: {e}",
+                msg=f"admission refused for {url}: {e}",
+            )
+            raise
+        self._connections[url] = ws
+        self._roster_for_url[url] = roster
+        task = asyncio.create_task(
+            self._read_loop(url, ws), name=f"relay-reader:{url}"
+        )
+        self._reader_tasks[url] = task
+        lifecycle.upstream_connect(self._log, upstream=url)
+        self._log.info(
+            Event.DIAGNOSTIC,
+            upstream=url,
+            msg=(
+                f"roster admitted for {url}: "
+                f"{sorted(roster) if roster else '(no searchable models reported)'}"
+            ),
+        )
+
+    async def _probe_roster(self, ws: Any, url: str) -> frozenset[str]:
+        """Probe one not-yet-admitted member's searchable-model roster.
+
+        Sends a bare ``{"id", "action": "query_models"}`` (bare is
+        load-bearing: the model-and-cache engine hard-refuses ``model``
+        / ``cacheContext`` on this action) and reads the socket
+        directly — the member is not in ``_connections`` yet, so no
+        read loop competes for frames. Vanilla KataGo (fork point
+        ccdec959) and the model-and-cache branch answer with ONE
+        response shape: per-element keys name/internalName/
+        maxBatchSize/usesHumanSLProfile/version/usingFP16; the branch
+        only widens the array from ≤2 elements to N searchable models
+        (+ optional human model last). The roster is the set of
+        ``internalName`` values whose entries are NOT human-profile
+        (``usesHumanSLProfile`` false/absent) — the human companion is
+        not a ``model``-resolvable target, so a ring differing only in
+        it still serves identical model-carrying traffic.
+
+        Known approximation (out-of-frame audit, 2026-08-21): the wire
+        carries the per-net PROFILE (``usesHumanSLProfile`` =
+        requiresSGFMetadata), not the engine-side ROLE
+        (Searchable vs HumanCompanion) that actually governs
+        resolvability. An SGF-metadata net loaded as an EXTRA model
+        would be Searchable yet excluded from this comparison. The
+        proxy uses the only signal the wire has; the general fix is
+        engine-side (expose the role in query_models) and is a
+        reported KataGo-side finding, not a proxy patch.
+
+        Raises RosterAdmissionError on timeout or a malformed reply.
+        """
+        probe_id = f"roster_probe_{secrets.token_hex(6)}"
+        await ws.send(json.dumps({"id": probe_id, "action": "query_models"}))
+        deadline = monotonic() + cfg.ROSTER_PROBE_TIMEOUT_S
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise RosterAdmissionError(
+                    f"no query_models reply from {url} within "
+                    f"{cfg.ROSTER_PROBE_TIMEOUT_S}s (both vanilla and "
+                    f"model-and-cache engines answer it; a silent "
+                    f"member is broken or not an analysis endpoint)"
+                )
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                wire = loads_bounded(raw, max_depth=cfg.JSON_MAX_DEPTH)
+            except Exception as e:
+                raise RosterAdmissionError(
+                    f"unparseable frame from {url} during roster "
+                    f"probe: {e}"
+                )
+            if not isinstance(wire, dict) or wire.get("id") != probe_id:
+                # Stray frame (e.g. a late reply to a pre-disconnect
+                # query): not ours, keep waiting within the deadline.
+                continue
+            if "error" in wire:
+                raise RosterAdmissionError(
+                    f"{url} refused the roster probe: {wire['error']!r}"
+                )
+            models = wire.get("models")
+            if not isinstance(models, list):
+                raise RosterAdmissionError(
+                    f"{url} answered the roster probe without a "
+                    f"'models' array: keys={sorted(wire.keys())}"
+                )
+            names: set[str] = set()
+            for entry in models:
+                if not isinstance(entry, dict):
+                    raise RosterAdmissionError(
+                        f"{url} roster entry is not an object: {entry!r}"
+                    )
+                if entry.get("usesHumanSLProfile"):
+                    continue
+                internal = entry.get("internalName")
+                if not isinstance(internal, str):
+                    raise RosterAdmissionError(
+                        f"{url} roster entry lacks a string "
+                        f"internalName: keys={sorted(entry.keys())}"
+                    )
+                names.add(internal)
+            return frozenset(names)
+
+    def _verify_roster(self, url: str, roster: frozenset[str]) -> None:
+        """Enforce searchable-roster set-equality against the connected ring.
+
+        The reference is the currently-connected members' agreed roster
+        (all equal by this same check); an empty ring re-seeds from the
+        next admitted member, so a full drain converges a rolling
+        roster change. Set-equality (not a weaker subset condition) is
+        the self-contained invariant: the RELAY cannot see any SELECTOR
+        config above it, and equality implies that every model value
+        any member can honor, all members honor.
+
+        Raises RosterAdmissionError naming both urls and both rosters.
+        """
+        for ref_url, ref_roster in self._roster_for_url.items():
+            if ref_url not in self._connections:
+                continue
+            if roster != ref_roster:
+                raise RosterAdmissionError(
+                    f"roster divergence: {url} hosts "
+                    f"{sorted(roster) or '(none)'} but ring member "
+                    f"{ref_url} hosts {sorted(ref_roster) or '(none)'}; "
+                    f"every ring member must host the same searchable "
+                    f"models (align the members' -model/-extra-model/"
+                    f"extraModelFile configs, or remove the divergent "
+                    f"member from UPSTREAM_URLS)"
+                )
+            return
+        # No connected member holds a roster: this member seeds it.
 
     async def _reconnect_with_backoff(self, url: str) -> None:
         delay = 2.0
@@ -1355,6 +1554,11 @@ class RelayRouter(BackendRouter):
         finally:
             was_connected = url in self._connections
             self._connections.pop(url, None)
+            # Roster leaves with the connection: the member's next
+            # admission re-probes (its engine may have restarted with a
+            # different model set), and an empty ring re-seeds the
+            # reference roster from whoever returns first.
+            self._roster_for_url.pop(url, None)
             self._reader_tasks.pop(url, None)
             if was_connected:
                 # Already-disconnected case (the upstream_disconnect was

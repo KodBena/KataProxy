@@ -274,9 +274,16 @@ consequences any new router author must preserve:
 
   1. Single-writer: on the SELECTOR's forwarded side, only config ever
      populates `model`. Client values die at the boundary.
-  2. RELAY ring members must share a model roster (documented contract;
-     the engine's per-query refusal is the loud backstop; a mechanical
-     admission-time query_models check is the named follow-up).
+  2. RELAY ring members must share a searchable-model roster —
+     MECHANICALLY CHECKED at admission since v1.0.33: `_connect`
+     probes each member with a bare `query_models` before it enters
+     the ring and refuses divergence (`RosterAdmissionError`), retried
+     by the existing reconnect-with-backoff. Reconnect re-verifies,
+     which is complete coverage (rosters are process-static; changing
+     one requires an engine restart, which drops the socket). Vanilla
+     and model-and-cache engines answer `query_models` with one
+     response shape (fork-point ccdec959 vs branch: same keys, wider
+     array), so there is no vanilla degrade path.
   3. The replay-cache key is salted with the SELECTOR's
      label→url|engine mapping (`PubSubHub.cache_key_salt`), so a config
      remap misses instead of replaying the old mapping's streams. Any

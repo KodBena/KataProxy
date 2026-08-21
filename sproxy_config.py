@@ -135,6 +135,17 @@ CACHE_VERB_TIMEOUT_S: float = float(
     os.environ.get("PROXY_CACHE_VERB_TIMEOUT_S", "120")
 )
 
+# RELAY roster admission check (v1.0.33): how long the admission probe
+# (a bare query_models sent before a member enters the ring) waits for
+# the member's reply. A member that cannot answer within this window is
+# refused admission and retried by the existing reconnect-with-backoff.
+# Vanilla KataGo and the model-and-cache branch both answer
+# query_models with one response shape, so a silent member is broken or
+# not an analysis endpoint — fail loud, not fail open.
+ROSTER_PROBE_TIMEOUT_S: float = float(
+    os.environ.get("PROXY_ROSTER_PROBE_TIMEOUT_S", "15")
+)
+
 # ---------------------------------------------------------------------------
 # Hub replay-cache bound (v1.0.4)
 # ---------------------------------------------------------------------------
