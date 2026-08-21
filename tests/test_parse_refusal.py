@@ -30,8 +30,12 @@ _PROXY_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
-from katago import SUPPORTED_WIRE_ACTIONS  # noqa: E402
-from AbstractProxy.proxy_core import CanonicalId  # noqa: E402
+from katago import (  # noqa: E402
+    SUPPORTED_WIRE_ACTIONS,
+    structured_error_wire,
+)
+from AbstractProxy.proxy_core import CanonicalId, ClientId  # noqa: E402
+from katago import KataGoAction, KataGoQuery  # noqa: E402
 from proxy_server import ClientSession  # noqa: E402
 
 
@@ -180,6 +184,57 @@ async def test_non_json_stays_silent() -> None:
     session, ws, _ = _make_session()
     await session._handle_incoming("this is not json {")
     assert ws.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Translation-layer refusal (proxy_server.py `_handle_query`): a wire
+# query whose populated terminateId names no in-flight query is refused
+# to the asking client; a middleware-injected query with the same
+# defect stays wire-silent (its orig_id is not client-namespace).
+# ---------------------------------------------------------------------------
+
+async def test_wire_query_with_unknown_terminate_id_refused() -> None:
+    session, ws, hub = _make_session()
+    await session._handle_incoming(json.dumps(
+        {"id": "q9", "moves": [], "terminateId": "never-existed"}
+    ))
+    reply = _only_reply(ws)
+    assert reply["id"] == "q9"
+    assert reply["field"] == "terminateId"
+    assert "never-existed" in reply["error"]
+    assert hub.subscriptions == []
+
+
+async def test_injected_query_with_unknown_terminate_id_stays_silent() -> None:
+    session, ws, _ = _make_session()
+    injected = KataGoQuery(
+        action=KataGoAction.ANALYZE,
+        terminate_id="never-existed",
+        opaque={"moves": []},
+    )
+    # The submit_query callback shape: no refuse_to_client.
+    await session._handle_query(ClientId("orch-internal-1"), injected)
+    assert ws.sent == []
+
+
+# ---------------------------------------------------------------------------
+# structured_error_wire is the single writer of the error shape.
+# ---------------------------------------------------------------------------
+
+def test_structured_error_wire_full_shape() -> None:
+    assert structured_error_wire("boom", error_id="x", field="model") == {
+        "id": "x", "error": "boom", "field": "model",
+    }
+
+
+def test_structured_error_wire_omits_absent_parts() -> None:
+    assert structured_error_wire("boom") == {"error": "boom"}
+    assert structured_error_wire("boom", field="id") == {
+        "error": "boom", "field": "id",
+    }
+    assert structured_error_wire("boom", error_id="x") == {
+        "id": "x", "error": "boom",
+    }
 
 
 # ---------------------------------------------------------------------------

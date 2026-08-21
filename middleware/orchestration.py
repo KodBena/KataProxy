@@ -44,6 +44,7 @@ from katago import (
     KataGoQuery,
     KataGoResponse,
     MetadataResponse,
+    structured_error_wire,
 )
 from middleware.session_middleware import (
     ResponseStream,
@@ -546,9 +547,15 @@ class OrchestrationMiddleware(SessionMiddleware):
                     f"parent_id={parent_id!r}: {e}"
                 ),
             )
-            err_response = MetadataResponse(opaque={
-                "error": f"orchestration error in {self.name}: {e}",
-            })
+            # structured_error_wire is the single writer of the
+            # client-facing error shape; as the response's opaque it
+            # contributes the "error" key while the envelope id comes
+            # from translate_response_to_wire's parent_id relabelling.
+            err_response = MetadataResponse(
+                opaque=structured_error_wire(
+                    f"orchestration error in {self.name}: {e}",
+                ),
+            )
             if self._caps is not None:
                 try:
                     await self._caps.send_response(parent_id, err_response)

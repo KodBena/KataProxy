@@ -58,6 +58,7 @@ __all__ = [
     "register_query_completion",
     "KATAGO_QUERY_PRISMS",
     "SUPPORTED_WIRE_ACTIONS",
+    "structured_error_wire",
     "CACHE_KEY_EXCLUDED_FIELDS",
     "CompletionTracker",
     # Game-tree indexing brands (v1.0.22; see
@@ -610,6 +611,39 @@ def parse_query_from_wire(wire: dict[str, Any]) -> tuple[str, KataGoQuery]:
         opaque=opaque,
     )
     return envelope_id, query
+
+
+def structured_error_wire(
+    message: str,
+    *,
+    error_id: Optional[str] = None,
+    field: Optional[str] = None,
+) -> dict[str, Any]:
+    """Construct the proxy's structured-error wire shape.
+
+    ``{"id": error_id?, "error": message, "field": field?}`` — the one
+    writer of this shape. Every proxy-synthesised client-facing error
+    (router engine-dead / SELECTOR model refusals via
+    `_send_structured_error`, the session parse-layer refusals via
+    `_refuse_unmatched`) builds its frame here, so a future change to
+    the shape has exactly one site. It deliberately matches the KataGo
+    analysis engine's own error envelope (``reportErrorForId`` emits
+    ``id``/``field``/``error``), so a client sees one error vocabulary
+    whether the refusal came from the engine or from the proxy.
+
+    `error_id` is omitted (not null-filled) when the refusal has no
+    trustworthy id to correlate with — callers that echo a
+    client-supplied id are responsible for bounding it first (see
+    proxy_server's `_REFUSAL_ID_ECHO_MAX`). Parses as a
+    MetadataResponse (no ``isDuringSearch``/``turnNumber``).
+    """
+    wire: dict[str, Any] = {}
+    if error_id is not None:
+        wire["id"] = error_id
+    wire["error"] = message
+    if field is not None:
+        wire["field"] = field
+    return wire
 
 
 def parse_response_from_wire(wire: dict[str, Any]) -> tuple[str, KataGoResponse]:

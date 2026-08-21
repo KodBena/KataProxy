@@ -86,6 +86,7 @@ from katago import (
     translate_response_to_wire,
     KATAGO_QUERY_PRISMS,
     SUPPORTED_WIRE_ACTIONS,
+    structured_error_wire,
 )
 from AbstractProxy.proxy_core import (
     CanonicalId,
@@ -507,7 +508,7 @@ class ClientSession:
         else:
             # Notify middleware BEFORE routing so it can record expected turn count.
             self._middleware.on_query(orig_id, query)
-            await self._handle_query(orig_id, query)
+            await self._handle_query(orig_id, query, refuse_to_client=True)
 
     # Bounds on client-supplied strings the parse-layer refusal echoes
     # back. An `id` above the echo bound (or of non-str type — a wire
@@ -549,62 +550,89 @@ class ClientSession:
         ``id``. The defensive tail keeps totality under future prism
         drift.
         """
+        raw_id = outer.get("id")
+        echo_id: Optional[str] = (
+            raw_id
+            if isinstance(raw_id, str)
+            and len(raw_id) <= self._REFUSAL_ID_ECHO_MAX
+            else None
+        )
+
         action_val = outer.get("action")
         if "action" in outer and action_val not in SUPPORTED_WIRE_ACTIONS:
             shown = repr(action_val)
             if len(shown) > self._REFUSAL_ACTION_ECHO_MAX:
                 shown = shown[: self._REFUSAL_ACTION_ECHO_MAX] + "...(truncated)"
-            reply: Dict[str, Any] = {
-                "error": (
+            reply = structured_error_wire(
+                (
                     f"unrecognized action {shown}; accepted actions: "
                     f"{', '.join(SUPPORTED_WIRE_ACTIONS)} (an analyze "
                     f'query may also omit "action" entirely)'
                 ),
-                "field": "action",
-            }
+                error_id=echo_id,
+                field="action",
+            )
         elif "id" not in outer:
-            reply = {
-                "error": (
+            reply = structured_error_wire(
+                (
                     'missing required field "id"; every query must '
                     "carry a string id that responses echo back"
                 ),
-                "field": "id",
-            }
+                field="id",
+            )
         else:
             # Unreachable with the current prism set (see docstring);
             # kept so prism drift cannot silently reopen the
             # refused-into-the-log-only class.
-            reply = {
-                "error": (
-                    "malformed protocol message: no protocol shape "
-                    "matched"
-                ),
-            }
+            reply = structured_error_wire(
+                "malformed protocol message: no protocol shape matched",
+                error_id=echo_id,
+            )
 
-        raw_id = outer.get("id")
-        if isinstance(raw_id, str) and len(raw_id) <= self._REFUSAL_ID_ECHO_MAX:
-            reply["id"] = raw_id
+        await self._send_refusal(reply)
 
+    async def _send_refusal(self, reply: Dict[str, Any]) -> None:
+        """Deliver a structured refusal directly on the WebSocket.
+
+        Shared tail of every session-layer refusal (`_refuse_unmatched`,
+        the `_handle_query` translation refusal). Receive-loop-survives
+        posture (audit H-3): a refusal that cannot be delivered (peer
+        already closing) must not tear down the session.
+        """
         try:
             await self._ws.send(json.dumps(reply))
         except Exception:
-            # Receive-loop-survives posture (audit H-3): a refusal that
-            # cannot be delivered (peer already closing) must not tear
-            # down the session.
             self._log.debug(
                 Event.DIAGNOSTIC,
                 msg=(
-                    f"peer={self._peer} could not deliver parse-layer "
-                    f"refusal (connection closing?)"
+                    f"peer={self._peer} could not deliver refusal "
+                    f"(connection closing?)"
                 ),
             )
 
-    async def _handle_query(self, orig_id: ClientId, query: KataGoQuery) -> None:
+    async def _handle_query(
+        self,
+        orig_id: ClientId,
+        query: KataGoQuery,
+        *,
+        refuse_to_client: bool = False,
+    ) -> None:
         """Translate and submit a query through the full Transformer + hub/router pipeline.
 
         Used for both client-originated queries and middleware-injected queries.
         Middleware passes this method as the submit_query callback, so injected
         follow-up queries receive the same enrichment as the originals.
+
+        `refuse_to_client` is True only on the wire path
+        (`_handle_incoming`): a translation failure then draws a
+        structured refusal on the WebSocket in addition to the ERROR
+        log, closing the refused-into-the-log-only gap for the one
+        translate_downstream failure a client can cause (a populated
+        `terminateId` naming no in-flight query on this session).
+        Middleware-injected queries keep the default False — their
+        orig_id is not client-namespace, and echoing it to the wire
+        would leak an internal id, violating the id-namespace
+        invariant (`ARCHITECTURE.md` § "ID namespaces and translation").
         """
         try:
             env = self._chain.translate_downstream(Envelope(id=orig_id, payload=query))
@@ -614,6 +642,34 @@ class ClientSession:
                 orig=orig_id,
                 msg=f"translation error: {e}",
             )
+            if refuse_to_client:
+                echo_id = (
+                    orig_id
+                    if len(orig_id) <= self._REFUSAL_ID_ECHO_MAX
+                    else None
+                )
+                # TranslationError carries typed attributes:
+                # kind = "unknown_<field.name>" and identity = the
+                # unresolvable referenced id (see
+                # proxy_core.translate_referentials). The field name is
+                # derived from the exception, so a future referential
+                # field self-describes in the refusal.
+                bad_field = e.kind.removeprefix("unknown_")
+                ref_shown = repr(e.identity)
+                if len(ref_shown) > self._REFUSAL_ACTION_ECHO_MAX:
+                    ref_shown = (
+                        ref_shown[: self._REFUSAL_ACTION_ECHO_MAX]
+                        + "...(truncated)"
+                    )
+                await self._send_refusal(structured_error_wire(
+                    (
+                        f"unknown {bad_field} {ref_shown}: no in-flight "
+                        f"query with that id on this session (it may "
+                        f"have already completed)"
+                    ),
+                    error_id=echo_id,
+                    field=bad_field,
+                ))
             return
 
         if env is None:

@@ -50,6 +50,7 @@ from katago import (
     KataGoQuery,
     parse_response_from_wire,
     response_completion_signal,
+    structured_error_wire,
 )
 from proxy_json import loads_bounded, JsonDepthExceededError
 import sproxy_config as cfg
@@ -883,10 +884,9 @@ class LeafRouter(BackendRouter):
         self._callbacks.clear()
         for canonical_id, (on_response, on_complete) in in_flight:
             self._tracker.cancel(canonical_id)
-            error_wire: WireDict = {
-                "id": canonical_id,
-                "error": self._ENGINE_DEAD_ERROR,
-            }
+            error_wire: WireDict = structured_error_wire(
+                self._ENGINE_DEAD_ERROR, error_id=canonical_id,
+            )
             try:
                 await on_response(canonical_id, error_wire)
                 await on_complete(canonical_id)
@@ -940,10 +940,9 @@ class LeafRouter(BackendRouter):
                     f"failing {canonical_id!r} loudly"
                 ),
             )
-            error_wire: WireDict = {
-                "id": canonical_id,
-                "error": self._ENGINE_DEAD_ERROR,
-            }
+            error_wire: WireDict = structured_error_wire(
+                self._ENGINE_DEAD_ERROR, error_id=canonical_id,
+            )
             await on_response(canonical_id, error_wire)
             await on_complete(canonical_id)
             return
@@ -965,10 +964,9 @@ class LeafRouter(BackendRouter):
             )
             self._tracker.cancel(canonical_id)
             self._callbacks.pop(canonical_id, None)
-            error_wire = {
-                "id": canonical_id,
-                "error": self._ENGINE_DEAD_ERROR,
-            }
+            error_wire = structured_error_wire(
+                self._ENGINE_DEAD_ERROR, error_id=canonical_id,
+            )
             await on_response(canonical_id, error_wire)
             await on_complete(canonical_id)
             return
@@ -2047,9 +2045,9 @@ class SelectorRouter(BackendRouter):
         Single response, immediate completion. Mirrors the structured
         errors the LeafRouter emits when KataGo is unavailable.
         """
-        wire: WireDict = {"id": canonical_id, "error": message}
-        if field is not None:
-            wire["field"] = field
+        wire: WireDict = structured_error_wire(
+            message, error_id=canonical_id, field=field,
+        )
         await on_response(canonical_id, wire)
         await on_complete(canonical_id)
 
