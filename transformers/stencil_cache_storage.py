@@ -163,9 +163,9 @@ local should_store = true
 
 if old_raw then
     local ok, old = pcall(cjson.decode, old_raw)
-    if ok and old.version == tonumber(ARGV[4]) then
-        local old_status = tonumber(old.status)
-        local old_cost = tonumber(old.tile_count)
+    local old_status = ok and old.version == tonumber(ARGV[4]) and tonumber(old.status) or nil
+    local old_cost = ok and old.version == tonumber(ARGV[4]) and tonumber(old.tile_count) or nil
+    if old_status ~= nil and old_cost ~= nil then
         if old_status == 0 and new_status == 0 and old_cost ~= new_cost then
             return -1
         end
@@ -268,7 +268,7 @@ class RedisStencilStore:
     def hard_components(self, family: Any) -> FrozenSet[bytes]:
         """Return the canonical component keys awaiting a more thorough solve."""
         members = self._client.smembers(self._hard_set_key(family))
-        result = set()
+        result: set[bytes] = set()
         for member in members:
             if isinstance(member, bytes):
                 result.add(member)
