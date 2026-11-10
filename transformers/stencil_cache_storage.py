@@ -17,11 +17,103 @@ import json
 import logging
 import math
 import threading
+import time
 from inspect import signature
 from typing import Any, Callable, Dict, FrozenSet, TypeVar, cast
 
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger("kataproxy.stencil_cache_storage")
+
+_INVALIDATORS: Dict[str, list[Callable[[], None]]] = {}
+_INVALIDATOR_THREADS: Dict[str, threading.Thread] = {}
+_PERSISTENT_CLIENTS: Dict[str, Any] = {}
+_INVALIDATOR_LOCK = threading.RLock()
+
+
+def _invalidation_channel(namespace: str) -> str:
+    return f"kataproxy:stencil-cover:{namespace}:invalidate"
+
+
+def _dispatch_cache_invalidation(namespace: str) -> None:
+    with _INVALIDATOR_LOCK:
+        callbacks = tuple(_INVALIDATORS.get(namespace, ()))
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            logger.exception("Local stencil-cache invalidation callback failed")
+
+
+def register_cache_invalidator(
+    namespace: str, callback: Callable[[], None],
+) -> bool:
+    """Clear a process-local cache when another process upgrades a Redis row.
+
+    Redis Pub/Sub is consumed by a daemon thread, never by the solver hot path.
+    Re-subscribing also clears the local cache, covering upgrades published
+    while this process was disconnected from Redis.
+    """
+    with _INVALIDATOR_LOCK:
+        callbacks = _INVALIDATORS.setdefault(namespace, [])
+        if callback not in callbacks:
+            callbacks.append(callback)
+        client = _PERSISTENT_CLIENTS.get(namespace)
+        if client is None or not callable(getattr(client, "pubsub", None)):
+            return False
+        thread = _INVALIDATOR_THREADS.get(namespace)
+        if thread is not None and thread.is_alive():
+            return True
+
+        def listen() -> None:
+            while True:
+                pubsub = None
+                try:
+                    pubsub = client.pubsub(ignore_subscribe_messages=True)
+                    pubsub.subscribe(_invalidation_channel(namespace))
+                    _dispatch_cache_invalidation(namespace)
+                    while True:
+                        message = pubsub.get_message(timeout=1.0)
+                        if message is None:
+                            continue
+                        if message.get("type") == "message":
+                            _dispatch_cache_invalidation(namespace)
+                except Exception as exc:
+                    logger.warning(
+                        "Stencil-cache invalidation subscription disconnected "
+                        "for namespace %s; retrying (%s)",
+                        namespace, exc,
+                    )
+                    time.sleep(2.0)
+                finally:
+                    if pubsub is not None:
+                        try:
+                            pubsub.close()
+                        except Exception:
+                            pass
+
+        thread = threading.Thread(
+            target=listen,
+            name=f"stencil-cache-invalidator-{namespace}",
+            daemon=True,
+        )
+        _INVALIDATOR_THREADS[namespace] = thread
+        thread.start()
+        return True
+
+
+def create_redis_client() -> Any:
+    """Connect to the proxy's dedicated Redis database, failing explicitly."""
+    redis_module = importlib.import_module("redis")
+    client = redis_module.Redis(
+        host=_REDIS_HOST,
+        port=_REDIS_PORT,
+        db=_REDIS_DB,
+        socket_connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+        socket_timeout=_SOCKET_TIMEOUT_SECONDS,
+        decode_responses=False,
+    )
+    client.ping()
+    return client
 
 _REDIS_HOST = "127.0.0.1"
 _REDIS_PORT = 6379
@@ -197,8 +289,14 @@ local final_raw = redis.call('GET', KEYS[1])
 local final = cjson.decode(final_raw)
 if tonumber(final.status) == 0 then
     redis.call('SREM', KEYS[2], ARGV[5])
+    redis.call('SREM', KEYS[3], ARGV[5])
+    redis.call('HDEL', KEYS[4], ARGV[5])
 else
     redis.call('SADD', KEYS[2], ARGV[5])
+    if should_store then
+        redis.call('SADD', KEYS[3], ARGV[5])
+        redis.call('HDEL', KEYS[4], ARGV[5])
+    end
 end
 
 if should_store then
@@ -207,14 +305,35 @@ end
 return 0
 """
 
+_MARK_TIMED_OUT_SCRIPT = """
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
+    return 0
+end
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then
+    return 0
+end
+local raw = redis.call('GET', KEYS[3])
+if not raw then
+    return 0
+end
+local ok, result = pcall(cjson.decode, raw)
+if not ok or tonumber(result.status) == 0 then
+    redis.call('SREM', KEYS[1], ARGV[1])
+    redis.call('HDEL', KEYS[4], ARGV[1])
+    return 0
+end
+redis.call('HSET', KEYS[4], ARGV[1], ARGV[2])
+redis.call('SREM', KEYS[2], ARGV[1])
+return 1
+"""
 
 class RedisStencilStore:
-    """Store best results and enumerate components whose solve was not optimal.
+    """Persist best results and maintain pending and timed-out component indexes.
 
-    The hard-instance set is partitioned by namespace and complete stencil
-    family. Its members are the canonical component keys themselves, so a
-    bulk solver can reconstruct each problem without a second payload or any
-    saved HiGHS state.
+    Hard components are all non-optimal problems. Pending components are the
+    subset not yet given the bulk solver's full time budget. Timeout metadata
+    remains durable after a worker attempt so hard components are not retried
+    continuously.
     """
 
     def __init__(self, client: Any, namespace: str) -> None:
@@ -235,12 +354,33 @@ class RedisStencilStore:
         })
         return f"kataproxy:stencil-cover:{self._namespace}:result:{digest}"
 
-    def _hard_set_key(self, family: Any) -> str:
+    def _family_key(self, kind: str, family: Any) -> str:
         fingerprint = _stable_digest(family)
         return (
             f"kataproxy:stencil-cover:{self._namespace}:"
-            f"hard:{fingerprint}"
+            f"{kind}:{fingerprint}"
         )
+
+    def _hard_set_key(self, family: Any) -> str:
+        return self._family_key("hard", family)
+
+    def _pending_set_key(self, family: Any) -> str:
+        return self._family_key("pending", family)
+
+    def _timeout_hash_key(self, family: Any) -> str:
+        return self._family_key("timeouts", family)
+
+    def _members(self, redis_key: str) -> FrozenSet[bytes]:
+        members = self._client.smembers(redis_key)
+        result: set[bytes] = set()
+        for member in members:
+            if isinstance(member, bytes):
+                result.add(member)
+            elif isinstance(member, str):
+                result.add(member.encode("latin-1"))
+            else:
+                raise ValueError("Redis stencil index contains a non-byte member")
+        return frozenset(result)
 
     def get_result(
         self, shape_key: bytes, family: Any,
@@ -256,16 +396,16 @@ class RedisStencilStore:
         family: Any,
         result: tuple[bool, int, bytes],
     ) -> bool:
-        """Persist an incumbent or optimum; never replace a better result."""
+        """Persist a result, queueing each newly improved non-optimal result."""
         _optimal, status, _placements, cost = _result_fields(result)
         raw = _encode_solver_result(result)
-        result_key = self._problem_key(shape_key, family)
-        hard_key = self._hard_set_key(family)
         outcome = self._client.eval(
             _STORE_RESULT_SCRIPT,
-            2,
-            result_key,
-            hard_key,
+            4,
+            self._problem_key(shape_key, family),
+            self._hard_set_key(family),
+            self._pending_set_key(family),
+            self._timeout_hash_key(family),
             raw,
             str(status),
             str(cost),
@@ -276,20 +416,76 @@ class RedisStencilStore:
             raise RedisCacheConflict(
                 "two optimal stencil covers disagree on the same canonical component"
             )
-        return bool(outcome)
+        updated = bool(outcome)
+        if updated:
+            try:
+                self._client.publish(
+                    _invalidation_channel(self._namespace), b"result-updated",
+                )
+            except Exception as exc:
+                # Persistence is already committed. A missed notification is
+                # repaired when a disconnected subscriber reconnects.
+                logger.warning("Could not publish stencil-cache invalidation (%s)", exc)
+        return updated
 
     def hard_components(self, family: Any) -> FrozenSet[bytes]:
-        """Return the canonical component keys awaiting a more thorough solve."""
-        members = self._client.smembers(self._hard_set_key(family))
-        result: set[bytes] = set()
-        for member in members:
-            if isinstance(member, bytes):
-                result.add(member)
-            elif isinstance(member, str):
-                result.add(member.encode("latin-1"))
-            else:
-                raise ValueError("Redis hard-instance index contains a non-byte member")
-        return frozenset(result)
+        """Return every canonical component whose result is not yet optimal."""
+        return self._members(self._hard_set_key(family))
+
+    def pending_components(self, family: Any) -> FrozenSet[bytes]:
+        """Return non-optimal components not yet processed at the bulk budget."""
+        return self._members(self._pending_set_key(family))
+
+    def timeout_metadata(self, shape_key: bytes, family: Any) -> Dict[str, Any] | None:
+        raw = self._client.hget(self._timeout_hash_key(family), shape_key)
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if not isinstance(raw, str):
+            raise ValueError("Redis timeout metadata is not bytes or text")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise ValueError("Redis timeout metadata has an unsupported schema")
+        return value
+
+    def mark_timed_out(
+        self,
+        shape_key: bytes,
+        family: Any,
+        result: tuple[bool, int, bytes],
+        *,
+        time_limit_ms: int,
+        attempted_at: float,
+    ) -> bool:
+        """Persist why a hard component was retired from the pending queue."""
+        optimal, status, _placements, cost = _result_fields(result)
+        if optimal or status == 0:
+            raise ValueError("an optimal result cannot be marked as timed out")
+        metadata = json.dumps(
+            {
+                "version": 1,
+                "reason": "time_limit_reached_without_proving_optimality",
+                "time_limit_ms": int(time_limit_ms),
+                "status": int(status),
+                "tile_count": int(cost),
+                "attempted_at": float(attempted_at),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        outcome = self._client.eval(
+            _MARK_TIMED_OUT_SCRIPT,
+            4,
+            self._hard_set_key(family),
+            self._pending_set_key(family),
+            self._problem_key(shape_key, family),
+            self._timeout_hash_key(family),
+            shape_key,
+            metadata,
+        )
+        return bool(outcome)
+
 
 
 def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
@@ -307,16 +503,9 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
 
     def decorate(function: F) -> F:
         try:
-            redis_module = importlib.import_module("redis")
-            client = redis_module.Redis(
-                host=_REDIS_HOST,
-                port=_REDIS_PORT,
-                db=_REDIS_DB,
-                socket_connect_timeout=_CONNECT_TIMEOUT_SECONDS,
-                socket_timeout=_SOCKET_TIMEOUT_SECONDS,
-                decode_responses=False,
-            )
-            client.ping()
+            client = create_redis_client()
+            with _INVALIDATOR_LOCK:
+                _PERSISTENT_CLIENTS[namespace] = client
         except Exception as exc:
             logger.warning(
                 "Redis stencil cache unavailable at %s:%d db=%d; "
@@ -372,7 +561,14 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
 
             result = function(*args, **kwargs)
             try:
-                store.put_result(shape_key, family, result)
+                updated = store.put_result(shape_key, family, result)
+                if not updated:
+                    # A concurrent worker or request may already have stored a
+                    # better result. Return that row so the outer LRU cannot
+                    # re-cache a stale incumbent after an invalidation race.
+                    latest = store.get_result(shape_key, family)
+                    if latest is not None:
+                        return latest
             except RedisCacheConflict:
                 raise
             except Exception as exc:
