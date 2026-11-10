@@ -729,7 +729,7 @@ def _verify_component_placements(
     for placement in placements:
         name = placement.get("stencil")
         points = placement.get("points")
-        if name not in names or not isinstance(points, list) or not points:
+        if (name not in names and name != "1x1") or not isinstance(points, list) or not points:
             raise RuntimeError("cached stencil placement has an unknown shape or no points")
         coordinates: List[Tuple[int, int]] = []
         flattened: List[int] = []
