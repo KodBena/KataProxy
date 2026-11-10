@@ -327,6 +327,19 @@ redis.call('SREM', KEYS[2], ARGV[1])
 return 1
 """
 
+_INITIALIZE_PENDING_SCRIPT = """
+if redis.call('SETNX', KEYS[4], '1') == 0 then
+    return 0
+end
+local queued = 0
+for _, shape_key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+    if redis.call('HEXISTS', KEYS[3], shape_key) == 0 then
+        queued = queued + redis.call('SADD', KEYS[2], shape_key)
+    end
+end
+return queued
+"""
+
 class RedisStencilStore:
     """Persist best results and maintain pending and timed-out component indexes.
 
@@ -369,6 +382,25 @@ class RedisStencilStore:
 
     def _timeout_hash_key(self, family: Any) -> str:
         return self._family_key("timeouts", family)
+
+    def _pending_initialized_key(self, family: Any) -> str:
+        return self._family_key("pending-initialized", family)
+
+    def initialize_pending_queue(self, family: Any) -> int:
+        """Seed the new queue from pre-existing non-optimal v3 result indexes.
+
+        This one-time atomic migration preserves components cached before the
+        pending queue existed. A marker prevents rescanning the hard index on
+        every worker poll or after process restarts.
+        """
+        return int(self._client.eval(
+            _INITIALIZE_PENDING_SCRIPT,
+            4,
+            self._hard_set_key(family),
+            self._pending_set_key(family),
+            self._timeout_hash_key(family),
+            self._pending_initialized_key(family),
+        ))
 
     def _members(self, redis_key: str) -> FrozenSet[bytes]:
         members = self._client.smembers(redis_key)
