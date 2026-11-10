@@ -57,20 +57,27 @@ def register_cache_invalidator(
         callbacks = _INVALIDATORS.setdefault(namespace, [])
         if callback not in callbacks:
             callbacks.append(callback)
-        client = _PERSISTENT_CLIENTS.get(namespace)
-        if client is None or not callable(getattr(client, "pubsub", None)):
-            return False
         thread = _INVALIDATOR_THREADS.get(namespace)
         if thread is not None and thread.is_alive():
             return True
 
         def listen() -> None:
+            warned = False
             while True:
                 pubsub = None
                 try:
+                    with _INVALIDATOR_LOCK:
+                        client = _PERSISTENT_CLIENTS.get(namespace)
+                    if client is None:
+                        client = create_redis_client()
+                        with _INVALIDATOR_LOCK:
+                            _PERSISTENT_CLIENTS[namespace] = client
+                    if not callable(getattr(client, "pubsub", None)):
+                        return
                     pubsub = client.pubsub(ignore_subscribe_messages=True)
                     pubsub.subscribe(_invalidation_channel(namespace))
                     _dispatch_cache_invalidation(namespace)
+                    warned = False
                     while True:
                         message = pubsub.get_message(timeout=1.0)
                         if message is None:
@@ -78,11 +85,13 @@ def register_cache_invalidator(
                         if message.get("type") == "message":
                             _dispatch_cache_invalidation(namespace)
                 except Exception as exc:
-                    logger.warning(
-                        "Stencil-cache invalidation subscription disconnected "
-                        "for namespace %s; retrying (%s)",
-                        namespace, exc,
-                    )
+                    if not warned:
+                        logger.warning(
+                            "Stencil-cache invalidation subscription disconnected "
+                            "for namespace %s; retrying (%s)",
+                            namespace, exc,
+                        )
+                        warned = True
                     time.sleep(2.0)
                 finally:
                     if pubsub is not None:
