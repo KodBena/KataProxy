@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 KataGo response enricher for signed ownership stencil covers.
 
