@@ -201,7 +201,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 logger.info("Bulk stencil pass: %s", counts)
             if args.once:
                 return 0
-            if counts["attempted"] == 0:
+            if counts["attempted"] == 0 or counts["skipped"] > 0:
+                # Avoid a tight error loop if an index entry is malformed or
+                # Redis temporarily rejects one component's result.
                 time.sleep(args.poll_interval)
     except KeyboardInterrupt:
         logger.info("Bulk stencil worker stopped")
