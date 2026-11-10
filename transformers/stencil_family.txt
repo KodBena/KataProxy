@@ -132,3 +132,73 @@ name: 6x3
 ###
 ###
 ###
+
+name: S-tetromino-1
+.##
+##.
+
+name: S-tetromino-2
+#.
+##
+.#
+
+name: S-tetromino-3
+##.
+.##
+
+name: S-tetromino-4
+.#
+##
+#.
+
+name: L-tetromino-1
+#.
+#.
+##
+
+name: L-tetromino-2
+###
+#..
+
+name: L-tetromino-3
+##
+.#
+.#
+
+name: L-tetromino-4
+..#
+###
+
+name: L-tetromino-5
+##
+#.
+#.
+
+name: L-tetromino-6
+.#
+.#
+##
+
+name: L-tetromino-7
+###
+..#
+
+name: L-tetromino-8
+#..
+###
+
+name: L-tromino-1
+#.
+##
+
+name: L-tromino-2
+##
+#.
+
+name: L-tromino-3
+##
+.#
+
+name: L-tromino-4
+.#
+##
