@@ -143,7 +143,7 @@ def test_rectangle_family_has_the_full_d4_stabilizer() -> None:
 
 def test_component_shape_key_merges_all_eight_dihedral_images() -> None:
     shape = ((0, 0), (1, 0), (1, 1))
-    keys = []
+    keys: List[bytes] = []
     for transform in range(8):
         mapped = [
             stencil._transform_cell(y, x, transform)
@@ -208,7 +208,7 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base_shape = ((0, 0), (1, 0), (1, 1))
-    unique_shapes = []
+    unique_shapes: List[tuple[tuple[int, int], ...]] = []
     for transform in range(8):
         candidate = stencil._normalise_shape(base_shape, transform)
         if candidate not in unique_shapes:
@@ -237,7 +237,7 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
 
     monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
 
-    recovered = []
+    recovered: List[List[Dict[str, Any]]] = []
     for transform in range(8):
         mapped = [
             stencil._transform_cell(y, x, transform)
