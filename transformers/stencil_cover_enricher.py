@@ -347,7 +347,7 @@ def _decode_cached_placements(
     """Decode placements as wire [column, row_from_top] coordinates.
 
     The source indices are KataGo row-major (row zero at the top). The SPA
-    translates this wire point into its bottom-origin BoardPoint at the
+    translates this wire point into its bottom-origin Point at the
     geometry boundary; do not pre-flip y here.
     """
     x0, y0, local_width, _local_height = frame
@@ -502,7 +502,7 @@ def _solve_region(
         components.append({
             # Wire cells are [column, row_from_top], directly derived from
             # KataGo's row-major flat index. The SPA owns the one conversion
-            # to its internal bottom-origin BoardPoint.
+            # to its internal bottom-origin Point.
             # Keep these exact solver-input cells even for fallback results.
             "cells": [
                 [point % width, point // width]
