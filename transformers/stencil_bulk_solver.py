@@ -78,6 +78,7 @@ class StencilBulkSolver:
     ) -> None:
         self.store = store
         self.family = family
+        self.store.initialize_pending_queue(self.family)
         self.solve = solve
         self.clock = clock
 
