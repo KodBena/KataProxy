@@ -34,7 +34,7 @@ def _invalidation_channel(namespace: str) -> str:
     return f"kataproxy:stencil-cover:{namespace}:invalidate"
 
 
-def _dispatch_cache_invalidation(namespace: str, shape_key: bytes = b\"\") -> None:
+def _dispatch_cache_invalidation(namespace: str, shape_key: bytes = b"") -> None:
     with _INVALIDATOR_LOCK:
         callbacks = tuple(_INVALIDATORS.get(namespace, ()))
     for callback in callbacks:
