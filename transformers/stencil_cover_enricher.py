@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import re
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import highspy
@@ -32,7 +33,10 @@ import numpy as np
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, KataGoResponse
-from transformers.stencil_cache_storage import redis_persistent_cache
+from transformers.stencil_cache_storage import (
+    redis_persistent_cache,
+    register_cache_invalidator,
+)
 
 Stencil = Tuple[str, Tuple[Tuple[int, int], ...]]
 
@@ -759,11 +763,7 @@ def _verify_component_placements(
         raise RuntimeError("cached stencil placements leave component cells uncovered")
 
 
-# The local LRU is outermost: hits avoid Redis I/O; only local misses consult
-# the persistent cache below it. Redis is optional and degrades to no-op.
-@lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)
-@redis_persistent_cache(namespace="solver-component-d4-v3")
-def _solve_component_cached(
+def _solve_component_uncached(
     shape_key: bytes,
     time_limit_ms: int,
     family: Tuple[Stencil, ...],
@@ -840,6 +840,53 @@ def _solve_component_cached(
     selected = [candidates[column] for column in chosen]
     encoded = _encode_cached_placements(selected, family)
     return bool(optimal), 2 if fallback else (0 if optimal else 1), encoded
+
+
+# The request path uses a large local LRU and a Redis-backed miss handler.
+# The bulk worker calls _solve_component_uncached directly with its larger
+# budget. Pub/Sub notifications invalidate this local LRU after a worker
+# upgrades a Redis row; generation checking closes the race where an
+# in-flight request might otherwise reinsert a stale incumbent after clear().
+_SOLVER_CACHE_NAMESPACE = "solver-component-d4-v3"
+_solver_component_persistent = redis_persistent_cache(
+    namespace=_SOLVER_CACHE_NAMESPACE,
+)(_solve_component_uncached)
+_solver_component_lru = lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)(
+    _solver_component_persistent
+)
+_solver_cache_lock = threading.RLock()
+_solver_cache_generation = 0
+
+
+def _invalidate_component_cache() -> None:
+    global _solver_cache_generation
+    with _solver_cache_lock:
+        _solver_cache_generation += 1
+        _solver_component_lru.cache_clear()
+
+
+def _solve_component_cached(
+    shape_key: bytes,
+    time_limit_ms: int,
+    family: Tuple[Stencil, ...],
+) -> Tuple[bool, int, bytes]:
+    while True:
+        with _solver_cache_lock:
+            generation = _solver_cache_generation
+        result = _solver_component_lru(shape_key, time_limit_ms, family)
+        with _solver_cache_lock:
+            if generation == _solver_cache_generation:
+                return result
+            # An invalidation raced with computation and may have happened
+            # before functools.lru_cache inserted that computation's value.
+            _solver_component_lru.cache_clear()
+
+
+_solve_component_cached.cache_info = _solver_component_lru.cache_info  # type: ignore[attr-defined]
+_solve_component_cached.cache_clear = _invalidate_component_cache  # type: ignore[attr-defined]
+register_cache_invalidator(
+    _SOLVER_CACHE_NAMESPACE, _invalidate_component_cache,
+)
 
 
 def _solve_region(
