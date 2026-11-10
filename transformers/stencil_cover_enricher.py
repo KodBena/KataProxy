@@ -344,7 +344,12 @@ def _decode_cached_placements(
     family: Sequence[Stencil],
     frame: Tuple[int, int, int, int],
 ) -> List[Dict[str, Any]]:
-    """Decode local-point placements and translate them into board coordinates."""
+    """Decode placements as wire [column, row_from_top] coordinates.
+
+    The source indices are KataGo row-major (row zero at the top). The SPA
+    translates this wire point into its bottom-origin BoardPoint at the
+    geometry boundary; do not pre-flip y here.
+    """
     x0, y0, local_width, _local_height = frame
     if len(encoded) < 2:
         raise ValueError("cached stencil solution is truncated")
@@ -495,9 +500,10 @@ def _solve_region(
         else:
             raise RuntimeError(f"unknown cached stencil solver status: {status!r}")
         components.append({
-            # These are the exact row-major cells passed to the component
-            # cache/solver, represented in board [x, y] coordinates. Keep
-            # them even when the solver uses a fallback or partial incumbent.
+            # Wire cells are [column, row_from_top], directly derived from
+            # KataGo's row-major flat index. The SPA owns the one conversion
+            # to its internal bottom-origin BoardPoint.
+            # Keep these exact solver-input cells even for fallback results.
             "cells": [
                 [point % width, point // width]
                 for point in component
