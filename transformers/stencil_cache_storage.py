@@ -331,7 +331,11 @@ if not raw then
     return 0
 end
 local ok, result = pcall(cjson.decode, raw)
-if not ok or tonumber(result.status) == 0 then
+local result_status = nil
+if ok and type(result) == 'table' then
+    result_status = tonumber(result.status)
+end
+if result_status == nil or result_status < 1 or result_status > 2 then
     redis.call('SREM', KEYS[1], ARGV[1])
     redis.call('SREM', KEYS[2], ARGV[1])
     redis.call('HDEL', KEYS[4], ARGV[1])
@@ -512,7 +516,7 @@ class RedisStencilStore:
         attempted_at: float,
     ) -> bool:
         """Persist why a hard component was retired from the pending queue."""
-        optimal, status, _placements, cost = _result_fields(result)
+        optimal, status, _placements, _cost = _result_fields(result)
         if optimal or status == 0:
             raise ValueError("an optimal result cannot be marked as timed out")
         metadata = json.dumps(
