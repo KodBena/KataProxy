@@ -257,8 +257,8 @@ def _decode_solver_result(raw: Any) -> tuple[bool, int, bytes]:
     return optimal, status, encoded_placements
 
 
-# A single Lua operation stores the new result only if it improves the current
-# one, and keeps the hard-instance index consistent with the best stored row.
+# A single Lua operation stores improvements and atomically maintains the
+# hard index, pending queue, and timeout metadata for the best stored row.
 # Status order is 0 (optimal), 1 (feasible incumbent), 2 (fallback). Within the
 # same non-optimal status, fewer tiles is better.
 _STORE_RESULT_SCRIPT = """
