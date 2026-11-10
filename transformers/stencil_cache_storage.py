@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Optional Redis persistence for the stencil component solver cache.
 
-SPDX-License-Identifier: MIT
-
 The process-local LRU remains the first cache layer. This decorator is placed
 inside it, so Redis is consulted only after a local cache miss. If Redis is
 unavailable during decoration, the function is returned unchanged and the
