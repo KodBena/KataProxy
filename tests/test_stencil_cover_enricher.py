@@ -684,7 +684,6 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
         return approximation
 
     wrapped = storage.redis_persistent_cache("approximation-test")(solve)
-    family = (("dot", ((0, 0),)),)
     shape_key = b"canonical-hard-shape"
 
     assert wrapped(shape_key, 250, family) == approximation
