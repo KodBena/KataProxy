@@ -14,12 +14,12 @@ There is one required solver path and one optional improvement path:
    component with a 250 ms HiGHS time limit. It first checks a process-local
    LRU; on an LRU miss it consults Redis, and only solves when Redis has no
    result.
-2. **Background improvement path (optional).** A separately managed process reads the
-   Redis pending set and attempts each component with a 10,000 ms HiGHS time
-   limit. It validates the cover and atomically upgrades the stored result
-   when it has found a better one. Not running this process does not disable
-stencil-cover annotations; it only means that foreground incumbents are not
-given this later, longer improvement attempt.
+2. **Background improvement path (optional).** A separately managed process
+   reads the Redis pending set and attempts each component with a 10,000 ms
+   HiGHS time limit. It validates the cover and atomically upgrades the stored
+   result when it has found a better one. Not running this process does not
+   disable stencil-cover annotations; it only means that foreground incumbents
+   are not given this later, longer improvement attempt.
 
 Redis is the shared source of truth for results and work indexes. The solver
 model, HiGHS basis, and intermediate search state are deliberately not shared
