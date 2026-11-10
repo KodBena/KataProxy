@@ -38,7 +38,7 @@ class RequestContext:
     width: int
     height: int
     threshold: float
-    initial_stones: Tuple[Tuple[str, int], ...]
+    initial_stones: Tuple[Tuple[str, Optional[int]], ...]
     moves: Tuple[Tuple[str, Optional[int]], ...]
 
 
@@ -189,7 +189,7 @@ def _coordinate_index(
             return None
         raise ValueError("initialStones cannot contain a pass")
 
-    numeric = re.fullmatch(r"\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)", value)
+    numeric = re.fullmatch(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)", value)
     if numeric is not None:
         x, y = int(numeric.group(1)), int(numeric.group(2))
     else:
