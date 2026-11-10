@@ -152,7 +152,6 @@ def test_transformer_requires_explicit_stencil_cover_opt_in() -> None:
 def test_transformer_enriches_only_final_response_and_keeps_signs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(stencil, "STENCIL_COVER_AVAILABLE", True)
     calls: List[List[int]] = []
 
     def fake_solve(
@@ -189,10 +188,7 @@ def test_transformer_enriches_only_final_response_and_keeps_signs(
     assert annotation["optimal"] is True
 
 
-def test_transformer_skips_when_policy_map_is_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(stencil, "STENCIL_COVER_AVAILABLE", True)
+def test_transformer_fails_loudly_when_policy_map_is_missing() -> None:
     transformer = stencil.stencil_cover_enricher(_mock_link())
     transformer.on_query(
         ClientId("q3"),
@@ -203,12 +199,10 @@ def test_transformer_skips_when_policy_map_is_missing(
         turn_number=0,
         opaque={"ownership": [0.8, 0.7, -0.8, -0.7]},
     )
-    out = transformer.on_response(ClientId("q3"), response)
-    assert out is response
-    assert "stencilCover" not in response.opaque
+    with pytest.raises(ValueError, match="no policy map"):
+        transformer.on_response(ClientId("q3"), response)
 
 
-@pytest.mark.skipif(not stencil.HIGHS_AVAILABLE, reason="optional highspy dependency is absent")
 def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None:
     family = (
         ("1x1", ((0, 0),)),

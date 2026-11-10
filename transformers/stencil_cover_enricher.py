@@ -1,5 +1,5 @@
 """
-Optional KataGo response enricher for signed ownership stencil covers.
+KataGo response enricher for signed ownership stencil covers.
 
 A query opts in with:
     capabilities: {"stencil_cover": {"truncation_threshold": 0.6}}
@@ -8,38 +8,37 @@ Only final analysis responses are processed. The response annotation is
 written to opaque.stencilCover and contains independently solved positive-
 and negative-ownership exact covers. Ownership sign is never discarded.
 
-HiGHS is an optional runtime dependency. The capability is advertised only
-when both highspy and the proxy-owned stencil family are available.
+Importing this module requires HiGHS and a valid proxy-owned stencil family.
+Both are loaded eagerly: a missing dependency or invalid family prevents the
+transformer from being composed.
 
 License: Public Domain (Unlicense). See UNLICENSE at the project root.
 """
 from __future__ import annotations
 
-import logging
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import highspy
 import numpy as np
 
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, KataGoResponse
-from proxy_logging import Event, get_proxy_logger
-
-logger = logging.getLogger("kataproxy." + __name__)
-_log = get_proxy_logger(__name__)
-
-try:
-    import highspy
-except ImportError as exc:
-    highspy = None  # type: ignore[assignment]
-    _HIGHS_IMPORT_ERROR: Optional[ImportError] = exc
-else:
-    _HIGHS_IMPORT_ERROR = None
 
 Stencil = Tuple[str, Tuple[Tuple[int, int], ...]]
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    width: int
+    height: int
+    threshold: float
+
+
 _MAX_BOARD_SIZE = 25
 _SOLVER_TIME_LIMIT_MS = 250
 # lru_cache is entry-bounded, not byte-bounded. Results are compact binary
@@ -109,24 +108,9 @@ def _parse_stencil_family(source: str) -> Tuple[Stencil, ...]:
     return tuple(family)
 
 
-try:
-    _FAMILY_PATH = Path(__file__).with_name("stencil_family.txt")
-    STENCIL_FAMILY: Tuple[Stencil, ...] = _parse_stencil_family(
-        _FAMILY_PATH.read_text(encoding="utf-8")
-    )
-    _FAMILY_ERROR: Optional[Exception] = None
-except Exception as exc:
-    STENCIL_FAMILY = ()
-    _FAMILY_ERROR = exc
-    logger.error("stencil-cover family unavailable: %s", exc)
-
-HIGHS_AVAILABLE = highspy is not None
-STENCIL_COVER_AVAILABLE = HIGHS_AVAILABLE and bool(STENCIL_FAMILY)
-if not HIGHS_AVAILABLE:
-    logger.warning(
-        "highspy not found; stencil-cover enrichment disabled. "
-        "Install the optional highspy dependency to enable it."
-    )
+STENCIL_FAMILY: Tuple[Stencil, ...] = _parse_stencil_family(
+    Path(__file__).with_name("stencil_family.txt").read_text(encoding="utf-8")
+)
 
 
 def _threshold_from_metadata(metadata: Any) -> float:
@@ -153,13 +137,10 @@ def _board_dimensions(opaque: Dict[str, Any]) -> Tuple[int, int]:
 
 
 def _numeric_array(value: Any, field: str) -> np.ndarray:
-    try:
-        raw = np.asarray(value)
-        if raw.dtype.kind not in "iuf":
-            raise ValueError(f"{field} must contain only numbers")
-        result = raw.astype(np.float64, copy=False).reshape(-1)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be a numeric array") from exc
+    raw = np.asarray(value)
+    if raw.dtype.kind not in "iuf":
+        raise ValueError(f"{field} must contain only numbers")
+    result = raw.astype(np.float64, copy=False).reshape(-1)
     if not np.isfinite(result).all():
         raise ValueError(f"{field} contains a non-finite value")
     return result
@@ -409,8 +390,6 @@ def _solve_component_cached(
     fallback. The time limit and family are cache-key dimensions, so changing
     either cannot accidentally reuse a result produced under another contract.
     """
-    if highspy is None:
-        raise RuntimeError("highspy is not installed")
     if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
         raise ValueError("solver time limit must be a positive number of milliseconds")
     width, height, region = _decode_component_shape_key(shape_key)
@@ -529,30 +508,29 @@ def _build_stencil_cover(
     }
 
 
+def _request_context(query: KataGoQuery) -> Optional[RequestContext]:
+    if query.action != KataGoAction.ANALYZE:
+        return None
+
+    capabilities = query.opaque.get("capabilities")
+    if not isinstance(capabilities, dict) or "stencil_cover" not in capabilities:
+        return None
+
+    width, height = _board_dimensions(query.opaque)
+    threshold = _threshold_from_metadata(capabilities["stencil_cover"])
+    return RequestContext(width=width, height=height, threshold=threshold)
+
+
 def stencil_cover_enricher(
     link: ProxyLink[ClientId, InternalId],
 ) -> Transformer[KataGoQuery, KataGoResponse]:
-    """Enrich opted-in final analysis packets with signed exact stencil covers."""
-    request_cache: Dict[ClientId, Tuple[int, int, float]] = {}
+    """Enrich explicitly opted-in final analysis packets with signed covers."""
+    request_cache: Dict[ClientId, RequestContext] = {}
 
     def on_query(eid: ClientId, query: KataGoQuery) -> Optional[KataGoQuery]:
-        if query.action != KataGoAction.ANALYZE or not STENCIL_COVER_AVAILABLE:
-            return query
-        capabilities = query.opaque.get("capabilities")
-        if not isinstance(capabilities, dict) or "stencil_cover" not in capabilities:
-            # capability_gate auto-engages for legacy clients; this feature
-            # intentionally requires explicit opt-in to avoid surprise CPU work.
-            return query
-        try:
-            threshold = _threshold_from_metadata(capabilities["stencil_cover"])
-            width, height = _board_dimensions(query.opaque)
-        except ValueError as exc:
-            _log.warning(
-                Event.DIAGNOSTIC, orig=eid,
-                msg=f"stencil_cover: refusing malformed query metadata: {exc}",
-            )
-            return query
-        request_cache[eid] = (width, height, threshold)
+        context = _request_context(query)
+        if context is not None:
+            request_cache[eid] = context
         return query
 
     def on_response(eid: ClientId, response: KataGoResponse) -> Optional[KataGoResponse]:
@@ -563,26 +541,16 @@ def stencil_cover_enricher(
                 and isinstance(response, AnalyzeResponse)
                 and not response.is_during_search
             ):
-                width, height, threshold = context
-                try:
-                    annotation = _build_stencil_cover(
-                        response.opaque, width, height, threshold,
-                    )
-                    response.opaque["stencilCover"] = annotation
-                except ValueError as exc:
-                    _log.warning(
-                        Event.DIAGNOSTIC, orig=eid,
-                        msg=f"stencil_cover: skipping malformed analysis response: {exc}",
-                    )
-                except Exception as exc:
-                    _log.error(
-                        Event.DIAGNOSTIC, orig=eid,
-                        msg=f"stencil_cover enrichment failed for eid={eid!r}: {exc}",
-                    )
+                response.opaque["stencilCover"] = _build_stencil_cover(
+                    response.opaque,
+                    context.width,
+                    context.height,
+                    context.threshold,
+                )
+            return response
         finally:
             if link.mapping.forward(eid) is None:
                 request_cache.pop(eid, None)
-        return response
 
     return Transformer(
         name="stencil_cover",

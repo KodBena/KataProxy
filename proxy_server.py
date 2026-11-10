@@ -1408,10 +1408,7 @@ class ProxyServer:
 # ---------------------------------------------------------------------------
 from contextual import Contextual
 from transformers.transposition_enricher import transposition_enricher
-from transformers.stencil_cover_enricher import (
-    STENCIL_COVER_AVAILABLE,
-    stencil_cover_enricher,
-)
+from transformers.stencil_cover_enricher import stencil_cover_enricher
 from transformers.analysis_enricher import analysis_enricher
 from transformers.capability_gate import capability_gate
 from transformers.capabilities_advertiser import capabilities_advertiser
@@ -1463,12 +1460,10 @@ def _make_middleware() -> SessionMiddleware:
 def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
     """Construct the server's capability advertisement at startup.
 
-    delta_analysis and adaptive_reevaluate are unconditionally wired
-    below in _main, so they are unconditionally advertised. transposition
-    is advertised iff the native go_transposition module is importable.
-    stencil_cover is advertised iff its optional highspy solver and the
-    proxy-owned stencil family are both available; the transformer and
-    advertisement share the same availability flag.
+    delta_analysis, adaptive_reevaluate, and stencil_cover are
+    unconditionally wired below in _main, so they are unconditionally
+    advertised. transposition is advertised iff the native
+    go_transposition module is importable.
 
     selector (Phase 2+3) is advertised iff cfg.ROLE == "SELECTOR" — the
     role-gated routing capability that tells SPA clients to render the
@@ -1486,6 +1481,7 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
     advertised: Dict[str, Dict[str, Any]] = {
         "delta_analysis": {},
         "adaptive_reevaluate": {},
+        "stencil_cover": {},
     }
     # v1.0.26 — enumerate proxy-hosted learned-VF versions for the SPA
     # to discover and offer in its value-function dropdown. Empty
@@ -1507,8 +1503,6 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
         advertised["transposition"] = {}
     except ImportError:
         pass
-    if STENCIL_COVER_AVAILABLE:
-        advertised["stencil_cover"] = {}
     if cfg.ROLE.upper() == "SELECTOR":
         advertised["selector"] = {}
     # cache (this feature) — advertised iff the Hub replay cache is
