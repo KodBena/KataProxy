@@ -768,11 +768,11 @@ def _solve_component_uncached(
     time_limit_ms: int,
     family: Tuple[Stencil, ...],
 ) -> Tuple[bool, int, bytes]:
-    """Solve one canonical component and cache only its compact placement list.
+    """Solve one canonical component and return only compact solution data.
 
     Status codes: 0 = proven optimal, 1 = feasible incumbent, 2 = singleton
-    fallback. The time limit and family are cache-key dimensions, so changing
-    either cannot accidentally reuse a result produced under another contract.
+    fallback. The request LRU separates time budgets; the Redis result identity
+    deliberately does not, so longer solves can upgrade the same problem row.
     """
     if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
         raise ValueError("solver time limit must be a positive number of milliseconds")
