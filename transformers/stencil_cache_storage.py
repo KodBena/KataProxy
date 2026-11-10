@@ -18,6 +18,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from inspect import signature
 from typing import Any, Callable, Dict, FrozenSet, TypeVar, cast
 
@@ -28,6 +29,30 @@ _INVALIDATORS: Dict[str, list[Callable[[bytes], None]]] = {}
 _INVALIDATOR_THREADS: Dict[str, threading.Thread] = {}
 _PERSISTENT_CLIENTS: Dict[str, Any] = {}
 _INVALIDATOR_LOCK = threading.RLock()
+_PROCESS_ID = uuid.uuid4().hex.encode("ascii")
+
+
+def _invalidation_payload(shape_key: bytes) -> bytes:
+    return _PROCESS_ID + b":" + base64.b64encode(shape_key)
+
+
+def _decode_invalidation_payload(message: bytes) -> bytes | None:
+    """Return the changed key, None for our own publication, or b'' to flush."""
+    origin, separator, encoded_shape = message.partition(b":")
+    if separator and len(origin) == 32:
+        try:
+            int(origin, 16)
+        except ValueError:
+            pass
+        else:
+            if origin == _PROCESS_ID:
+                return None
+            try:
+                return base64.b64decode(encoded_shape, validate=True)
+            except (ValueError, TypeError):
+                return b""
+    # Accept legacy raw-key messages during a rolling deployment.
+    return message
 
 
 def _invalidation_channel(namespace: str) -> str:
@@ -88,7 +113,9 @@ def register_cache_invalidator(
                                 data = data.encode("latin-1")
                             if not isinstance(data, bytes):
                                 data = b""
-                            _dispatch_cache_invalidation(namespace, data)
+                            changed_shape = _decode_invalidation_payload(data)
+                            if changed_shape is not None:
+                                _dispatch_cache_invalidation(namespace, changed_shape)
                 except Exception as exc:
                     if not warned:
                         logger.warning(
@@ -477,7 +504,8 @@ class RedisStencilStore:
         if updated:
             try:
                 self._client.publish(
-                    _invalidation_channel(self._namespace), shape_key,
+                    _invalidation_channel(self._namespace),
+                    _invalidation_payload(shape_key),
                 )
             except Exception as exc:
                 # Persistence is already committed. A missed notification is
