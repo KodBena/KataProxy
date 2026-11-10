@@ -141,6 +141,54 @@ def test_rectangle_family_has_the_full_d4_stabilizer() -> None:
     assert stencil._family_dihedral_group(stencil.STENCIL_FAMILY) == tuple(range(8))
 
 
+def test_stencil_family_contains_complete_d4_orbits_of_s_and_l_pieces() -> None:
+    prototypes = (
+        ("S-tetromino", ((0, 1), (0, 2), (1, 0), (1, 1)), 4),
+        ("L-tetromino", ((0, 0), (1, 0), (2, 0), (2, 1)), 8),
+        ("L-tromino", ((0, 0), (1, 0), (1, 1)), 4),
+    )
+    for prefix, prototype, expected_orbit_size in prototypes:
+        expected = {
+            stencil._normalise_shape(prototype, transform)
+            for transform in range(8)
+        }
+        actual = {
+            cells
+            for name, cells in stencil.STENCIL_FAMILY
+            if name.startswith(prefix + "-")
+        }
+        assert len(expected) == expected_orbit_size
+        assert actual == expected
+
+
+def test_each_new_asymmetric_stencil_solves_as_one_exact_tile() -> None:
+    new_names = (
+        "S-tetromino-",
+        "L-tetromino-",
+        "L-tromino-",
+    )
+    new_stencils = [
+        (name, cells)
+        for name, cells in stencil.STENCIL_FAMILY
+        if name.startswith(new_names)
+    ]
+    assert len(new_stencils) == 16
+
+    for name, cells in new_stencils:
+        width = max(x for _, x in cells) + 1
+        height = max(y for y, _ in cells) + 1
+        region = [y * width + x for y, x in cells]
+        result = stencil._solve_region(
+            region, width, height, stencil.STENCIL_FAMILY,
+        )
+        assert result["optimal"] is True
+        assert result["tileCount"] == 1
+        assert result["placements"] == [{
+            "stencil": name,
+            "points": [[x, y] for y, x in sorted(cells)],
+        }]
+
+
 def test_component_shape_key_merges_all_eight_dihedral_images() -> None:
     shape = ((0, 0), (1, 0), (1, 1))
     keys: List[bytes] = []
