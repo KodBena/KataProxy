@@ -6,7 +6,9 @@ A query opts in with:
 
 Only final analysis responses are processed. The response annotation is
 written to opaque.stencilCover and contains independently solved positive-
-and negative-ownership exact covers. Ownership sign is never discarded.
+and negative-ownership exact covers. Empty points use the configured ownership
+cutoff; living chains are omitted and dead chains are assigned to their
+opponent's territory.
 
 Importing this module requires HiGHS and a valid proxy-owned stencil family.
 Both are loaded eagerly: a missing dependency or invalid family prevents the
