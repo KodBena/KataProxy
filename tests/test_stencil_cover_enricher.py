@@ -1,5 +1,7 @@
+# SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -355,3 +357,74 @@ def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None
     assert result["placements"] == [
         {"stencil": "1x2", "points": [[0, 0], [1, 0]]},
     ]
+
+
+def test_redis_persistent_cache_round_trips_between_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transformers.stencil_cache_storage as storage
+
+    persisted: Dict[str, bytes] = {}
+
+    class FakeRedis:
+        def __init__(self, **kwargs: Any) -> None:
+            assert kwargs["host"] == "127.0.0.1"
+            assert kwargs["port"] == 6379
+            assert kwargs["db"] == 7
+
+        def ping(self) -> bool:
+            return True
+
+        def get(self, key: str) -> bytes | None:
+            return persisted.get(key)
+
+        def set(self, key: str, value: bytes) -> bool:
+            persisted[key] = value
+            return True
+
+    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(Redis=FakeRedis))
+    calls: List[int] = []
+
+    def solve(
+        shape_key: bytes,
+        time_limit_ms: int,
+        family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(1)
+        return True, 0, b"optimal-solution"
+
+    first_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
+    second_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
+    args = (b"canonical-shape", 250, (("dot", ((0, 0),)),))
+
+    assert first_wrapper(*args) == (True, 0, b"optimal-solution")
+    assert second_wrapper(*args) == (True, 0, b"optimal-solution")
+    assert calls == [1]
+
+
+def test_redis_persistent_cache_warns_and_degrades_to_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import transformers.stencil_cache_storage as storage
+
+    class OfflineRedis:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def ping(self) -> None:
+            raise ConnectionError("Redis is offline")
+
+    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(Redis=OfflineRedis))
+    calls: List[int] = []
+
+    def solve(shape_key: bytes, time_limit_ms: int, family: Any) -> tuple[bool, int, bytes]:
+        calls.append(1)
+        return False, 2, b"fallback"
+
+    with caplog.at_level("WARNING"):
+        decorated = storage.redis_persistent_cache("offline-test")(solve)
+
+    assert decorated(b"shape", 250, ()) == (False, 2, b"fallback")
+    assert calls == [1]
+    assert "persistent caching disabled" in caplog.text
