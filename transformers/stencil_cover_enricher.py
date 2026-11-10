@@ -5,7 +5,8 @@ KataGo response enricher for signed ownership stencil covers.
 A query opts in with:
     capabilities: {"stencil_cover": {"truncation_threshold": 0.6}}
 
-Only final analysis responses are processed. The response annotation is
+The transformer automatically adds KataGo's includeOwnership flag for opted-in
+queries. Only final analysis responses are processed. The response annotation is
 written to opaque.stencilCover and contains independently solved positive-
 and negative-ownership exact covers. Empty points use the configured ownership
 cutoff; living chains are omitted and dead chains are assigned to their
