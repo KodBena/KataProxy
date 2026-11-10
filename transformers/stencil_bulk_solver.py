@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
-"""Low-priority worker that upgrades early-exit stencil covers.
+"""Optional low-priority worker that upgrades early-exit stencil covers.
 
-Run with `kataproxy-stencil-bulk-solver` (or
-`python -m transformers.stencil_bulk_solver`). One worker processes the
-Redis pending set sequentially. Each canonical component receives one
-10-second HiGHS solve; a non-optimal outcome is retained as the best result
-and accompanied by durable timeout metadata so it is not retried forever.
+The normal foreground stencil-cover path does not require this process.
+Run the optional worker with `kataproxy-stencil-bulk-solver` after installing
+the project, or from a checkout with
+`python -m transformers.stencil_bulk_solver`. One worker processes the Redis
+pending set sequentially. Each canonical component receives one 10-second
+HiGHS solve; a non-optimal outcome is retained as the best result and
+accompanied by durable timeout metadata so it is not retried forever.
 """
 from __future__ import annotations
 
