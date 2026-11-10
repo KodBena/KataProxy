@@ -184,6 +184,45 @@ load balancing) works identically with or without it.
 
 ---
 
+## Stencil-cover enrichment (opt-in)
+
+An analyze query can request the signed stencil-cover annotation by including:
+
+```json
+{
+  "capabilities": {
+    "stencil_cover": {
+      "truncation_threshold": 0.6
+    }
+  }
+}
+```
+
+The transformer requests KataGo's ownership map automatically for opted-in
+queries and adds `opaque.stencilCover` to final analysis responses. No
+separate `includeOwnership` flag is required from the client.
+
+The foreground solver is the normal operating mode: it attempts each
+component with a 250 ms HiGHS time limit and returns its best valid result,
+which may be feasible rather than proven optimal. **No background process is
+required.** Redis at `127.0.0.1:6379`, DB 7, adds shared result persistence;
+the foreground solver continues to work when Redis is unavailable.
+
+An optional background process can spend up to a 10-second HiGHS optimization
+limit trying to improve cached non-optimal results. After installing the
+project in the active environment (`pip install -e .`), run:
+
+```sh
+kataproxy-stencil-bulk-solver
+```
+
+The same worker can be launched from a checkout with
+`python -m transformers.stencil_bulk_solver`. Add `--once` to process the
+current pending snapshot and exit. At present, run at most one bulk worker
+for this cache namespace.
+
+---
+
 ## Logs
 
 KataProxy uses the standard `logging` module. The default level is `INFO`;
