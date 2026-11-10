@@ -557,6 +557,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
         raise ValueError("persistent cache namespace must be a non-empty safe token")
 
     def decorate(function: F) -> F:
+        client = None
         try:
             client = create_redis_client()
             with _INVALIDATOR_LOCK:
@@ -564,12 +565,11 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
         except Exception as exc:
             logger.warning(
                 "Redis stencil cache unavailable at %s:%d db=%d; "
-                "persistent caching disabled (%s)",
+                "persistent caching temporarily disabled (%s)",
                 _REDIS_HOST, _REDIS_PORT, _REDIS_DB, exc,
             )
-            return function
 
-        store = RedisStencilStore(client, namespace)
+        store = RedisStencilStore(client, namespace) if client is not None else None
         function_signature = signature(function)
         enabled = True
         state_lock = threading.Lock()
@@ -587,7 +587,21 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
 
         @functools.wraps(function)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
+            nonlocal store
             if not enabled:
+                return function(*args, **kwargs)
+
+            # If Redis was unavailable during module import, the background
+            # subscriber may reconnect later. Adopt its client lazily here;
+            # this work occurs only on an LRU miss, not on the hot cache hit.
+            if store is None:
+                with state_lock:
+                    if store is None:
+                        with _INVALIDATOR_LOCK:
+                            recovered_client = _PERSISTENT_CLIENTS.get(namespace)
+                        if recovered_client is not None:
+                            store = RedisStencilStore(recovered_client, namespace)
+            if store is None:
                 return function(*args, **kwargs)
 
             bound = function_signature.bind(*args, **kwargs)
@@ -629,7 +643,4 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
             except Exception as exc:
                 disable_after_error(exc)
             return result
-
-        return cast(F, wrapped)
-
     return decorate
