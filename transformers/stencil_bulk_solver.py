@@ -194,7 +194,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.exception("Could not connect to Redis DB 7 for bulk stencil solving")
         return 1
 
-    worker = StencilBulkSolver(store)
+    try:
+        worker = StencilBulkSolver(store)
+    except Exception:
+        logger.exception("Could not initialize the Redis bulk stencil queue")
+        return 1
+
     try:
         while True:
             counts = worker.run_once()
