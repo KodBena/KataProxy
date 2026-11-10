@@ -106,6 +106,71 @@ def test_disconnected_region_is_solved_as_independent_components(
         {"stencil": "1x1", "points": [[1, 0]]},
         {"stencil": "1x1", "points": [[2, 2]]},
     ]
+    assert result["components"] == [
+        {
+            "cells": [[0, 0], [1, 0]],
+            "tileCount": 2,
+            "optimal": True,
+            "status": "optimal",
+        },
+        {
+            "cells": [[2, 2]],
+            "tileCount": 1,
+            "optimal": True,
+            "status": "optimal",
+        },
+    ]
+
+
+
+def test_raw_components_retain_the_cells_and_status_of_each_solver_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    family = (("1x1", ((0, 0),)),)
+    returned_statuses = iter([(False, 1), (False, 2)])
+
+    def fake_cached(
+        shape_key: bytes, time_limit_ms: int, family_key: Any,
+    ) -> tuple[bool, int, bytes]:
+        _optimal, status = next(returned_statuses)
+        _width, _height, cells = stencil._decode_component_shape_key(shape_key)
+        singleton_cover = [("1x1", (point,)) for point in cells]
+        return (
+            False,
+            status,
+            stencil._encode_cached_placements(singleton_cover, family_key),
+        )
+
+    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+    result = stencil._solve_region([0, 1, 8], 3, 3, family)
+
+    assert result["status"] == "fallback"
+    assert result["optimal"] is False
+    assert result["components"] == [
+        {
+            "cells": [[0, 0], [1, 0]],
+            "tileCount": 2,
+            "optimal": False,
+            "status": "feasible",
+        },
+        {
+            "cells": [[2, 2]],
+            "tileCount": 1,
+            "optimal": False,
+            "status": "fallback",
+        },
+    ]
+
+
+def test_empty_region_exposes_an_empty_raw_component_list() -> None:
+    result = stencil._solve_region([], 3, 3, (("1x1", ((0, 0),)),))
+    assert result == {
+        "components": [],
+        "placements": [],
+        "tileCount": 0,
+        "optimal": True,
+        "status": "empty",
+    }
 
 
 def test_component_solver_cache_is_large_and_entry_bounded() -> None:
@@ -158,7 +223,17 @@ def test_transformer_enriches_only_final_response_and_keeps_signs(
         cells: List[int], width: int, height: int, family: Any,
     ) -> Dict[str, Any]:
         calls.append(list(cells))
+        components = [
+            {
+                "cells": [[point % width, point // width] for point in component],
+                "tileCount": 1,
+                "optimal": True,
+                "status": "optimal",
+            }
+            for component in stencil._connected_components(cells, width, height)
+        ]
         return {
+            "components": components,
             "placements": [],
             "tileCount": 0,
             "optimal": True,
@@ -182,7 +257,16 @@ def test_transformer_enriches_only_final_response_and_keeps_signs(
     assert out is final
     assert calls == [[0, 1], [2, 3]]
     annotation = final.opaque["stencilCover"]
+    assert annotation["version"] == 2
     assert annotation["threshold"] == 0.5
+    assert annotation["positive"]["components"] == [
+        {
+            "cells": [[0, 0], [1, 0]],
+            "tileCount": 1,
+            "optimal": True,
+            "status": "optimal",
+        },
+    ]
     assert annotation["positive"]["optimal"] is True
     assert annotation["negative"]["optimal"] is True
     assert annotation["optimal"] is True

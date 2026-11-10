@@ -463,12 +463,17 @@ def _solve_region(
     family: Sequence[Stencil],
     time_limit_ms: int = _SOLVER_TIME_LIMIT_MS,
 ) -> Dict[str, Any]:
-    """Decompose first, then solve/cache each connected component independently."""
+    """Decompose, expose, and solve exactly the connected components handed to HiGHS."""
     if not region:
         return {
-            "placements": [], "tileCount": 0, "optimal": True, "status": "empty",
+            "components": [],
+            "placements": [],
+            "tileCount": 0,
+            "optimal": True,
+            "status": "empty",
         }
     family_key = tuple(family)
+    components: List[Dict[str, Any]] = []
     placements: List[Dict[str, Any]] = []
     statuses: List[int] = []
     for component in _connected_components(region, width, height):
@@ -476,12 +481,36 @@ def _solve_region(
         optimal, status, encoded = _solve_component_cached(
             shape_key, time_limit_ms, family_key,
         )
-        placements.extend(_decode_cached_placements(encoded, family_key, frame))
+        component_placements = _decode_cached_placements(
+            encoded, family_key, frame,
+        )
+        placements.extend(component_placements)
         statuses.append(status)
+        if status == 0:
+            component_status = "optimal"
+        elif status == 1:
+            component_status = "feasible"
+        elif status == 2:
+            component_status = "fallback"
+        else:
+            raise RuntimeError(f"unknown cached stencil solver status: {status!r}")
+        components.append({
+            # These are the exact row-major cells passed to the component
+            # cache/solver, represented in board [x, y] coordinates. Keep
+            # them even when the solver uses a fallback or partial incumbent.
+            "cells": [
+                [point % width, point // width]
+                for point in component
+            ],
+            "tileCount": len(component_placements),
+            "optimal": bool(optimal and status == 0),
+            "status": component_status,
+        })
     fallback = any(status == 2 for status in statuses)
     feasible = any(status == 1 for status in statuses)
     optimal = all(status == 0 for status in statuses)
     return {
+        "components": components,
         "placements": placements,
         "tileCount": len(placements),
         "optimal": optimal,
@@ -498,7 +527,7 @@ def _build_stencil_cover(
     positive = _solve_region(positive_cells, width, height, STENCIL_FAMILY)
     negative = _solve_region(negative_cells, width, height, STENCIL_FAMILY)
     return {
-        "version": 1,
+        "version": 2,
         "threshold": threshold,
         "width": width,
         "height": height,
