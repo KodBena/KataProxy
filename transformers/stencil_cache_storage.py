@@ -540,7 +540,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
     The Redis key deliberately excludes time_limit_ms. A better solution found
     by an offline, longer solve can therefore upgrade the exact same problem
     record. Feasible results are cached and their canonical problem keys are
-    added to the hard-instance set. No solver checkpoint/state is written.
+    added to the hard and pending indexes. No solver checkpoint/state is written.
     """
     if not namespace or not all(
         char.isalnum() or char in "-_." for char in namespace
