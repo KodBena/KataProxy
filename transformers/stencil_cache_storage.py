@@ -16,6 +16,7 @@ import importlib
 import json
 import logging
 import math
+import os
 import threading
 import time
 import uuid
@@ -29,23 +30,31 @@ _INVALIDATORS: Dict[str, list[Callable[[bytes], None]]] = {}
 _INVALIDATOR_THREADS: Dict[str, threading.Thread] = {}
 _PERSISTENT_CLIENTS: Dict[str, Any] = {}
 _INVALIDATOR_LOCK = threading.RLock()
-_PROCESS_ID = uuid.uuid4().hex.encode("ascii")
+_PROCESS_NONCE = uuid.uuid4().hex.encode("ascii")
+
+
+def _current_process_token() -> bytes:
+    # Include the PID at call time: a process created with fork inherits module
+    # globals, but it must not share the parent's Pub/Sub origin identity.
+    return str(os.getpid()).encode("ascii") + b"-" + _PROCESS_NONCE
 
 
 def _invalidation_payload(shape_key: bytes) -> bytes:
-    return _PROCESS_ID + b":" + base64.b64encode(shape_key)
+    return _current_process_token() + b":" + base64.b64encode(shape_key)
 
 
 def _decode_invalidation_payload(message: bytes) -> bytes | None:
     """Return the changed key, None for our own publication, or b'' to flush."""
     origin, separator, encoded_shape = message.partition(b":")
-    if separator and len(origin) == 32:
+    if separator and b"-" in origin:
+        process_id, nonce = origin.split(b"-", 1)
         try:
-            int(origin, 16)
+            int(process_id)
+            valid_token = len(nonce) == 32 and int(nonce, 16) >= 0
         except ValueError:
-            pass
-        else:
-            if origin == _PROCESS_ID:
+            valid_token = False
+        if valid_token:
+            if origin == _current_process_token():
                 return None
             try:
                 return base64.b64decode(encoded_shape, validate=True)
