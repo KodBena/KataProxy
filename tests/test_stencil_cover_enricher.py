@@ -121,8 +121,87 @@ def test_component_shape_key_is_translation_normalized() -> None:
         (7, 8, 10, 11), board_width=3,
     )
     assert first == translated
-    assert first_frame == (0, 0, 2, 2)
-    assert translated_frame == (1, 2, 2, 2)
+    assert (
+        first_frame.transform,
+        first_frame.offset_y,
+        first_frame.offset_x,
+        first_frame.canonical_width,
+        first_frame.canonical_height,
+    ) == (0, 0, 0, 2, 2)
+    assert (
+        translated_frame.transform,
+        translated_frame.offset_y,
+        translated_frame.offset_x,
+        translated_frame.canonical_width,
+        translated_frame.canonical_height,
+    ) == (0, 2, 1, 2, 2)
+
+
+def test_rectangle_family_has_the_full_d4_stabilizer() -> None:
+    assert stencil._family_dihedral_group(stencil.STENCIL_FAMILY) == tuple(range(8))
+
+
+def test_component_shape_key_merges_all_eight_dihedral_images() -> None:
+    shape = ((0, 0), (1, 0), (1, 1))
+    keys = []
+    for transform in range(8):
+        mapped = [
+            stencil._transform_cell(y, x, transform)
+            for y, x in shape
+        ]
+        min_y = min(y for y, _ in mapped)
+        min_x = min(x for _, x in mapped)
+        # Embed each orientation at a positive board offset, independently
+        # of its rotation/reflection and bounding-box dimensions.
+        points = tuple(
+            (y - min_y + 4) * 16 + (x - min_x + 4)
+            for y, x in mapped
+        )
+        key, _frame = stencil._component_shape_key(points, board_width=16)
+        keys.append(key)
+    assert len(set(keys)) == 1
+
+
+def test_family_symmetry_is_restricted_to_maps_that_preserve_its_shapes() -> None:
+    horizontal_only = (
+        ("dot", ((0, 0),)),
+        ("line", ((0, 0), (0, 1), (0, 2))),
+    )
+    assert stencil._family_dihedral_group(horizontal_only) == (0, 2, 4, 5)
+
+
+def test_canonical_solution_is_recovered_with_rotated_stencil_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    family = stencil.STENCIL_FAMILY
+    seen_keys: List[bytes] = []
+
+    def fake_cached(
+        shape_key: bytes, time_limit_ms: int, family_key: Any,
+    ) -> tuple[bool, int, bytes]:
+        seen_keys.append(shape_key)
+        local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
+        candidates = stencil._candidate_placements(
+            cells, local_width, local_height, family_key,
+        )
+        complete = next(
+            candidate for candidate in candidates
+            if len(candidate[1]) == len(cells) and set(candidate[1]) == set(cells)
+        )
+        return True, 0, stencil._encode_cached_placements([complete], family_key)
+
+    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+
+    horizontal = stencil._solve_region([0, 1], width=2, height=1, family=family)
+    vertical = stencil._solve_region([0, 1], width=1, height=2, family=family)
+
+    assert seen_keys[0] == seen_keys[1]
+    assert horizontal["placements"] == [
+        {"stencil": "1x2", "points": [[0, 0], [1, 0]]},
+    ]
+    assert vertical["placements"] == [
+        {"stencil": "2x1", "points": [[0, 0], [0, 1]]},
+    ]
 
 
 def test_disconnected_region_is_solved_as_independent_components(
