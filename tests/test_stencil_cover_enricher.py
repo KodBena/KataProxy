@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 import pytest
 
 import transformers.stencil_cover_enricher as stencil
-from katago import AnalyzeResponse, KataGoAction, KataGoQuery
+from katago import AnalyzeResponse, KataGoAction, KataGoQuery, make_katago_link
 from AbstractProxy.proxy_core import ClientId
 
 
@@ -145,9 +145,7 @@ def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client_id = ClientId("stencil-cover-test")
-    link = SimpleNamespace(
-        mapping=SimpleNamespace(forward=lambda _eid: None),
-    )
+    link = make_katago_link()
     transformer = stencil.stencil_cover_enricher(link)
     query = KataGoQuery(
         action=KataGoAction.ANALYZE,
