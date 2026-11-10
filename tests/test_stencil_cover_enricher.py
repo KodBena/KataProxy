@@ -1101,6 +1101,21 @@ def test_cache_invalidation_dispatch_passes_the_changed_shape_key() -> None:
     assert seen == [b"canonical-shape"]
 
 
+def test_invalidation_payload_skips_self_and_decodes_other_processes() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    shape_key = b"canonical-component"
+    own_message = storage._invalidation_payload(shape_key)
+    assert storage._decode_invalidation_payload(own_message) is None
+
+    other_process = b"0123456789abcdef0123456789abcdef"
+    foreign_message = other_process + b":" + __import__("base64").b64encode(shape_key)
+    assert storage._decode_invalidation_payload(foreign_message) == shape_key
+
+    # Raw messages remain accepted during a rolling deployment.
+    assert storage._decode_invalidation_payload(shape_key) == shape_key
+
+
 def test_redis_persistent_cache_recovers_after_startup_outage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
