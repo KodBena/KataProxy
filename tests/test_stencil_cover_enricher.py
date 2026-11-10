@@ -847,9 +847,6 @@ def test_pending_queue_migrates_existing_hard_components_once() -> None:
         False, 1,
         stencil._encode_cached_placements([("dot", (0,))], family),
     )
-        False, 1,
-        stencil._encode_cached_placements([("dot", (0,))], family),
-    )
 
     store.put_result(shape_key, family, approximation)
     # Simulate a Redis instance that has the Step 3 hard index but predates
