@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, FrozenSet, TypeVar, cast
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger("kataproxy.stencil_cache_storage")
 
-_INVALIDATORS: Dict[str, list[Callable[[], None]]] = {}
+_INVALIDATORS: Dict[str, list[Callable[[bytes], None]]] = {}
 _INVALIDATOR_THREADS: Dict[str, threading.Thread] = {}
 _PERSISTENT_CLIENTS: Dict[str, Any] = {}
 _INVALIDATOR_LOCK = threading.RLock()
@@ -34,18 +34,18 @@ def _invalidation_channel(namespace: str) -> str:
     return f"kataproxy:stencil-cover:{namespace}:invalidate"
 
 
-def _dispatch_cache_invalidation(namespace: str) -> None:
+def _dispatch_cache_invalidation(namespace: str, shape_key: bytes = b\"\") -> None:
     with _INVALIDATOR_LOCK:
         callbacks = tuple(_INVALIDATORS.get(namespace, ()))
     for callback in callbacks:
         try:
-            callback()
+            callback(shape_key)
         except Exception:
             logger.exception("Local stencil-cache invalidation callback failed")
 
 
 def register_cache_invalidator(
-    namespace: str, callback: Callable[[], None],
+    namespace: str, callback: Callable[[bytes], None],
 ) -> bool:
     """Clear a process-local cache when another process upgrades a Redis row.
 
@@ -83,7 +83,12 @@ def register_cache_invalidator(
                         if message is None:
                             continue
                         if message.get("type") == "message":
-                            _dispatch_cache_invalidation(namespace)
+                            data = message.get("data", b"")
+                            if isinstance(data, str):
+                                data = data.encode("latin-1")
+                            if not isinstance(data, bytes):
+                                data = b""
+                            _dispatch_cache_invalidation(namespace, data)
                 except Exception as exc:
                     if not warned:
                         logger.warning(
@@ -461,7 +466,7 @@ class RedisStencilStore:
         if updated:
             try:
                 self._client.publish(
-                    _invalidation_channel(self._namespace), b"result-updated",
+                    _invalidation_channel(self._namespace), shape_key,
                 )
             except Exception as exc:
                 # Persistence is already committed. A missed notification is
