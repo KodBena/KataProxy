@@ -14,7 +14,8 @@ Importing this module requires HiGHS and a valid proxy-owned stencil family.
 Both are loaded eagerly: a missing dependency or invalid family prevents the
 transformer from being composed.
 
-License: Public Domain (Unlicense). See UNLICENSE at the project root.
+SPDX-License-Identifier: MIT
+See NOTICE for the file-specific MIT exception and KataGo attribution.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ import numpy as np
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, KataGoResponse
+from transformers.stencil_cache_storage import redis_persistent_cache
 
 Stencil = Tuple[str, Tuple[Tuple[int, int], ...]]
 
@@ -599,7 +601,10 @@ def _decode_cached_placements(
     return placements
 
 
+# The local LRU is outermost: hits avoid Redis I/O; only local misses consult
+# the persistent cache below it. Redis is optional and degrades to no-op.
 @lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)
+@redis_persistent_cache(namespace="solver-component-v1")
 def _solve_component_cached(
     shape_key: bytes,
     time_limit_ms: int,
