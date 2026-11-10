@@ -17,6 +17,8 @@ class _MemoryRedis:
     def __init__(self) -> None:
         self.values: Dict[str, bytes] = {}
         self.sets: Dict[str, set[bytes]] = {}
+        self.hashes: Dict[str, Dict[bytes, bytes]] = {}
+        self.markers: set[str] = set()
 
     def get(self, key: str) -> bytes | None:
         return self.values.get(key)
@@ -24,19 +26,51 @@ class _MemoryRedis:
     def smembers(self, key: str) -> set[bytes]:
         return set(self.sets.get(key, set()))
 
-    def eval(
-        self,
-        _script: str,
-        numkeys: int,
-        result_key: str,
-        hard_key: str,
-        payload: bytes,
-        status: str,
-        tile_count: str,
-        _schema_version: str,
-        shape_key: bytes,
-    ) -> int:
-        assert numkeys == 2
+    def hget(self, key: str, field: bytes) -> bytes | None:
+        return self.hashes.get(key, {}).get(field)
+
+    def eval(self, script: str, numkeys: int, *args: Any) -> int:
+        if "SETNX" in script:
+            assert numkeys == 4
+            hard_key, pending_key, timeout_key, marker_key = args
+            if marker_key in self.markers:
+                return 0
+            self.markers.add(marker_key)
+            pending = self.sets.setdefault(pending_key, set())
+            timed_out = self.hashes.get(timeout_key, {})
+            queued = 0
+            for shape_key in self.sets.get(hard_key, set()):
+                if shape_key not in timed_out and shape_key not in pending:
+                    pending.add(shape_key)
+                    queued += 1
+            return queued
+
+        if "SISMEMBER" in script:
+            assert numkeys == 4
+            hard_key, pending_key, result_key, timeout_key, shape_key, metadata = args
+            hard = self.sets.setdefault(hard_key, set())
+            pending = self.sets.setdefault(pending_key, set())
+            if shape_key not in hard or shape_key not in pending:
+                return 0
+            raw = self.values.get(result_key)
+            if raw is None:
+                return 0
+            result = json.loads(raw.decode("utf-8"))
+            if int(result["status"]) == 0:
+                hard.discard(shape_key)
+                self.hashes.setdefault(timeout_key, {}).pop(shape_key, None)
+                return 0
+            self.hashes.setdefault(timeout_key, {})[shape_key] = (
+                metadata.encode("utf-8") if isinstance(metadata, str) else metadata
+            )
+            pending.discard(shape_key)
+            return 1
+
+        assert numkeys == 4
+        (
+            result_key, hard_key, pending_key, timeout_key,
+            payload, status, tile_count, _schema_version, shape_key,
+        ) = args
         new_status = int(status)
         new_cost = int(tile_count)
         should_store = True
@@ -55,11 +89,18 @@ class _MemoryRedis:
         if should_store:
             self.values[result_key] = payload
         final = json.loads(self.values[result_key].decode("utf-8"))
-        members = self.sets.setdefault(hard_key, set())
+        hard = self.sets.setdefault(hard_key, set())
+        pending = self.sets.setdefault(pending_key, set())
+        timeouts = self.hashes.setdefault(timeout_key, {})
         if int(final["status"]) == 0:
-            members.discard(shape_key)
+            hard.discard(shape_key)
+            pending.discard(shape_key)
+            timeouts.pop(shape_key, None)
         else:
-            members.add(shape_key)
+            hard.add(shape_key)
+            if should_store:
+                pending.add(shape_key)
+                timeouts.pop(shape_key, None)
         return int(should_store)
 
 
@@ -79,8 +120,14 @@ class _FakeRedisClient:
     def smembers(self, key: str) -> set[bytes]:
         return self.backend.smembers(key)
 
+    def hget(self, key: str, field: bytes) -> bytes | None:
+        return self.backend.hget(key, field)
+
     def eval(self, *args: Any) -> int:
         return self.backend.eval(*args)
+
+    def publish(self, _channel: str, _message: bytes) -> int:
+        return 1
 
 
 
