@@ -15,7 +15,6 @@ Importing this module requires HiGHS and a valid proxy-owned stencil family.
 Both are loaded eagerly: a missing dependency or invalid family prevents the
 transformer from being composed.
 
-SPDX-License-Identifier: MIT
 See NOTICE for the file-specific MIT exception and KataGo attribution.
 """
 from __future__ import annotations
