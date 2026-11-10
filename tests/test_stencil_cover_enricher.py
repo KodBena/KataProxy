@@ -697,6 +697,15 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     assert store.get_result(shape_key, family) == approximation
     assert store.hard_components(family) == frozenset({shape_key})
 
+    # Only the canonical problem key and the current best result are stored;
+    # there is no serialized HiGHS model, basis, or checkpoint state.
+    record = json.loads(next(iter(backend.values.values())).decode("utf-8"))
+    assert set(record) == {
+        "version", "optimal", "status", "tile_count", "placements",
+    }
+    assert record["status"] == 1
+    assert record["placements"]
+
 
 def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
     import transformers.stencil_cache_storage as storage
