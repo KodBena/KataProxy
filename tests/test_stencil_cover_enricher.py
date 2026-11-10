@@ -63,9 +63,16 @@ class _MemoryRedis:
                 hard.discard(shape_key)
                 self.hashes.setdefault(timeout_key, {}).pop(shape_key, None)
                 return 0
-            self.hashes.setdefault(timeout_key, {})[shape_key] = (
-                metadata.encode("utf-8") if isinstance(metadata, str) else metadata
+            metadata_value = (
+                json.loads(metadata)
+                if isinstance(metadata, str)
+                else json.loads(metadata.decode("utf-8"))
             )
+            metadata_value["status"] = int(result["status"])
+            metadata_value["tile_count"] = int(result["tile_count"])
+            self.hashes.setdefault(timeout_key, {})[shape_key] = json.dumps(
+                metadata_value, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
             pending.discard(shape_key)
             return 1
 
