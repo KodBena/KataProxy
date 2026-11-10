@@ -51,7 +51,7 @@ implementation was consulted as a reference for query/replay shape;
 its source code was not copied into these stencil-cover files. Its
 separate provenance and obligations are documented below.
 
-The MIT exception applies only to the three paths listed above. All
+The MIT exception applies only to the four paths listed above. All
 other project-root files and subdirectories remain under the
 Unlicense unless another explicit exception is documented here.
 
