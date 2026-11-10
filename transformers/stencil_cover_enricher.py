@@ -19,6 +19,7 @@ See NOTICE for the file-specific MIT exception and KataGo attribution.
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ from transformers.stencil_cache_storage import (
     redis_persistent_cache,
     register_cache_invalidator,
 )
+
+logger = logging.getLogger("kataproxy.stencil_cover_enricher")
 
 Stencil = Tuple[str, Tuple[Tuple[int, int], ...]]
 
@@ -1114,6 +1117,10 @@ def stencil_cover_enricher(
         context = _request_context(query)
         if context is not None:
             request_cache[eid] = context
+            # Ownership is an input to this opt-in enrichment. Ask KataGo for
+            # the map here so clients do not need to know this implementation
+            # detail or remember a second protocol flag.
+            query.opaque["includeOwnership"] = True
         return query
 
     def on_response(eid: ClientId, response: KataGoResponse) -> Optional[KataGoResponse]:
@@ -1124,14 +1131,24 @@ def stencil_cover_enricher(
                 and isinstance(response, AnalyzeResponse)
                 and not response.is_during_search
             ):
-                board = _board_at_turn(context, response.turn_number)
-                response.opaque["stencilCover"] = _build_stencil_cover(
-                    response.opaque,
-                    board,
-                    context.width,
-                    context.height,
-                    context.threshold,
-                )
+                try:
+                    board = _board_at_turn(context, response.turn_number)
+                    response.opaque["stencilCover"] = _build_stencil_cover(
+                        response.opaque,
+                        board,
+                        context.width,
+                        context.height,
+                        context.threshold,
+                    )
+                except Exception:
+                    # Stencil cover is optional enrichment. A malformed or
+                    # incomplete map must not kill the session's send loop or
+                    # suppress the original KataGo analysis response.
+                    logger.exception(
+                        "Could not build stencilCover for query %s; "
+                        "forwarding the original KataGo response",
+                        eid,
+                    )
             return response
         finally:
             if link.mapping.forward(eid) is None:
