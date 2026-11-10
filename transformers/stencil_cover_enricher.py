@@ -489,28 +489,121 @@ def _connected_components(
     return components
 
 
-def _component_shape_key(
-    component: Sequence[int], board_width: int,
-) -> Tuple[bytes, Tuple[int, int, int, int]]:
-    """Pack a translation-normalised component as (height,width,bits).
+# D4 is represented as integer matrices acting on (row, column). The
+# transforms are intentionally shared by canonicalisation and recovery.
+_D4_MATRICES = (
+    (1, 0, 0, 1),    # identity
+    (0, 1, -1, 0),   # quarter turn
+    (-1, 0, 0, -1),  # half turn
+    (0, -1, 1, 0),   # three-quarter turn
+    (-1, 0, 0, 1),   # horizontal-axis reflection
+    (1, 0, 0, -1),   # vertical-axis reflection
+    (0, 1, 1, 0),    # main-diagonal reflection
+    (0, -1, -1, 0),  # anti-diagonal reflection
+)
+_D4_INVERSE = (0, 3, 2, 1, 4, 5, 6, 7)
 
-    The returned frame is (board_x, board_y, local_width, local_height).
-    Only translation is normalised: this family is not guaranteed to be
-    invariant under rotation/reflection, so applying D4 would be unsound.
-    """
-    xs = [point % board_width for point in component]
-    ys = [point // board_width for point in component]
-    x0, y0 = min(xs), min(ys)
-    local_width = max(xs) - x0 + 1
-    local_height = max(ys) - y0 + 1
-    bits = bytearray((local_width * local_height + 7) // 8)
-    for point in component:
-        local = (point // board_width - y0) * local_width + (point % board_width - x0)
-        bits[local >> 3] |= 1 << (local & 7)
-    return (
-        bytes((local_height, local_width)) + bytes(bits),
-        (x0, y0, local_width, local_height),
+
+@dataclass(frozen=True)
+class ComponentFrame:
+    """Map between a board component and its canonical D4 frame."""
+
+    board_width: int
+    transform: int
+    offset_y: int
+    offset_x: int
+    canonical_width: int
+    canonical_height: int
+
+
+def _transform_cell(y: int, x: int, transform: int) -> Tuple[int, int]:
+    a, b, c, d = _D4_MATRICES[transform]
+    return a * y + b * x, c * y + d * x
+
+
+def _normalise_shape(
+    cells: Sequence[Tuple[int, int]], transform: int = 0,
+) -> Tuple[Tuple[int, int], ...]:
+    mapped = [_transform_cell(int(y), int(x), transform) for y, x in cells]
+    if not mapped:
+        raise ValueError("a stencil shape must contain at least one cell")
+    min_y = min(y for y, _ in mapped)
+    min_x = min(x for _, x in mapped)
+    return tuple(sorted((y - min_y, x - min_x) for y, x in mapped))
+
+
+def _family_dihedral_group(family: Sequence[Stencil]) -> Tuple[int, ...]:
+    """Return exactly the D4 maps that preserve the family's shape set."""
+    shapes = {_normalise_shape(cells) for _name, cells in family}
+    group = tuple(
+        transform for transform in range(8)
+        if {
+            _normalise_shape(cells, transform)
+            for _name, cells in family
+        } == shapes
     )
+    if not group or group[0] != 0:
+        raise RuntimeError("the stencil family's symmetry group lost the identity")
+    return group
+
+
+def _component_shape_key(
+    component: Sequence[int],
+    board_width: int,
+    family: Sequence[Stencil] = STENCIL_FAMILY,
+) -> Tuple[bytes, ComponentFrame]:
+    """Return the least translation/D4 representative allowed by the family.
+
+    The key is bytes([height, width]) followed by an LSB-first packed bitmap.
+    The frame records the chosen map from caller coordinates into that
+    canonical rectangle, so cached placements can be mapped back exactly.
+    Only symmetries preserving the complete stencil shape set are admitted.
+    """
+    if isinstance(board_width, bool) or not isinstance(board_width, int) or board_width <= 0:
+        raise ValueError("board_width must be a positive integer")
+    points = tuple(sorted({int(point) for point in component}))
+    if not points:
+        raise ValueError("cannot canonicalise an empty component")
+    if points[0] < 0:
+        raise ValueError("component points must be non-negative board indices")
+
+    coordinates = [(point // board_width, point % board_width) for point in points]
+    best_key: Optional[bytes] = None
+    best_frame: Optional[ComponentFrame] = None
+
+    for transform in _family_dihedral_group(family):
+        mapped = [
+            _transform_cell(y, x, transform)
+            for y, x in coordinates
+        ]
+        offset_y = min(y for y, _ in mapped)
+        offset_x = min(x for _, x in mapped)
+        local = [(y - offset_y, x - offset_x) for y, x in mapped]
+        canonical_height = max(y for y, _ in local) + 1
+        canonical_width = max(x for _, x in local) + 1
+        if canonical_height > 255 or canonical_width > 255:
+            raise ValueError("canonical component dimensions exceed the key format")
+
+        bits = bytearray((canonical_width * canonical_height + 7) // 8)
+        for y, x in local:
+            index = y * canonical_width + x
+            bits[index >> 3] |= 1 << (index & 7)
+        candidate_key = bytes((canonical_height, canonical_width)) + bytes(bits)
+
+        # Iteration is in transform order, so the first transform wins ties.
+        if best_key is None or candidate_key < best_key:
+            best_key = candidate_key
+            best_frame = ComponentFrame(
+                board_width=board_width,
+                transform=transform,
+                offset_y=offset_y,
+                offset_x=offset_x,
+                canonical_width=canonical_width,
+                canonical_height=canonical_height,
+            )
+
+    assert best_key is not None and best_frame is not None
+    return best_key, best_frame
 
 
 def _decode_component_shape_key(shape_key: bytes) -> Tuple[int, int, Tuple[int, ...]]:
@@ -560,19 +653,23 @@ def _encode_cached_placements(
 def _decode_cached_placements(
     encoded: bytes,
     family: Sequence[Stencil],
-    frame: Tuple[int, int, int, int],
+    frame: ComponentFrame,
 ) -> List[Dict[str, Any]]:
-    """Decode placements as wire [column, row_from_top] coordinates.
+    """Recover a canonical solution into board coordinates and stencil names.
 
-    The source indices are KataGo row-major (row zero at the top). The SPA
-    translates this wire point into its bottom-origin Point at the
-    geometry boundary; do not pre-flip y here.
+    A D4 map can rotate a rectangle into a differently named family member
+    (for example, canonical 1x2 becomes caller-facing 2x1). Both points and
+    stencil geometry are therefore transformed back together.
     """
-    x0, y0, local_width, _local_height = frame
     if len(encoded) < 2:
         raise ValueError("cached stencil solution is truncated")
     count = int.from_bytes(encoded[:2], "little")
     offset = 2
+    inverse = _D4_INVERSE[frame.transform]
+    names_by_shape: Dict[Tuple[Tuple[int, int], ...], str] = {}
+    for name, cells in family:
+        names_by_shape.setdefault(_normalise_shape(cells), name)
+
     placements: List[Dict[str, Any]] = []
     for _ in range(count):
         if offset + 2 > len(encoded):
@@ -581,30 +678,86 @@ def _decode_cached_placements(
         offset += 2
         if offset + point_count * 2 > len(encoded):
             raise ValueError("cached stencil placement points are truncated")
+
         if stencil_index == 255:
             stencil_name = "1x1"
         elif stencil_index < len(family):
-            stencil_name = family[stencil_index][0]
+            canonical_stencil = family[stencil_index][1]
+            recovered_shape = _normalise_shape(canonical_stencil, inverse)
+            stencil_name = names_by_shape.get(recovered_shape)
+            if stencil_name is None:
+                raise RuntimeError(
+                    "the active family is not closed under the component's recovery transform"
+                )
         else:
             raise ValueError("cached stencil index is outside the active family")
-        points = []
+
+        points: List[List[int]] = []
         for _ in range(point_count):
             local = int.from_bytes(encoded[offset:offset + 2], "little")
             offset += 2
-            points.append([
-                x0 + local % local_width,
-                y0 + local // local_width,
-            ])
+            if local >= frame.canonical_width * frame.canonical_height:
+                raise ValueError("cached stencil point is outside the canonical component frame")
+            canonical_y, canonical_x = divmod(local, frame.canonical_width)
+            transformed_y = canonical_y + frame.offset_y
+            transformed_x = canonical_x + frame.offset_x
+            original_y, original_x = _transform_cell(
+                transformed_y, transformed_x, inverse,
+            )
+            if original_y < 0 or not 0 <= original_x < frame.board_width:
+                raise ValueError("recovered stencil point is outside the caller's board frame")
+            points.append([original_x, original_y])
+
+        points.sort(key=lambda point: (point[1], point[0]))
         placements.append({"stencil": stencil_name, "points": points})
+
     if offset != len(encoded):
         raise ValueError("cached stencil solution has trailing bytes")
     return placements
 
 
+def _verify_component_placements(
+    component: Sequence[int],
+    board_width: int,
+    placements: Sequence[Dict[str, Any]],
+    family: Sequence[Stencil],
+) -> None:
+    """Reject corrupt or incorrectly recovered covers before they are served."""
+    allowed = set(int(point) for point in component)
+    names = {name: _normalise_shape(cells) for name, cells in family}
+    covered: set[int] = set()
+    for placement in placements:
+        name = placement.get("stencil")
+        points = placement.get("points")
+        if name not in names or not isinstance(points, list) or not points:
+            raise RuntimeError("cached stencil placement has an unknown shape or no points")
+        coordinates: List[Tuple[int, int]] = []
+        flattened: List[int] = []
+        for point in points:
+            if (
+                not isinstance(point, list) or len(point) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in point)
+            ):
+                raise RuntimeError("cached stencil placement contains a malformed coordinate")
+            x, y = point
+            if x < 0 or not 0 <= x < board_width or y < 0:
+                raise RuntimeError("cached stencil placement is outside the board")
+            coordinates.append((y, x))
+            flattened.append(y * board_width + x)
+        if _normalise_shape(coordinates) != names[name]:
+            raise RuntimeError("cached stencil name does not match its recovered geometry")
+        for point in flattened:
+            if point not in allowed or point in covered:
+                raise RuntimeError("cached stencil placements do not form a disjoint component cover")
+            covered.add(point)
+    if covered != allowed:
+        raise RuntimeError("cached stencil placements leave component cells uncovered")
+
+
 # The local LRU is outermost: hits avoid Redis I/O; only local misses consult
 # the persistent cache below it. Redis is optional and degrades to no-op.
 @lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)
-@redis_persistent_cache(namespace="solver-component-v1")
+@redis_persistent_cache(namespace="solver-component-d4-v2")
 def _solve_component_cached(
     shape_key: bytes,
     time_limit_ms: int,
@@ -703,12 +856,15 @@ def _solve_region(
     placements: List[Dict[str, Any]] = []
     statuses: List[int] = []
     for component in _connected_components(region, width, height):
-        shape_key, frame = _component_shape_key(component, width)
+        shape_key, frame = _component_shape_key(component, width, family)
         optimal, status, encoded = _solve_component_cached(
             shape_key, time_limit_ms, family_key,
         )
         component_placements = _decode_cached_placements(
             encoded, family_key, frame,
+        )
+        _verify_component_placements(
+            component, width, component_placements, family_key,
         )
         placements.extend(component_placements)
         statuses.append(status)
