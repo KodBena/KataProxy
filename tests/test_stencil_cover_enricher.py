@@ -204,6 +204,70 @@ def test_canonical_solution_is_recovered_with_rotated_stencil_name(
     ]
 
 
+def test_solution_recovery_is_equivariant_for_all_d4_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_shape = ((0, 0), (1, 0), (1, 1))
+    unique_shapes = []
+    for transform in range(8):
+        candidate = stencil._normalise_shape(base_shape, transform)
+        if candidate not in unique_shapes:
+            unique_shapes.append(candidate)
+    family = (
+        ("dot", ((0, 0),)),
+        *((f"L{index}", shape) for index, shape in enumerate(unique_shapes)),
+    )
+    assert stencil._family_dihedral_group(family) == tuple(range(8))
+
+    seen_keys: List[bytes] = []
+
+    def fake_cached(
+        shape_key: bytes, time_limit_ms: int, family_key: Any,
+    ) -> tuple[bool, int, bytes]:
+        seen_keys.append(shape_key)
+        local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
+        candidates = stencil._candidate_placements(
+            cells, local_width, local_height, family_key,
+        )
+        complete = next(
+            candidate for candidate in candidates
+            if len(candidate[1]) == len(cells) and set(candidate[1]) == set(cells)
+        )
+        return True, 0, stencil._encode_cached_placements([complete], family_key)
+
+    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+
+    recovered = []
+    for transform in range(8):
+        mapped = [
+            stencil._transform_cell(y, x, transform)
+            for y, x in base_shape
+        ]
+        min_y = min(y for y, _ in mapped)
+        min_x = min(x for _, x in mapped)
+        component = tuple(
+            (y - min_y + 3) * 10 + (x - min_x + 3)
+            for y, x in mapped
+        )
+        result = stencil._solve_region(
+            component, width=10, height=10, family=family,
+        )
+        recovered.append(result["placements"])
+
+        expected_points = sorted(
+            [[point % 10, point // 10] for point in component],
+            key=lambda point: (point[1], point[0]),
+        )
+        assert result["placements"][0]["points"] == expected_points
+        assert result["optimal"] is True
+
+    assert len(seen_keys) == 8
+    assert len(set(seen_keys)) == 1
+    # All eight callers receive a geometrically valid placement in their
+    # own frame; the verification inside _solve_region checks the name too.
+    assert len(recovered) == 8
+
+
 def test_disconnected_region_is_solved_as_independent_components(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
