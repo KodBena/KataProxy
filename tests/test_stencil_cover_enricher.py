@@ -141,6 +141,49 @@ class _FakeRedisClient:
 
 
 
+def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client_id = ClientId("stencil-cover-test")
+    link = SimpleNamespace(
+        mapping=SimpleNamespace(forward=lambda _eid: None),
+    )
+    transformer = stencil.stencil_cover_enricher(link)
+    query = KataGoQuery(
+        action=KataGoAction.ANALYZE,
+        opaque={
+            "capabilities": {
+                "stencil_cover": {"truncation_threshold": 0.6},
+            },
+            "boardXSize": 1,
+            "boardYSize": 1,
+            "initialStones": [],
+            "moves": [],
+            "includeOwnership": False,
+        },
+    )
+
+    assert transformer.on_query(client_id, query) is query
+    # Opting in to stencil_cover is sufficient; callers need not separately
+    # know that KataGo's ownership map must be requested.
+    assert query.opaque["includeOwnership"] is True
+
+    # A missing map can still occur for an upstream error/incomplete response.
+    # Optional enrichment must not take down the session send loop.
+    response = AnalyzeResponse(
+        is_during_search=False,
+        turn_number=0,
+        opaque={},
+    )
+    with caplog.at_level(
+        "ERROR", logger="kataproxy.stencil_cover_enricher",
+    ):
+        assert transformer.on_response(client_id, response) is response
+
+    assert "stencilCover" not in response.opaque
+    assert "forwarding the original KataGo response" in caplog.text
+
+
 def test_family_parser_loads_proxy_owned_rectangles() -> None:
     family = stencil._parse_stencil_family("name: dot\n#\n\nname: domino\n##\n")
     assert family == (
