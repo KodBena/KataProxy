@@ -762,7 +762,7 @@ def _verify_component_placements(
 # The local LRU is outermost: hits avoid Redis I/O; only local misses consult
 # the persistent cache below it. Redis is optional and degrades to no-op.
 @lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)
-@redis_persistent_cache(namespace="solver-component-d4-v2")
+@redis_persistent_cache(namespace="solver-component-d4-v3")
 def _solve_component_cached(
     shape_key: bytes,
     time_limit_ms: int,
