@@ -673,7 +673,14 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
         ),
     )
     calls: List[int] = []
-    approximation = (False, 1, b"\x02\x00\x00\x01\x01\x01\x00")
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+    )
+    approximation = (
+        False, 1,
+        stencil._encode_cached_placements([("domino", (0, 1))], family),
+    )
 
     def solve(
         shape_key: bytes,
@@ -711,11 +718,25 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "upgrade-test")
-    family = (("dot", ((0, 0),)),)
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+    )
     shape_key = b"canonical-component"
-    fallback = (False, 2, b"\x03\x00\x00\x01\x01\x02\x00\x03\x00")
-    approximation = (False, 1, b"\x02\x00\x00\x01\x01\x01\x00")
-    exact = (True, 0, b"\x01\x00\x00\x01\x00\x00")
+    fallback = (
+        False, 2,
+        stencil._encode_cached_placements(
+            [("dot", (0,)), ("dot", (1,))], family,
+        ),
+    )
+    approximation = (
+        False, 1,
+        stencil._encode_cached_placements([("domino", (0, 1))], family),
+    )
+    exact = (
+        True, 0,
+        stencil._encode_cached_placements([("domino", (0, 1))], family),
+    )
 
     assert store.put_result(shape_key, family, fallback) is True
     assert store.hard_components(family) == frozenset({shape_key})
@@ -732,7 +753,9 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
 
     contradictory_exact = (
         True, 0,
-        b"\x02\x00\x00\x01\x01\x01\x00\x01\x01\x00",
+        stencil._encode_cached_placements(
+            [("dot", (0,)), ("dot", (1,))], family,
+        ),
     )
     with pytest.raises(storage.RedisCacheConflict):
         store.put_result(shape_key, family, contradictory_exact)
