@@ -1,11 +1,11 @@
 KataProxy
 =========
 
-This repository contains code released under two distinct licenses.
-The boundary is by directory and is documented below.
+This repository contains code released under distinct licensing scopes.
+The boundaries are documented below.
 
 ------------------------------------------------------------------------
-Project root and all subdirectories EXCEPT `goboard_transposition/`
+Project root and all subdirectories EXCEPT the paths listed below and `goboard_transposition/`
 ------------------------------------------------------------------------
 
 Released into the public domain under the Unlicense.
@@ -19,6 +19,39 @@ This includes (non-exhaustive):
   - flt.py, transposition_enricher.py
   - All shell scripts, configuration examples, and documentation
 
+------------------------------------------------------------------------
+File-specific MIT exception: ownership stencil implementation
+------------------------------------------------------------------------
+
+The following files are released under the MIT License. This is a
+file-specific exception to the Unlicense scope above:
+
+  - transformers/stencil_cover_enricher.py
+  - transformers/stencil_cache_storage.py
+  - tests/test_stencil_cover_enricher.py
+
+The chain-liveness classification in
+transformers/stencil_cover_enricher.py is an independent Python
+implementation of the ownership-based heuristic in KataGo's
+cpp/program/playutils.cpp, function
+PlayUtils::computeAnticipatedStatusesWithOwnership. The upstream
+project is copyright 2025 David J Wu ("lightvector") and/or other
+authors. The upstream copyright and full MIT license text are
+preserved in goboard_transposition/LICENSE. Redistributors of any of
+the MIT-licensed files listed above must include that license file
+and this NOTICE.
+
+The Redis persistence wrapper and the proxy-side board reconstruction
+are original KataProxy implementations. The goboard_transposition
+implementation was consulted as a reference for query/replay shape;
+its source code was not copied into these stencil-cover files. Its
+separate provenance and obligations are documented below.
+
+The MIT exception applies only to the three paths listed above. All
+other project-root files and subdirectories remain under the
+Unlicense unless another explicit exception is documented here.
+
+------------------------------------------------------------------------
 ------------------------------------------------------------------------
 The `goboard_transposition/` subdirectory
 ------------------------------------------------------------------------
@@ -93,10 +126,12 @@ hash for the unmodified upstream amalgamation are documented in
 Practical implications for downstream users
 ------------------------------------------------------------------------
 
-If you redistribute KataProxy in source form: include `UNLICENSE`,
-`goboard_transposition/LICENSE`,
-`goboard_transposition/third_party/nlohmann/LICENSE.MIT`, and this
-NOTICE file. No further obligations.
+If you redistribute KataProxy in source form, include `UNLICENSE`
+and this NOTICE file. If the distribution contains any file-specific
+MIT paths listed above or any code from `goboard_transposition/`,
+also include `goboard_transposition/LICENSE`. If the distribution
+contains the vendored nlohmann/json code, also include
+`goboard_transposition/third_party/nlohmann/LICENSE.MIT`.
 
 If you redistribute compiled artifacts that include
 `goboard_transposition`: include both
@@ -105,6 +140,9 @@ If you redistribute compiled artifacts that include
 (nlohmann/json MIT) alongside the binary. The MIT attribution
 requirement applies to each upstream independently.
 
-If you redistribute compiled artifacts WITHOUT `goboard_transposition`
-(the module is optional at runtime): no licensing obligations apply.
-The remainder of the project is in the public domain.
+If you redistribute compiled artifacts without
+`goboard_transposition`, but they contain one of the file-specific
+MIT stencil-cover files, include `goboard_transposition/LICENSE`
+and this NOTICE for the KataGo attribution. If they contain neither
+the MIT stencil-cover files nor `goboard_transposition`, the
+remaining project code is in the public domain under the Unlicense.
