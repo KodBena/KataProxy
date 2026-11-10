@@ -333,10 +333,17 @@ end
 local ok, result = pcall(cjson.decode, raw)
 if not ok or tonumber(result.status) == 0 then
     redis.call('SREM', KEYS[1], ARGV[1])
+    redis.call('SREM', KEYS[2], ARGV[1])
     redis.call('HDEL', KEYS[4], ARGV[1])
     return 0
 end
-redis.call('HSET', KEYS[4], ARGV[1], ARGV[2])
+local metadata_ok, metadata = pcall(cjson.decode, ARGV[2])
+if not metadata_ok or type(metadata) ~= 'table' then
+    return redis.error_reply('invalid stencil timeout metadata')
+end
+metadata.status = tonumber(result.status)
+metadata.tile_count = tonumber(result.tile_count)
+redis.call('HSET', KEYS[4], ARGV[1], cjson.encode(metadata))
 redis.call('SREM', KEYS[2], ARGV[1])
 return 1
 """
@@ -513,8 +520,6 @@ class RedisStencilStore:
                 "version": 1,
                 "reason": "time_limit_reached_without_proving_optimality",
                 "time_limit_ms": int(time_limit_ms),
-                "status": int(status),
-                "tile_count": int(cost),
                 "attempted_at": float(attempted_at),
             },
             sort_keys=True,
