@@ -744,7 +744,12 @@ def _verify_component_placements(
                 raise RuntimeError("cached stencil placement is outside the board")
             coordinates.append((y, x))
             flattened.append(y * board_width + x)
-        if _normalise_shape(coordinates) != names[name]:
+        expected_shape = names.get(name)
+        if expected_shape is None and name == "1x1" and len(coordinates) == 1:
+            # Explicitly preserve the solver's guaranteed singleton fallback
+            # for a family that omits a named singleton stencil.
+            expected_shape = ((0, 0),)
+        if expected_shape is None or _normalise_shape(coordinates) != expected_shape:
             raise RuntimeError("cached stencil name does not match its recovered geometry")
         for point in flattened:
             if point not in allowed or point in covered:
