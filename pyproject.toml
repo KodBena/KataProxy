@@ -42,6 +42,7 @@ dev = [
 
 [project.scripts]
 kataproxy = "proxy_server:main"
+kataproxy-stencil-bulk-solver = "transformers.stencil_bulk_solver:main"
 
 [project.urls]
 Repository = "https://github.com/KodBena/kataproxy"
