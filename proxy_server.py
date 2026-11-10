@@ -1408,6 +1408,10 @@ class ProxyServer:
 # ---------------------------------------------------------------------------
 from contextual import Contextual
 from transformers.transposition_enricher import transposition_enricher
+from transformers.stencil_cover_enricher import (
+    STENCIL_COVER_AVAILABLE,
+    stencil_cover_enricher,
+)
 from transformers.analysis_enricher import analysis_enricher
 from transformers.capability_gate import capability_gate
 from transformers.capabilities_advertiser import capabilities_advertiser
@@ -1461,10 +1465,10 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
 
     delta_analysis and adaptive_reevaluate are unconditionally wired
     below in _main, so they are unconditionally advertised. transposition
-    is advertised iff the native go_transposition module is importable;
-    this mirrors the runtime check in
-    transformers/transposition_enricher.py and keeps the advertisement
-    honest about what the proxy can actually do.
+    is advertised iff the native go_transposition module is importable.
+    stencil_cover is advertised iff its optional highspy solver and the
+    proxy-owned stencil family are both available; the transformer and
+    advertisement share the same availability flag.
 
     selector (Phase 2+3) is advertised iff cfg.ROLE == "SELECTOR" — the
     role-gated routing capability that tells SPA clients to render the
@@ -1503,6 +1507,8 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
         advertised["transposition"] = {}
     except ImportError:
         pass
+    if STENCIL_COVER_AVAILABLE:
+        advertised["stencil_cover"] = {}
     if cfg.ROLE.upper() == "SELECTOR":
         advertised["selector"] = {}
     # cache (this feature) — advertised iff the Hub replay cache is
@@ -1552,6 +1558,7 @@ async def _main() -> None:
     chain = (
         Contextual(capability_gate("delta_analysis", analysis_enricher))
         .then(capability_gate("transposition", transposition_enricher))
+        .then(capability_gate("stencil_cover", stencil_cover_enricher))
     )
     if cfg.ADVERTISE_CAPABILITIES:
         advertised_caps = _build_advertised_capabilities()
