@@ -26,21 +26,66 @@ def test_family_parser_rejects_disconnected_shapes() -> None:
 def test_zero_threshold_splits_signs_and_leaves_neutral_points_unowned() -> None:
     positive, negative = stencil._ownership_regions(
         [0.8, 0.0, -0.7, 0.4],
-        [True, True, True, False],
-        0.0,
+        [None, None, None, None],
+        width=2,
+        height=2,
+        threshold=0.0,
     )
     assert positive == [0]
     assert negative == [2]
 
 
-def test_threshold_one_keeps_only_fully_owned_points() -> None:
+def test_threshold_one_keeps_only_fully_owned_empty_points() -> None:
     positive, negative = stencil._ownership_regions(
         [1.0, 0.999, -1.0, -0.999],
-        [True, True, True, True],
-        1.0,
+        [None, None, None, None],
+        width=2,
+        height=2,
+        threshold=1.0,
     )
     assert positive == [0]
     assert negative == [2]
+
+
+def test_dead_chains_join_opponent_territory_and_living_stones_are_excluded() -> None:
+    # The black chain at 0-1 and white chain at 3-4 fail KataGo's chain-level
+    # liveness heuristic. The black stone at 6 is alive and stays out.
+    board = ["B", "B", None, "W", "W", None, "B", None]
+    ownership = [0.3, 0.0, 0.95, -0.95, -0.5, -0.9, -0.95, -0.9]
+
+    positive, negative = stencil._ownership_regions(
+        ownership, board, width=4, height=2, threshold=0.8,
+    )
+
+    # Dead stones are included even though their individual ownership values
+    # do not cross 0.8; empty points still use the configured cutoff.
+    assert positive == [0, 1, 2]
+    assert negative == [3, 4, 5, 7]
+
+
+def test_board_replay_stops_at_the_requested_turn_and_applies_captures() -> None:
+    context = stencil.RequestContext(
+        width=3,
+        height=3,
+        threshold=0.6,
+        initial_stones=(
+            ("W", stencil._coordinate_index("B2", 3, 3, allow_pass=False)),
+            ("B", stencil._coordinate_index("B3", 3, 3, allow_pass=False)),
+        ),
+        moves=(
+            ("B", stencil._coordinate_index("A2", 3, 3, allow_pass=True)),
+            ("W", None),
+            ("B", stencil._coordinate_index("C2", 3, 3, allow_pass=True)),
+            ("W", None),
+            ("B", stencil._coordinate_index("B1", 3, 3, allow_pass=True)),
+        ),
+    )
+
+    before_capture = stencil._board_at_turn(context, 4)
+    after_capture = stencil._board_at_turn(context, 5)
+    assert before_capture[4] == "W"
+    assert after_capture[4] is None
+    assert after_capture[1] == "B"
 
 
 def test_candidates_include_singletons_for_every_region_point() -> None:
@@ -183,12 +228,19 @@ def _mock_link() -> Any:
     )
 
 
-def _query(capabilities: Dict[str, Any]) -> KataGoQuery:
+def _query(
+    capabilities: Dict[str, Any],
+    *,
+    initial_stones: List[List[str]] | None = None,
+    moves: List[List[str]] | None = None,
+) -> KataGoQuery:
     return KataGoQuery(
         action=KataGoAction.ANALYZE,
         opaque={
             "boardXSize": 2,
             "boardYSize": 2,
+            "initialStones": initial_stones or [],
+            "moves": moves or [],
             "capabilities": capabilities,
         },
     )
@@ -200,7 +252,6 @@ def _response(*, during_search: bool = False) -> AnalyzeResponse:
         turn_number=0,
         opaque={
             "ownership": [0.8, 0.7, -0.8, -0.7],
-            "rootInfo": {"policy": [0.25, 0.25, 0.25, 0.25]},
         },
     )
 
@@ -272,7 +323,7 @@ def test_transformer_enriches_only_final_response_and_keeps_signs(
     assert annotation["optimal"] is True
 
 
-def test_transformer_fails_loudly_when_policy_map_is_missing() -> None:
+def test_transformer_does_not_need_policy_map_for_territory() -> None:
     transformer = stencil.stencil_cover_enricher(_mock_link())
     transformer.on_query(
         ClientId("q3"),
@@ -283,8 +334,8 @@ def test_transformer_fails_loudly_when_policy_map_is_missing() -> None:
         turn_number=0,
         opaque={"ownership": [0.8, 0.7, -0.8, -0.7]},
     )
-    with pytest.raises(ValueError, match="no policy map"):
-        transformer.on_response(ClientId("q3"), response)
+    transformer.on_response(ClientId("q3"), response)
+    assert "stencilCover" in response.opaque
 
 
 def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None:
