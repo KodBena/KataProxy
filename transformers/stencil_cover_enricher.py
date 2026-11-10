@@ -20,6 +20,7 @@ import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import highspy
@@ -37,6 +38,8 @@ class RequestContext:
     width: int
     height: int
     threshold: float
+    initial_stones: Tuple[Tuple[str, int], ...]
+    moves: Tuple[Tuple[str, Optional[int]], ...]
 
 
 _MAX_BOARD_SIZE = 25
@@ -47,7 +50,14 @@ _SOLVER_TIME_LIMIT_MS = 250
 # including ordinary Python LRU/dict overhead; typical components are much smaller.
 _SOLVER_CACHE_MAX_ENTRIES = 90_000
 _OWNERSHIP_EPSILON = 1e-5
-_POLICY_EPSILON = 1e-3
+# Match KataGo PlayUtils::computeAnticipatedStatusesWithOwnership. These
+# classify occupied chains; truncation_threshold remains the confidence cutoff
+# for empty intersections only.
+_STONE_AVG_LIVENESS_THRESHOLD = 0.2
+_STONE_WORST_LIVENESS_THRESHOLD = 0.6
+_MAX_INITIAL_STONES = 1_000
+_MAX_REPLAY_MOVES = 1_000
+_MAX_COORDINATE_LENGTH = 16
 
 
 def _parse_stencil_family(source: str) -> Tuple[Stencil, ...]:
@@ -148,7 +158,13 @@ def _numeric_array(value: Any, field: str) -> np.ndarray:
 
 def _extract_maps(
     opaque: Dict[str, Any], width: int, height: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
+    """Extract KataGo's signed white-ownership map.
+
+    The policy map is intentionally not consulted here: -1 means that a move
+    is illegal, not that the intersection is absent from territorial ownership.
+    Board occupancy and chain liveness are reconstructed from the request.
+    """
     area = width * height
     ownership_value = opaque.get("ownership")
     if ownership_value is None:
@@ -159,52 +175,250 @@ def _extract_maps(
     if ((ownership < -1.0 - _OWNERSHIP_EPSILON)
             | (ownership > 1.0 + _OWNERSHIP_EPSILON)).any():
         raise ValueError("ownership values must lie in [-1, 1]")
+    return ownership
 
-    root_info = opaque.get("rootInfo")
-    policy_value = opaque.get("policy")
-    if policy_value is None and isinstance(root_info, dict):
-        policy_value = root_info.get("policy")
-    if policy_value is None:
-        raise ValueError("response has no policy map; legal-point masking is unavailable")
-    policy = _numeric_array(policy_value, "policy")
-    if policy.size not in (area, area + 1):
+
+def _coordinate_index(
+    coordinate: str, width: int, height: int, *, allow_pass: bool,
+) -> Optional[int]:
+    """Parse KataGo GTP-style or explicit (x,y) coordinates to top-row indices."""
+    value = coordinate.strip()
+    lowered = value.lower()
+    if lowered in ("pass", "..") or (lowered == "tt" and max(width, height) <= 19):
+        if allow_pass:
+            return None
+        raise ValueError("initialStones cannot contain a pass")
+
+    numeric = re.fullmatch(r"\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)", value)
+    if numeric is not None:
+        x, y = int(numeric.group(1)), int(numeric.group(2))
+    else:
+        gtp = re.fullmatch(r"([A-HJ-Z])([1-9][0-9]*)", value, re.IGNORECASE)
+        if gtp is None:
+            raise ValueError(f"invalid KataGo coordinate: {coordinate!r}")
+        column = ord(gtp.group(1).upper()) - ord("A")
+        if column > 8:
+            column -= 1  # GTP skips the letter I.
+        x = column
+        y = height - int(gtp.group(2))
+
+    if not 0 <= x < width or not 0 <= y < height:
         raise ValueError(
-            f"policy has {policy.size} values; expected {area} board values "
-            f"with an optional pass value"
+            f"coordinate {coordinate!r} is outside the {width}x{height} board"
         )
-    policy = policy[:area]
-    illegal = policy < -0.5
-    if ((illegal & (np.abs(policy + 1.0) > _POLICY_EPSILON))
-            | (~illegal & ((policy < 0.0) | (policy > 1.0 + _POLICY_EPSILON)))).any():
-        raise ValueError("policy values must be -1 for illegal points or probabilities in [0, 1]")
-    legal = ~illegal
-    return ownership, legal
+    return y * width + x
+
+
+def _parse_position_entries(
+    value: Any, field: str, width: int, height: int, *, allow_pass: bool,
+) -> Tuple[Tuple[str, Optional[int]], ...]:
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be an array")
+    limit = _MAX_REPLAY_MOVES if allow_pass else _MAX_INITIAL_STONES
+    if len(value) > limit:
+        raise ValueError(f"{field} has more than {limit} entries")
+
+    entries: List[Tuple[str, Optional[int]]] = []
+    for i, item in enumerate(value):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"{field}[{i}] must be a [player, coordinate] pair")
+        player, coordinate = item
+        if player not in ("B", "W"):
+            raise ValueError(f"{field}[{i}][0] must be 'B' or 'W'")
+        if not isinstance(coordinate, str) or not coordinate or len(coordinate) > _MAX_COORDINATE_LENGTH:
+            raise ValueError(f"{field}[{i}][1] must be a short coordinate string")
+        point = _coordinate_index(
+            coordinate, width, height, allow_pass=allow_pass,
+        )
+        entries.append((player, point))
+    return tuple(entries)
+
+
+def _neighbours(index: int, width: int, height: int) -> List[int]:
+    x, y = index % width, index // width
+    result: List[int] = []
+    if x > 0:
+        result.append(index - 1)
+    if x + 1 < width:
+        result.append(index + 1)
+    if y > 0:
+        result.append(index - width)
+    if y + 1 < height:
+        result.append(index + width)
+    return result
+
+
+def _chain_and_liberties(
+    board: Sequence[Optional[str]], start: int, width: int, height: int,
+) -> Tuple[set[int], set[int]]:
+    """Return a same-colour chain and its distinct empty neighbouring points."""
+    colour = board[start]
+    if colour is None:
+        return set(), set()
+    stones: set[int] = set()
+    liberties: set[int] = set()
+    pending = [start]
+    while pending:
+        point = pending.pop()
+        if point in stones:
+            continue
+        stones.add(point)
+        for neighbour in _neighbours(point, width, height):
+            adjacent = board[neighbour]
+            if adjacent is None:
+                liberties.add(neighbour)
+            elif adjacent == colour and neighbour not in stones:
+                pending.append(neighbour)
+    return stones, liberties
+
+
+def _board_at_turn(context: RequestContext, turn_number: int) -> List[Optional[str]]:
+    """Replay the submitted position to the response's turnNumber.
+
+    Moves are assumed to be KataGo-valid, just as in transposition_enricher.
+    Captures and self-captures are applied; ko legality need not be rechecked
+    because the source move sequence has already passed KataGo's rules engine.
+    """
+    if isinstance(turn_number, bool) or not isinstance(turn_number, int) or turn_number < 0:
+        raise ValueError("response turnNumber must be a non-negative integer")
+    if turn_number > len(context.moves):
+        raise ValueError(
+            f"response turnNumber {turn_number} exceeds the {len(context.moves)} submitted moves"
+        )
+
+    board: List[Optional[str]] = [None] * (context.width * context.height)
+    for colour, point in context.initial_stones:
+        assert point is not None
+        if board[point] is not None:
+            raise ValueError(f"overlapping initial stones at flat point {point}")
+        board[point] = colour
+
+    # A valid setup position cannot contain a chain without liberties.
+    visited: set[int] = set()
+    for point, colour in enumerate(board):
+        if colour is None or point in visited:
+            continue
+        chain, liberties = _chain_and_liberties(
+            board, point, context.width, context.height,
+        )
+        visited.update(chain)
+        if not liberties:
+            raise ValueError("initialStones contains a chain without liberties")
+
+    for colour, point in context.moves[:turn_number]:
+        if point is None:  # pass
+            continue
+        if board[point] is not None:
+            raise ValueError(f"move plays on occupied point {point}")
+        board[point] = colour
+        opponent = "W" if colour == "B" else "B"
+
+        checked_opponent_chains: set[int] = set()
+        for neighbour in _neighbours(point, context.width, context.height):
+            if board[neighbour] != opponent or neighbour in checked_opponent_chains:
+                continue
+            chain, liberties = _chain_and_liberties(
+                board, neighbour, context.width, context.height,
+            )
+            checked_opponent_chains.update(chain)
+            if not liberties:
+                for captured in chain:
+                    board[captured] = None
+
+        own_chain, own_liberties = _chain_and_liberties(
+            board, point, context.width, context.height,
+        )
+        if not own_liberties:
+            # This occurs only under rules that permit suicide in a valid
+            # KataGo move sequence; the self-captured stones leave the board.
+            for captured in own_chain:
+                board[captured] = None
+    return board
+
+
+def _dead_stone_owners(
+    ownership: Sequence[float],
+    board: Sequence[Optional[str]],
+    width: int,
+    height: int,
+) -> Tuple[List[int], List[int]]:
+    """Return dead Black stones (White-owned) and dead White stones (Black-owned).
+
+    This mirrors KataGo's chain-level heuristic in
+    PlayUtils::computeAnticipatedStatusesWithOwnership:
+    White lives if avg > 0.2 and min > -0.6; Black lives if avg < -0.2
+    and max < 0.6. A dead chain belongs to the opponent as a whole.
+    """
+    if len(ownership) != width * height or len(board) != width * height:
+        raise ValueError("ownership and board maps must match the board dimensions")
+
+    dead_black: List[int] = []
+    dead_white: List[int] = []
+    visited: set[int] = set()
+    for point, colour in enumerate(board):
+        if colour is None or point in visited:
+            continue
+        chain, _liberties = _chain_and_liberties(board, point, width, height)
+        visited.update(chain)
+        values = [float(ownership[cell]) for cell in chain]
+        average = sum(values) / len(values)
+        minimum = min(values)
+        maximum = max(values)
+
+        if colour == "W":
+            alive = (
+                average > _STONE_AVG_LIVENESS_THRESHOLD
+                and minimum > -_STONE_WORST_LIVENESS_THRESHOLD
+            )
+        else:
+            alive = (
+                average < -_STONE_AVG_LIVENESS_THRESHOLD
+                and maximum < _STONE_WORST_LIVENESS_THRESHOLD
+            )
+        if not alive:
+            (dead_black if colour == "B" else dead_white).extend(chain)
+
+    return sorted(dead_black), sorted(dead_white)
 
 
 def _ownership_regions(
     ownership: Sequence[float],
-    legal: Sequence[bool],
+    board: Sequence[Optional[str]],
+    width: int,
+    height: int,
     threshold: float,
 ) -> Tuple[List[int], List[int]]:
-    """Return flat row-major cell indices, preserving the two ownership signs."""
-    positive: List[int] = []
-    negative: List[int] = []
-    for index, (value, is_legal) in enumerate(zip(ownership, legal)):
-        if not is_legal:
-            continue
+    """Build signed territory masks from empty points plus dead opposing stones.
+
+    The truncation threshold applies to empty intersections. Living stones are
+    excluded, while each dead chain is included in the opponent's territory
+    regardless of the ownership value at an individual stone.
+    """
+    dead_black, dead_white = _dead_stone_owners(
+        ownership, board, width, height,
+    )
+    positive = set(dead_black)  # positive ownership is White
+    negative = set(dead_white)  # negative ownership is Black
+
+    for index, value in enumerate(ownership):
+        if board[index] is not None:
+            continue  # occupied stones were handled chain-by-chain above
         # At zero, neutral ownership belongs to neither side. For non-zero
-        # thresholds the comparison is inclusive, so a threshold of 1 keeps
-        # exactly fully-owned points.
+        # thresholds the comparison is inclusive, so threshold 1 keeps only
+        # completely-owned empty points.
         if threshold == 0.0:
             if value > 0.0:
-                positive.append(index)
+                positive.add(index)
             elif value < 0.0:
-                negative.append(index)
+                negative.add(index)
         elif value >= threshold:
-            positive.append(index)
+            positive.add(index)
         elif value <= -threshold:
-            negative.append(index)
-    return positive, negative
+            negative.add(index)
+
+    return sorted(positive), sorted(negative)
 
 
 def _candidate_placements(
@@ -524,11 +738,15 @@ def _solve_region(
     }
 
 def _build_stencil_cover(
-    opaque: Dict[str, Any], width: int, height: int, threshold: float,
+    opaque: Dict[str, Any],
+    board: Sequence[Optional[str]],
+    width: int,
+    height: int,
+    threshold: float,
 ) -> Dict[str, Any]:
-    ownership, legal = _extract_maps(opaque, width, height)
+    ownership = _extract_maps(opaque, width, height)
     positive_cells, negative_cells = _ownership_regions(
-        ownership, legal, threshold,
+        ownership, board, width, height, threshold,
     )
     positive = _solve_region(positive_cells, width, height, STENCIL_FAMILY)
     negative = _solve_region(negative_cells, width, height, STENCIL_FAMILY)
@@ -553,7 +771,27 @@ def _request_context(query: KataGoQuery) -> Optional[RequestContext]:
 
     width, height = _board_dimensions(query.opaque)
     threshold = _threshold_from_metadata(capabilities["stencil_cover"])
-    return RequestContext(width=width, height=height, threshold=threshold)
+    initial_stones = _parse_position_entries(
+        query.opaque.get("initialStones", []),
+        "initialStones",
+        width,
+        height,
+        allow_pass=False,
+    )
+    moves = _parse_position_entries(
+        query.opaque.get("moves", []),
+        "moves",
+        width,
+        height,
+        allow_pass=True,
+    )
+    return RequestContext(
+        width=width,
+        height=height,
+        threshold=threshold,
+        initial_stones=initial_stones,
+        moves=moves,
+    )
 
 
 def stencil_cover_enricher(
@@ -576,8 +814,10 @@ def stencil_cover_enricher(
                 and isinstance(response, AnalyzeResponse)
                 and not response.is_during_search
             ):
+                board = _board_at_turn(context, response.turn_number)
                 response.opaque["stencilCover"] = _build_stencil_cover(
                     response.opaque,
+                    board,
                     context.width,
                     context.height,
                     context.threshold,
