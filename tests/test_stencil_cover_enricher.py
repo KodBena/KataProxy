@@ -1161,8 +1161,16 @@ def test_invalidation_payload_skips_self_and_decodes_other_processes() -> None:
     own_message = storage._invalidation_payload(shape_key)
     assert storage._decode_invalidation_payload(own_message) is None
 
-    other_process = b"0123456789abcdef0123456789abcdef"
-    foreign_message = other_process + b":" + __import__("base64").b64encode(shape_key)
+    import base64
+    import os
+
+    # A forked child inherits the module nonce but has a different runtime PID.
+    other_process = (
+        str(os.getpid() + 1).encode("ascii")
+        + b"-"
+        + storage._PROCESS_NONCE
+    )
+    foreign_message = other_process + b":" + base64.b64encode(shape_key)
     assert storage._decode_invalidation_payload(foreign_message) == shape_key
 
     # Raw messages remain accepted during a rolling deployment.
