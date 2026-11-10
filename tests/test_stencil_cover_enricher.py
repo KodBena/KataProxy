@@ -847,6 +847,9 @@ def test_pending_queue_migrates_existing_hard_components_once() -> None:
         False, 1,
         stencil._encode_cached_placements([("dot", (0,))], family),
     )
+        False, 1,
+        stencil._encode_cached_placements([("dot", (0,))], family),
+    )
 
     store.put_result(shape_key, family, approximation)
     # Simulate a Redis instance that has the Step 3 hard index but predates
@@ -1003,7 +1006,7 @@ def test_bulk_worker_rejects_a_malformed_or_non_covering_solution() -> None:
     shape_key, _frame = stencil._component_shape_key(
         (0, 1), board_width=2, family=family,
     )
-    malformed = (True, 0, b"\\x01\\x00\\x00\\x00")
+    malformed = (True, 0, bytes((1, 0, 0, 0)))
     with pytest.raises((ValueError, RuntimeError)):
         _validate_bulk_result(shape_key, family, malformed)
 
