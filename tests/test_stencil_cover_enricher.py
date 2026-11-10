@@ -54,6 +54,64 @@ def test_candidates_include_singletons_for_every_region_point() -> None:
     assert (1, 2) in candidate_cells
 
 
+
+def test_components_use_four_connectivity_not_diagonal_connectivity() -> None:
+    components = stencil._connected_components(
+        [0, 1, 7, 8], width=3, height=3,
+    )
+    assert components == [(0, 1), (7, 8)]
+
+
+def test_component_shape_key_is_translation_normalized() -> None:
+    first, first_frame = stencil._component_shape_key((0, 1, 3, 4), board_width=3)
+    translated, translated_frame = stencil._component_shape_key(
+        (7, 8, 10, 11), board_width=3,
+    )
+    assert first == translated
+    assert first_frame == (0, 0, 2, 2)
+    assert translated_frame == (1, 2, 2, 2)
+
+
+def test_disconnected_region_is_solved_as_independent_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    family = (("1x1", ((0, 0),)),)
+    seen_components: List[tuple[int, ...]] = []
+
+    def fake_cached(
+        shape_key: bytes, time_limit_ms: int, family_key: Any,
+    ) -> tuple[bool, int, bytes]:
+        local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
+        # The cache/solver boundary must never receive a disconnected mask.
+        assert stencil._connected_components(
+            cells, local_width, local_height,
+        ) == [tuple(cells)]
+        seen_components.append(tuple(cells))
+        singleton_cover = [("1x1", (point,)) for point in cells]
+        return (
+            True,
+            0,
+            stencil._encode_cached_placements(singleton_cover, family_key),
+        )
+
+    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+    result = stencil._solve_region(
+        [0, 1, 8], width=3, height=3, family=family,
+    )
+    assert seen_components == [(0, 1), (0,)]
+    assert result["optimal"] is True
+    assert result["status"] == "optimal"
+    assert result["placements"] == [
+        {"stencil": "1x1", "points": [[0, 0]]},
+        {"stencil": "1x1", "points": [[1, 0]]},
+        {"stencil": "1x1", "points": [[2, 2]]},
+    ]
+
+
+def test_component_solver_cache_is_large_and_entry_bounded() -> None:
+    info = stencil._solve_component_cached.cache_info()
+    assert info.maxsize == 90_000
+
 def _mock_link() -> Any:
     return SimpleNamespace(
         mapping=SimpleNamespace(forward=lambda _eid: "internal-id"),

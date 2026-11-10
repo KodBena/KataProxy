@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -40,7 +41,12 @@ else:
 
 Stencil = Tuple[str, Tuple[Tuple[int, int], ...]]
 _MAX_BOARD_SIZE = 25
-_SOLVER_TIME_LIMIT_SECONDS = 0.25
+_SOLVER_TIME_LIMIT_MS = 250
+# lru_cache is entry-bounded, not byte-bounded. Results are compact binary
+# placement lists (<= about 2.5 KB even for a 25x25 all-singleton cover),
+# never candidate matrices. 90,000 entries is roughly a 256 MB-scale cache
+# including ordinary Python LRU/dict overhead; typical components are much smaller.
+_SOLVER_CACHE_MAX_ENTRIES = 90_000
 _OWNERSHIP_EPSILON = 1e-5
 _POLICY_EPSILON = 1e-3
 
@@ -244,17 +250,170 @@ def _candidate_placements(
     return [(name, cells) for cells, name in found.items()]
 
 
-def _solve_region(
+def _connected_components(
     region: Sequence[int], width: int, height: int,
+) -> List[Tuple[int, ...]]:
+    """Split a flat row-major mask into 4-connected components.
+
+    Stencil-family members are 4-connected, so no legal placement can span
+    two such components. Solving them together only multiplies the exact-cover
+    search space; every component is therefore an independent solver input.
+    """
+    area = width * height
+    remaining = {int(point) for point in region}
+    if any(point < 0 or point >= area for point in remaining):
+        raise ValueError("region contains a point outside the board")
+    components: List[Tuple[int, ...]] = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        pending = [start]
+        component = [start]
+        while pending:
+            point = pending.pop()
+            x = point % width
+            neighbours = []
+            if x > 0:
+                neighbours.append(point - 1)
+            if x + 1 < width:
+                neighbours.append(point + 1)
+            if point >= width:
+                neighbours.append(point - width)
+            if point + width < area:
+                neighbours.append(point + width)
+            for neighbour in neighbours:
+                if neighbour in remaining:
+                    remaining.remove(neighbour)
+                    pending.append(neighbour)
+                    component.append(neighbour)
+        components.append(tuple(sorted(component)))
+    return components
+
+
+def _component_shape_key(
+    component: Sequence[int], board_width: int,
+) -> Tuple[bytes, Tuple[int, int, int, int]]:
+    """Pack a translation-normalised component as (height,width,bits).
+
+    The returned frame is (board_x, board_y, local_width, local_height).
+    Only translation is normalised: this family is not guaranteed to be
+    invariant under rotation/reflection, so applying D4 would be unsound.
+    """
+    xs = [point % board_width for point in component]
+    ys = [point // board_width for point in component]
+    x0, y0 = min(xs), min(ys)
+    local_width = max(xs) - x0 + 1
+    local_height = max(ys) - y0 + 1
+    bits = bytearray((local_width * local_height + 7) // 8)
+    for point in component:
+        local = (point // board_width - y0) * local_width + (point % board_width - x0)
+        bits[local >> 3] |= 1 << (local & 7)
+    return (
+        bytes((local_height, local_width)) + bytes(bits),
+        (x0, y0, local_width, local_height),
+    )
+
+
+def _decode_component_shape_key(shape_key: bytes) -> Tuple[int, int, Tuple[int, ...]]:
+    if len(shape_key) < 2:
+        raise ValueError("component shape key is truncated")
+    height, width = shape_key[0], shape_key[1]
+    area = height * width
+    expected_bytes = (area + 7) // 8
+    if not 1 <= width <= _MAX_BOARD_SIZE or not 1 <= height <= _MAX_BOARD_SIZE:
+        raise ValueError("component shape dimensions are invalid")
+    if len(shape_key) != 2 + expected_bytes:
+        raise ValueError("component shape key has an invalid bitset length")
+    packed = shape_key[2:]
+    cells = tuple(
+        point for point in range(area)
+        if packed[point >> 3] & (1 << (point & 7))
+    )
+    return width, height, cells
+
+
+def _encode_cached_placements(
+    placements: Sequence[Tuple[str, Sequence[int]]],
     family: Sequence[Stencil],
-) -> Dict[str, Any]:
-    if not region:
-        return {
-            "placements": [], "tileCount": 0, "optimal": True, "status": "empty",
-        }
+) -> bytes:
+    """Compact binary encoding: count, then (family-index, size, cells...)."""
+    if len(placements) > 0xFFFF:
+        raise ValueError("too many placements for compact cache encoding")
+    name_to_index = {name: index for index, (name, _) in enumerate(family)}
+    encoded = bytearray(len(placements).to_bytes(2, "little"))
+    for name, points in placements:
+        if len(points) > 0xFF:
+            raise ValueError("stencil placement is too large for compact cache encoding")
+        # 255 is reserved for the guaranteed singleton fallback when a
+        # future family omits its explicit 1x1 stencil.
+        stencil_index = name_to_index.get(name, 255 if name == "1x1" else -1)
+        if not 0 <= stencil_index <= 255:
+            raise ValueError(f"unknown stencil name in solver result: {name!r}")
+        encoded.extend((stencil_index, len(points)))
+        for point in points:
+            point = int(point)
+            if not 0 <= point <= 0xFFFF:
+                raise ValueError("component point index exceeds compact cache encoding")
+            encoded.extend(point.to_bytes(2, "little"))
+    return bytes(encoded)
+
+
+def _decode_cached_placements(
+    encoded: bytes,
+    family: Sequence[Stencil],
+    frame: Tuple[int, int, int, int],
+) -> List[Dict[str, Any]]:
+    """Decode local-point placements and translate them into board coordinates."""
+    x0, y0, local_width, _local_height = frame
+    if len(encoded) < 2:
+        raise ValueError("cached stencil solution is truncated")
+    count = int.from_bytes(encoded[:2], "little")
+    offset = 2
+    placements: List[Dict[str, Any]] = []
+    for _ in range(count):
+        if offset + 2 > len(encoded):
+            raise ValueError("cached stencil placement header is truncated")
+        stencil_index, point_count = encoded[offset], encoded[offset + 1]
+        offset += 2
+        if offset + point_count * 2 > len(encoded):
+            raise ValueError("cached stencil placement points are truncated")
+        if stencil_index == 255:
+            stencil_name = "1x1"
+        elif stencil_index < len(family):
+            stencil_name = family[stencil_index][0]
+        else:
+            raise ValueError("cached stencil index is outside the active family")
+        points = []
+        for _ in range(point_count):
+            local = int.from_bytes(encoded[offset:offset + 2], "little")
+            offset += 2
+            points.append([
+                x0 + local % local_width,
+                y0 + local // local_width,
+            ])
+        placements.append({"stencil": stencil_name, "points": points})
+    if offset != len(encoded):
+        raise ValueError("cached stencil solution has trailing bytes")
+    return placements
+
+
+@lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)
+def _solve_component_cached(
+    shape_key: bytes,
+    time_limit_ms: int,
+    family: Tuple[Stencil, ...],
+) -> Tuple[bool, int, bytes]:
+    """Solve one canonical component and cache only its compact placement list.
+
+    Status codes: 0 = proven optimal, 1 = feasible incumbent, 2 = singleton
+    fallback. The time limit and family are cache-key dimensions, so changing
+    either cannot accidentally reuse a result produced under another contract.
+    """
     if highspy is None:
         raise RuntimeError("highspy is not installed")
-
+    if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
+        raise ValueError("solver time limit must be a positive number of milliseconds")
+    width, height, region = _decode_component_shape_key(shape_key)
     candidates = _candidate_placements(region, width, height, family)
     point_to_columns: Dict[int, List[int]] = {point: [] for point in region}
     for column, (_, points) in enumerate(candidates):
@@ -265,7 +424,7 @@ def _solve_region(
 
     highs = highspy.Highs()
     highs.setOptionValue("log_to_console", False)
-    highs.setOptionValue("time_limit", _SOLVER_TIME_LIMIT_SECONDS)
+    highs.setOptionValue("time_limit", time_limit_ms / 1000.0)
     variable_count = len(candidates)
     highs.addVars(
         variable_count,
@@ -289,8 +448,7 @@ def _solve_region(
         )
     highs.run()
 
-    status = highs.getModelStatus()
-    optimal = status == highspy.HighsModelStatus.kOptimal
+    optimal = highs.getModelStatus() == highspy.HighsModelStatus.kOptimal
     solution = highs.getSolution()
     values = getattr(solution, "col_value", None)
     chosen = (
@@ -309,31 +467,47 @@ def _solve_region(
     fallback = not chosen or not is_exact_cover(chosen)
     if fallback:
         singleton_columns = {
-            points[0]: i
-            for i, (_, points) in enumerate(candidates)
+            points[0]: index
+            for index, (_, points) in enumerate(candidates)
             if len(points) == 1
         }
         chosen = [singleton_columns[point] for point in region]
         optimal = False
-    elif not optimal:
-        # A time-limited incumbent is still a valid exact cover, but it is not
-        # labelled as a proven minimum.
-        pass
 
-    placements = []
-    for column in chosen:
-        name, points = candidates[column]
-        placements.append({
-            "stencil": name,
-            "points": [[point % width, point // width] for point in points],
-        })
+    selected = [candidates[column] for column in chosen]
+    encoded = _encode_cached_placements(selected, family)
+    return bool(optimal), 2 if fallback else (0 if optimal else 1), encoded
+
+
+def _solve_region(
+    region: Sequence[int], width: int, height: int,
+    family: Sequence[Stencil],
+    time_limit_ms: int = _SOLVER_TIME_LIMIT_MS,
+) -> Dict[str, Any]:
+    """Decompose first, then solve/cache each connected component independently."""
+    if not region:
+        return {
+            "placements": [], "tileCount": 0, "optimal": True, "status": "empty",
+        }
+    family_key = tuple(family)
+    placements: List[Dict[str, Any]] = []
+    statuses: List[int] = []
+    for component in _connected_components(region, width, height):
+        shape_key, frame = _component_shape_key(component, width)
+        optimal, status, encoded = _solve_component_cached(
+            shape_key, time_limit_ms, family_key,
+        )
+        placements.extend(_decode_cached_placements(encoded, family_key, frame))
+        statuses.append(status)
+    fallback = any(status == 2 for status in statuses)
+    feasible = any(status == 1 for status in statuses)
+    optimal = all(status == 0 for status in statuses)
     return {
         "placements": placements,
         "tileCount": len(placements),
-        "optimal": bool(optimal),
-        "status": "fallback" if fallback else ("optimal" if optimal else "feasible"),
+        "optimal": optimal,
+        "status": "fallback" if fallback else ("feasible" if feasible else "optimal"),
     }
-
 
 def _build_stencil_cover(
     opaque: Dict[str, Any], width: int, height: int, threshold: float,
