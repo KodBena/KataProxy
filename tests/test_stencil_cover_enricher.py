@@ -843,7 +843,10 @@ def test_pending_queue_migrates_existing_hard_components_once() -> None:
     store = storage.RedisStencilStore(backend, "queue-migration-test")
     family = (("dot", ((0, 0),)),)
     shape_key = b"pre-existing-hard-component"
-    approximation = (False, 1, b"\\x01\\x00\\x00\\x01\\x00\\x00")
+    approximation = (
+        False, 1,
+        stencil._encode_cached_placements([("dot", (0,))], family),
+    )
 
     store.put_result(shape_key, family, approximation)
     # Simulate a Redis instance that has the Step 3 hard index but predates
@@ -1016,6 +1019,43 @@ def test_local_solver_cache_invalidation_clears_request_lru() -> None:
 
     stencil._invalidate_component_cache()
     assert stencil._solve_component_cached.cache_info().currsize == 0
+
+
+def test_component_specific_invalidation_preserves_other_lru_entries() -> None:
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+    )
+    singleton_key, _ = stencil._component_shape_key(
+        (0,), board_width=1, family=family,
+    )
+    domino_key, _ = stencil._component_shape_key(
+        (0, 1), board_width=2, family=family,
+    )
+    stencil._solve_component_cached.cache_clear()
+    stencil._solve_component_cached(singleton_key, 1_000, family)
+    stencil._solve_component_cached(domino_key, 1_000, family)
+    assert stencil._solve_component_cached.cache_info().currsize == 2
+
+    stencil._invalidate_component_cache(singleton_key)
+    assert stencil._solve_component_cached.cache_info().currsize == 1
+    before_hits = stencil._solve_component_cached.cache_info().hits
+    stencil._solve_component_cached(domino_key, 1_000, family)
+    assert stencil._solve_component_cached.cache_info().hits == before_hits + 1
+    stencil._solve_component_cached.cache_clear()
+
+
+def test_cache_invalidation_dispatch_passes_the_changed_shape_key() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    namespace = "invalidation-dispatch-test"
+    seen: List[bytes] = []
+    storage._INVALIDATORS[namespace] = [seen.append]
+    try:
+        storage._dispatch_cache_invalidation(namespace, b"canonical-shape")
+    finally:
+        storage._INVALIDATORS.pop(namespace, None)
+    assert seen == [b"canonical-shape"]
 
 
 def test_redis_persistent_cache_warns_and_degrades_to_noop(
