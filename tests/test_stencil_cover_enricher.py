@@ -29,6 +29,9 @@ class _MemoryRedis:
     def hget(self, key: str, field: bytes) -> bytes | None:
         return self.hashes.get(key, {}).get(field)
 
+    def publish(self, _channel: str, _message: bytes) -> int:
+        return 1
+
     def eval(self, script: str, numkeys: int, *args: Any) -> int:
         if "SETNX" in script:
             assert numkeys == 4
