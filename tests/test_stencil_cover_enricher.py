@@ -749,6 +749,7 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     store = storage.RedisStencilStore(backend, "approximation-test")
     assert store.get_result(shape_key, family) == approximation
     assert store.hard_components(family) == frozenset({shape_key})
+    assert store.pending_components(family) == frozenset({shape_key})
 
     # Only the canonical problem key and the current best result are stored;
     # there is no serialized HiGHS model, basis, or checkpoint state.
@@ -787,6 +788,7 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
 
     assert store.put_result(shape_key, family, fallback) is True
     assert store.hard_components(family) == frozenset({shape_key})
+    assert store.pending_components(family) == frozenset({shape_key})
     assert store.put_result(shape_key, family, approximation) is True
     assert store.get_result(shape_key, family) == approximation
     assert store.put_result(shape_key, family, fallback) is False
@@ -795,6 +797,8 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
     assert store.put_result(shape_key, family, exact) is True
     assert store.get_result(shape_key, family) == exact
     assert store.hard_components(family) == frozenset()
+    assert store.pending_components(family) == frozenset()
+    assert store.timeout_metadata(shape_key, family) is None
     assert store.put_result(shape_key, family, approximation) is False
     assert store.get_result(shape_key, family) == exact
 
@@ -823,8 +827,192 @@ def test_redis_stencil_store_isolates_hard_keys_by_family() -> None:
 
     store.put_result(shape_key, first_family, approximation)
     assert store.hard_components(first_family) == frozenset({shape_key})
+    assert store.pending_components(first_family) == frozenset({shape_key})
     assert store.hard_components(second_family) == frozenset()
+    assert store.pending_components(second_family) == frozenset()
 
+
+
+def test_pending_queue_migrates_existing_hard_components_once() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "queue-migration-test")
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"pre-existing-hard-component"
+    approximation = (False, 1, b"\\x01\\x00\\x00\\x01\\x00\\x00")
+
+    store.put_result(shape_key, family, approximation)
+    # Simulate a Redis instance that has the Step 3 hard index but predates
+    # the Step 4 pending set.
+    backend.sets[store._pending_set_key(family)].clear()
+
+    assert store.initialize_pending_queue(family) == 1
+    assert store.pending_components(family) == frozenset({shape_key})
+    assert store.initialize_pending_queue(family) == 0
+
+
+def test_timeout_metadata_retires_pending_work_and_better_results_requeue() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "timeout-lifecycle-test")
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+        ("square", ((0, 0), (0, 1), (1, 0), (1, 1))),
+    )
+    shape_key = b"hard-square"
+    two_dominoes = (
+        False, 1,
+        stencil._encode_cached_placements(
+            [("domino", (0, 1)), ("domino", (2, 3))], family,
+        ),
+    )
+    one_square = (
+        False, 1,
+        stencil._encode_cached_placements([("square", (0, 1, 2, 3))], family),
+    )
+
+    assert store.put_result(shape_key, family, two_dominoes)
+    assert store.mark_timed_out(
+        shape_key, family, two_dominoes,
+        time_limit_ms=10_000, attempted_at=123.5,
+    )
+    metadata = store.timeout_metadata(shape_key, family)
+    assert metadata == {
+        "version": 1,
+        "reason": "time_limit_reached_without_proving_optimality",
+        "time_limit_ms": 10_000,
+        "status": 1,
+        "tile_count": 2,
+        "attempted_at": 123.5,
+    }
+    assert store.hard_components(family) == frozenset({shape_key})
+    assert store.pending_components(family) == frozenset()
+
+    # A later foreground improvement clears the old timeout and queues another
+    # bulk attempt, rather than leaving an improved incumbent permanently idle.
+    assert store.put_result(shape_key, family, one_square)
+    assert store.timeout_metadata(shape_key, family) is None
+    assert store.pending_components(family) == frozenset({shape_key})
+
+
+def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
+    from transformers.stencil_bulk_solver import (
+        BULK_TIME_LIMIT_MS,
+        StencilBulkSolver,
+    )
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "bulk-optimal-test")
+    family = (("domino", ((0, 0), (0, 1))),)
+    shape_key, _frame = stencil._component_shape_key(
+        (0, 1), board_width=2, family=family,
+    )
+    encoded = stencil._encode_cached_placements([("domino", (0, 1))], family)
+    approximation = (False, 1, encoded)
+    exact = (True, 0, encoded)
+    assert store.put_result(shape_key, family, approximation)
+
+    calls: List[int] = []
+
+    def solve(
+        key: bytes, time_limit_ms: int, family_key: Any,
+    ) -> tuple[bool, int, bytes]:
+        assert key == shape_key
+        assert family_key == family
+        calls.append(time_limit_ms)
+        return exact
+
+    worker = StencilBulkSolver(
+        store, family=family, solve=solve, clock=lambda: 456.0,
+    )
+    counts = worker.run_once()
+
+    assert calls == [BULK_TIME_LIMIT_MS]
+    assert counts == {
+        "attempted": 1, "optimal": 1, "timed_out": 0, "skipped": 0,
+    }
+    assert store.get_result(shape_key, family) == exact
+    assert store.hard_components(family) == frozenset()
+    assert store.pending_components(family) == frozenset()
+    assert store.timeout_metadata(shape_key, family) is None
+
+
+def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
+    from transformers.stencil_bulk_solver import (
+        BULK_TIME_LIMIT_MS,
+        StencilBulkSolver,
+    )
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "bulk-timeout-test")
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+    )
+    shape_key, _frame = stencil._component_shape_key(
+        (0, 1), board_width=2, family=family,
+    )
+    encoded = stencil._encode_cached_placements([("domino", (0, 1))], family)
+    approximation = (False, 1, encoded)
+    assert store.put_result(shape_key, family, approximation)
+
+    calls: List[int] = []
+
+    def solve(
+        _key: bytes, time_limit_ms: int, _family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(time_limit_ms)
+        return approximation
+
+    worker = StencilBulkSolver(
+        store, family=family, solve=solve, clock=lambda: 789.0,
+    )
+    first = worker.run_once()
+    second = worker.run_once()
+
+    assert calls == [BULK_TIME_LIMIT_MS]
+    assert first == {
+        "attempted": 1, "optimal": 0, "timed_out": 1, "skipped": 0,
+    }
+    assert second == {
+        "attempted": 0, "optimal": 0, "timed_out": 0, "skipped": 0,
+    }
+    metadata = store.timeout_metadata(shape_key, family)
+    assert metadata is not None
+    assert metadata["time_limit_ms"] == 10_000
+    assert metadata["attempted_at"] == 789.0
+    assert store.hard_components(family) == frozenset({shape_key})
+    assert store.pending_components(family) == frozenset()
+
+
+def test_bulk_worker_rejects_a_malformed_or_non_covering_solution() -> None:
+    from transformers.stencil_bulk_solver import _validate_bulk_result
+
+    family = (("domino", ((0, 0), (0, 1))),)
+    shape_key, _frame = stencil._component_shape_key(
+        (0, 1), board_width=2, family=family,
+    )
+    malformed = (True, 0, b"\\x01\\x00\\x00\\x00")
+    with pytest.raises((ValueError, RuntimeError)):
+        _validate_bulk_result(shape_key, family, malformed)
+
+
+def test_local_solver_cache_invalidation_clears_request_lru() -> None:
+    family = (("dot", ((0, 0),)),)
+    shape_key, _frame = stencil._component_shape_key(
+        (0,), board_width=1, family=family,
+    )
+    stencil._solve_component_cached.cache_clear()
+    stencil._solve_component_cached(shape_key, 100, family)
+    assert stencil._solve_component_cached.cache_info().currsize == 1
+
+    stencil._invalidate_component_cache()
+    assert stencil._solve_component_cached.cache_info().currsize == 0
 
 
 def test_redis_persistent_cache_warns_and_degrades_to_noop(
