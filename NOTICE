@@ -5,7 +5,8 @@ This repository contains code released under distinct licensing scopes.
 The boundaries are documented below.
 
 ------------------------------------------------------------------------
-Project root and all subdirectories EXCEPT the paths listed below and `goboard_transposition/`
+Project root and all subdirectories EXCEPT the paths listed below
+and `goboard_transposition/`
 ------------------------------------------------------------------------
 
 Released into the public domain under the Unlicense.
@@ -30,6 +31,8 @@ file-specific exception to the Unlicense scope above:
   - transformers/stencil_cache_storage.py
   - tests/test_stencil_cover_enricher.py
 
+Copyright (c) 2026 KataProxy contributors.
+
 The chain-liveness classification in
 transformers/stencil_cover_enricher.py is an independent Python
 implementation of the ownership-based heuristic in KataGo's
@@ -51,7 +54,6 @@ The MIT exception applies only to the three paths listed above. All
 other project-root files and subdirectories remain under the
 Unlicense unless another explicit exception is documented here.
 
-------------------------------------------------------------------------
 ------------------------------------------------------------------------
 The `goboard_transposition/` subdirectory
 ------------------------------------------------------------------------
