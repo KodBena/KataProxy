@@ -163,9 +163,14 @@ local should_store = true
 
 if old_raw then
     local ok, old = pcall(cjson.decode, old_raw)
-    local old_status = ok and old.version == tonumber(ARGV[4]) and tonumber(old.status) or nil
-    local old_cost = ok and old.version == tonumber(ARGV[4]) and tonumber(old.tile_count) or nil
-    if old_status ~= nil and old_cost ~= nil then
+    local old_status = nil
+    local old_cost = nil
+    if ok and type(old) == 'table' and old.version == tonumber(ARGV[4]) then
+        old_status = tonumber(old.status)
+        old_cost = tonumber(old.tile_count)
+    end
+    if old_status ~= nil and old_cost ~= nil and
+       old_status >= 0 and old_status <= 2 and old_cost >= 0 then
         if old_status == 0 and new_status == 0 and old_cost ~= new_cost then
             return -1
         end
