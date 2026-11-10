@@ -101,6 +101,7 @@ class StencilBulkSolver:
             self.store.put_result(shape_key, self.family, previous)
             return "optimal"
 
+        attempted_at = self.clock()
         result = _validate_bulk_result(
             shape_key,
             self.family,
@@ -122,7 +123,7 @@ class StencilBulkSolver:
             self.family,
             best,
             time_limit_ms=BULK_TIME_LIMIT_MS,
-            attempted_at=self.clock(),
+            attempted_at=attempted_at,
         ):
             return "timed_out"
         return "optimal" if best[0] and best[1] == 0 else "already_retired"
