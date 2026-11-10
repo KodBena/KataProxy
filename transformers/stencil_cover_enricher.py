@@ -20,12 +20,12 @@ See NOTICE for the file-specific MIT exception and KataGo attribution.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 import re
 import threading
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import highspy
 import numpy as np
@@ -842,48 +842,143 @@ def _solve_component_uncached(
     return bool(optimal), 2 if fallback else (0 if optimal else 1), encoded
 
 
-# The request path uses a large local LRU and a Redis-backed miss handler.
-# The bulk worker calls _solve_component_uncached directly with its larger
-# budget. Pub/Sub notifications invalidate this local LRU after a worker
-# upgrades a Redis row; generation checking closes the race where an
-# in-flight request might otherwise reinsert a stale incumbent after clear().
+class _SolverCacheInfo(NamedTuple):
+    hits: int
+    misses: int
+    maxsize: int
+    currsize: int
+
+
+class _InvalidatableSolverCache:
+    """Entry-bounded LRU with efficient per-component invalidation.
+
+    The generation counters ensure that a solver call already in flight when
+    an update notification arrives cannot put its stale result back into the
+    cache after the invalidation.
+    """
+
+    def __init__(
+        self,
+        function: Any,
+        maxsize: int,
+    ) -> None:
+        self._function = function
+        self._maxsize = maxsize
+        self._cache: OrderedDict[
+            Tuple[bytes, int, Tuple[Stencil, ...]],
+            Tuple[bool, int, bytes],
+        ] = OrderedDict()
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._global_generation = 0
+        self._generations: Dict[bytes, int] = {}
+        self._inflight: Dict[bytes, int] = {}
+
+    def __call__(
+        self,
+        shape_key: bytes,
+        time_limit_ms: int,
+        family: Tuple[Stencil, ...],
+    ) -> Tuple[bool, int, bytes]:
+        cache_key = (shape_key, time_limit_ms, family)
+        while True:
+            with self._lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    self._hits += 1
+                    self._cache.move_to_end(cache_key)
+                    return cached
+                self._misses += 1
+                generation = (
+                    self._global_generation,
+                    self._generations.get(shape_key, 0),
+                )
+                self._inflight[shape_key] = self._inflight.get(shape_key, 0) + 1
+
+            try:
+                result = self._function(shape_key, time_limit_ms, family)
+            except Exception:
+                with self._lock:
+                    self._leave_inflight(shape_key)
+                raise
+
+            with self._lock:
+                current_generation = (
+                    self._global_generation,
+                    self._generations.get(shape_key, 0),
+                )
+                changed_during_solve = generation != current_generation
+                self._leave_inflight(shape_key)
+                if changed_during_solve:
+                    # The cache miss may have computed against an older Redis
+                    # row. Retry through the persistent layer before caching.
+                    continue
+
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    self._cache.move_to_end(cache_key)
+                    return cached
+                self._cache[cache_key] = result
+                if len(self._cache) > self._maxsize:
+                    self._cache.popitem(last=False)
+                return result
+
+    def _leave_inflight(self, shape_key: bytes) -> None:
+        remaining = self._inflight[shape_key] - 1
+        if remaining:
+            self._inflight[shape_key] = remaining
+        else:
+            del self._inflight[shape_key]
+            self._generations.pop(shape_key, None)
+
+    def invalidate(self, shape_key: bytes | None = None) -> None:
+        with self._lock:
+            if not shape_key:
+                self._global_generation += 1
+                self._cache.clear()
+                return
+
+            for cache_key in tuple(self._cache):
+                if cache_key[0] == shape_key:
+                    del self._cache[cache_key]
+            if self._inflight.get(shape_key, 0):
+                self._generations[shape_key] = (
+                    self._generations.get(shape_key, 0) + 1
+                )
+
+    def cache_clear(self) -> None:
+        self.invalidate()
+
+    def cache_info(self) -> _SolverCacheInfo:
+        with self._lock:
+            return _SolverCacheInfo(
+                self._hits,
+                self._misses,
+                self._maxsize,
+                len(self._cache),
+            )
+
+
+# The request path uses an entry-bounded local LRU and a Redis-backed miss
+# handler. The bulk worker calls _solve_component_uncached directly with its
+# larger budget. Pub/Sub invalidates only the changed canonical component;
+# reconnect notifications clear the cache once to cover any missed messages.
 _SOLVER_CACHE_NAMESPACE = "solver-component-d4-v3"
 _solver_component_persistent = redis_persistent_cache(
     namespace=_SOLVER_CACHE_NAMESPACE,
 )(_solve_component_uncached)
-_solver_component_lru = lru_cache(maxsize=_SOLVER_CACHE_MAX_ENTRIES)(
-    _solver_component_persistent
+_solver_component_lru = _InvalidatableSolverCache(
+    _solver_component_persistent,
+    _SOLVER_CACHE_MAX_ENTRIES,
 )
-_solver_cache_lock = threading.RLock()
-_solver_cache_generation = 0
 
 
-def _invalidate_component_cache() -> None:
-    global _solver_cache_generation
-    with _solver_cache_lock:
-        _solver_cache_generation += 1
-        _solver_component_lru.cache_clear()
+def _invalidate_component_cache(shape_key: bytes = b"") -> None:
+    _solver_component_lru.invalidate(shape_key or None)
 
 
-def _solve_component_cached(
-    shape_key: bytes,
-    time_limit_ms: int,
-    family: Tuple[Stencil, ...],
-) -> Tuple[bool, int, bytes]:
-    while True:
-        with _solver_cache_lock:
-            generation = _solver_cache_generation
-        result = _solver_component_lru(shape_key, time_limit_ms, family)
-        with _solver_cache_lock:
-            if generation == _solver_cache_generation:
-                return result
-            # An invalidation raced with computation and may have happened
-            # before functools.lru_cache inserted that computation's value.
-            _solver_component_lru.cache_clear()
-
-
-_solve_component_cached.cache_info = _solver_component_lru.cache_info  # type: ignore[attr-defined]
-_solve_component_cached.cache_clear = _invalidate_component_cache  # type: ignore[attr-defined]
+_solve_component_cached = _solver_component_lru
 register_cache_invalidator(
     _SOLVER_CACHE_NAMESPACE, _invalidate_component_cache,
 )
