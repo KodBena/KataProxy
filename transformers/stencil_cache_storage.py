@@ -165,9 +165,17 @@ if old_raw then
     local ok, old = pcall(cjson.decode, old_raw)
     local old_status = nil
     local old_cost = nil
-    if ok and type(old) == 'table' and old.version == tonumber(ARGV[4]) then
+    if ok and type(old) == 'table' and
+       old.version == tonumber(ARGV[4]) and
+       type(old.optimal) == 'boolean' and
+       type(old.placements) == 'string' and
+       string.len(old.placements) > 0 then
         old_status = tonumber(old.status)
         old_cost = tonumber(old.tile_count)
+        if old.optimal ~= (old_status == 0) then
+            old_status = nil
+            old_cost = nil
+        end
     end
     if old_status ~= nil and old_cost ~= nil and
        old_status >= 0 and old_status <= 2 and old_cost >= 0 then
