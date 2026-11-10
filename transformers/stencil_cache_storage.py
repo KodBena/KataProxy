@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Optional Redis persistence for the stencil component solver cache.
 
 SPDX-License-Identifier: MIT
