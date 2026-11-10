@@ -95,10 +95,10 @@ def register_cache_invalidator(
                         client = _PERSISTENT_CLIENTS.get(namespace)
                     if client is None:
                         client = create_redis_client()
-                        with _INVALIDATOR_LOCK:
-                            _PERSISTENT_CLIENTS[namespace] = client
                     if not callable(getattr(client, "pubsub", None)):
                         return
+                    with _INVALIDATOR_LOCK:
+                        _PERSISTENT_CLIENTS[namespace] = client
                     pubsub = client.pubsub(ignore_subscribe_messages=True)
                     pubsub.subscribe(_invalidation_channel(namespace))
                     _dispatch_cache_invalidation(namespace)
