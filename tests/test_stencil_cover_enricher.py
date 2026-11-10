@@ -1065,6 +1065,57 @@ def test_cache_invalidation_dispatch_passes_the_changed_shape_key() -> None:
     assert seen == [b"canonical-shape"]
 
 
+def test_redis_persistent_cache_recovers_after_startup_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transformers.stencil_cache_storage as storage
+
+    namespace = "startup-recovery-test"
+    backend = _MemoryRedis()
+    fake_client = _FakeRedisClient(
+        backend,
+        host="127.0.0.1",
+        port=6379,
+        db=7,
+        socket_connect_timeout=0.25,
+        socket_timeout=0.25,
+        decode_responses=False,
+    )
+    monkeypatch.setattr(
+        storage,
+        "create_redis_client",
+        lambda: (_ for _ in ()).throw(ConnectionError("Redis is offline")),
+    )
+    storage._PERSISTENT_CLIENTS.pop(namespace, None)
+
+    calls: List[int] = []
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"startup-recovery"
+    result = (
+        True, 0,
+        stencil._encode_cached_placements([("dot", (0,))], family),
+    )
+
+    def solve(
+        _shape_key: bytes,
+        time_limit_ms: int,
+        _family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(time_limit_ms)
+        return result
+
+    wrapped = storage.redis_persistent_cache(namespace)(solve)
+    assert wrapped(shape_key, 250, family) == result
+    assert calls == [250]
+
+    # The reconnecting invalidation listener publishes its client into this
+    # registry; a later LRU miss can adopt it without restarting the proxy.
+    storage._PERSISTENT_CLIENTS[namespace] = fake_client
+    assert wrapped(shape_key, 10_000, family) == result
+    assert wrapped(shape_key, 20_000, family) == result
+    assert calls == [250, 10_000]
+
+
 def test_redis_persistent_cache_warns_and_degrades_to_noop(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
