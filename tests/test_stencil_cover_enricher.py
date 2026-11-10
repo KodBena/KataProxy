@@ -47,6 +47,12 @@ def test_threshold_one_keeps_only_fully_owned_empty_points() -> None:
     assert negative == [2]
 
 
+def test_coordinate_parser_handles_numeric_and_rectangular_coordinates() -> None:
+    assert stencil._coordinate_index("(2, 0)", 3, 2, allow_pass=False) == 2
+    assert stencil._coordinate_index("C2", 3, 2, allow_pass=False) == 2
+    assert stencil._coordinate_index("A1", 3, 2, allow_pass=False) == 3
+
+
 def test_dead_chains_join_opponent_territory_and_living_stones_are_excluded() -> None:
     # The black chain at 0-1 and white chain at 3-4 fail KataGo's chain-level
     # liveness heuristic. The black stone at 6 is alive and stays out.
