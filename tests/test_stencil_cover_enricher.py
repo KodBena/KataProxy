@@ -1100,6 +1100,47 @@ def test_component_specific_invalidation_preserves_other_lru_entries() -> None:
     stencil._solve_component_cached.cache_clear()
 
 
+def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None:
+    import threading
+
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"component-under-solve"
+    stale = (False, 2, b"stale")
+    improved = (False, 1, b"improved")
+    started = threading.Event()
+    release = threading.Event()
+    calls: List[int] = []
+
+    def solve(
+        _shape: bytes,
+        _time_limit_ms: int,
+        _family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(1)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(timeout=3.0)
+            return stale
+        return improved
+
+    cache = stencil._InvalidatableSolverCache(solve, maxsize=4)
+    results: List[tuple[bool, int, bytes]] = []
+    thread = threading.Thread(
+        target=lambda: results.append(cache(shape_key, 250, family)),
+    )
+    thread.start()
+    assert started.wait(timeout=3.0)
+    cache.invalidate(shape_key)
+    release.set()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert results == [improved]
+    assert calls == [1, 1]
+    assert cache(shape_key, 250, family) == improved
+    assert calls == [1, 1]
+
+
 def test_cache_invalidation_dispatch_passes_the_changed_shape_key() -> None:
     import transformers.stencil_cache_storage as storage
 
