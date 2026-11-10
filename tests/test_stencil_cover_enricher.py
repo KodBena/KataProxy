@@ -911,6 +911,42 @@ def test_timeout_metadata_retires_pending_work_and_better_results_requeue() -> N
     assert store.pending_components(family) == frozenset({shape_key})
 
 
+def test_timeout_metadata_uses_result_current_at_atomic_retirement() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "timeout-race-test")
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+        ("square", ((0, 0), (0, 1), (1, 0), (1, 1))),
+    )
+    shape_key = b"race-component"
+    stale = (
+        False, 1,
+        stencil._encode_cached_placements(
+            [("domino", (0, 1)), ("domino", (2, 3))], family,
+        ),
+    )
+    improved = (
+        False, 1,
+        stencil._encode_cached_placements(
+            [("square", (0, 1, 2, 3))], family,
+        ),
+    )
+
+    assert store.put_result(shape_key, family, stale)
+    assert store.put_result(shape_key, family, improved)
+    assert store.mark_timed_out(
+        shape_key, family, stale,
+        time_limit_ms=10_000, attempted_at=321.0,
+    )
+    metadata = store.timeout_metadata(shape_key, family)
+    assert metadata is not None
+    assert metadata["tile_count"] == 1
+    assert metadata["status"] == 1
+
+
 def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
     from transformers.stencil_bulk_solver import (
         BULK_TIME_LIMIT_MS,
