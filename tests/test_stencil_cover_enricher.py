@@ -643,18 +643,18 @@ def test_redis_persistent_cache_round_trips_best_result_across_budgets(
         family: Any,
     ) -> tuple[bool, int, bytes]:
         calls.append(time_limit_ms)
-        return True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00"
+        return True, 0, b"\x01\x00\x00\x01\x00\x00"
 
     first_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
     second_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
     family = (("dot", ((0, 0),)),)
 
     assert first_wrapper(b"canonical-shape", 250, family) == (
-        True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00",
+        True, 0, b"\x01\x00\x00\x01\x00\x00",
     )
     # Budget is intentionally not part of the persistent problem key.
     assert second_wrapper(b"canonical-shape", 10_000, family) == (
-        True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00",
+        True, 0, b"\x01\x00\x00\x01\x00\x00",
     )
     assert calls == [250]
 
@@ -673,7 +673,7 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
         ),
     )
     calls: List[int] = []
-    approximation = (False, 1, b"\\x02\\x00\\x00\\x01\\x01\\x01\\x00")
+    approximation = (False, 1, b"\x02\x00\x00\x01\x01\x01\x00")
 
     def solve(
         shape_key: bytes,
@@ -714,9 +714,9 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
     store = storage.RedisStencilStore(backend, "upgrade-test")
     family = (("dot", ((0, 0),)),)
     shape_key = b"canonical-component"
-    fallback = (False, 2, b"\\x03\\x00\\x00\\x01\\x01\\x02\\x00\\x03\\x00")
-    approximation = (False, 1, b"\\x02\\x00\\x00\\x01\\x01\\x01\\x00")
-    exact = (True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00")
+    fallback = (False, 2, b"\x03\x00\x00\x01\x01\x02\x00\x03\x00")
+    approximation = (False, 1, b"\x02\x00\x00\x01\x01\x01\x00")
+    exact = (True, 0, b"\x01\x00\x00\x01\x00\x00")
 
     assert store.put_result(shape_key, family, fallback) is True
     assert store.hard_components(family) == frozenset({shape_key})
@@ -733,7 +733,7 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
 
     contradictory_exact = (
         True, 0,
-        b"\\x02\\x00\\x00\\x01\\x01\\x01\\x00\\x01\\x01\\x00",
+        b"\x02\x00\x00\x01\x01\x01\x00\x01\x01\x00",
     )
     with pytest.raises(storage.RedisCacheConflict):
         store.put_result(shape_key, family, contradictory_exact)
@@ -750,7 +750,7 @@ def test_redis_stencil_store_isolates_hard_keys_by_family() -> None:
         ("domino", ((0, 0), (0, 1))),
     )
     shape_key = b"same-component"
-    approximation = (False, 1, b"\\x01\\x00\\x00\\x01\\x00\\x00")
+    approximation = (False, 1, b"\x01\x00\x00\x01\x00\x00")
 
     store.put_result(shape_key, first_family, approximation)
     assert store.hard_components(first_family) == frozenset({shape_key})
