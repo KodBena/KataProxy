@@ -680,4 +680,5 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
             except Exception as exc:
                 disable_after_error(exc)
             return result
+        return cast(F, wrapped)
     return decorate
