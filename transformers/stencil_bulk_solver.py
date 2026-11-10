@@ -45,7 +45,12 @@ def _validate_bulk_result(
     if not isinstance(result, tuple) or len(result) != 3:
         raise TypeError("bulk solver must return a 3-tuple")
     optimal, status, encoded = result
-    if not isinstance(optimal, bool) or status not in (0, 1, 2):
+    if (
+        not isinstance(optimal, bool)
+        or isinstance(status, bool)
+        or not isinstance(status, int)
+        or status not in (0, 1, 2)
+    ):
         raise ValueError("bulk solver returned an invalid optimal flag or status")
     if optimal != (status == 0) or not isinstance(encoded, bytes):
         raise ValueError("bulk solver result status and payload disagree")
