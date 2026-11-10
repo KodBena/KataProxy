@@ -946,6 +946,18 @@ def test_timeout_metadata_uses_result_current_at_atomic_retirement() -> None:
     assert metadata["tile_count"] == 1
     assert metadata["status"] == 1
 
+    # If an exact foreground result wins the race instead, the atomic
+    # retirement check must leave the component out of both hard indexes.
+    exact = (True, 0, improved[2])
+    assert store.put_result(shape_key, family, exact)
+    assert not store.mark_timed_out(
+        shape_key, family, stale,
+        time_limit_ms=10_000, attempted_at=322.0,
+    )
+    assert store.timeout_metadata(shape_key, family) is None
+    assert store.pending_components(family) == frozenset()
+    assert store.hard_components(family) == frozenset()
+
 
 def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
     from transformers.stencil_bulk_solver import (
