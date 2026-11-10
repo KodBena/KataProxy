@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -10,6 +11,77 @@ import pytest
 import transformers.stencil_cover_enricher as stencil
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery
 from AbstractProxy.proxy_core import ClientId
+
+
+class _MemoryRedis:
+    def __init__(self) -> None:
+        self.values: Dict[str, bytes] = {}
+        self.sets: Dict[str, set[bytes]] = {}
+
+    def get(self, key: str) -> bytes | None:
+        return self.values.get(key)
+
+    def smembers(self, key: str) -> set[bytes]:
+        return set(self.sets.get(key, set()))
+
+    def eval(
+        self,
+        _script: str,
+        numkeys: int,
+        result_key: str,
+        hard_key: str,
+        payload: bytes,
+        status: str,
+        tile_count: str,
+        _schema_version: str,
+        shape_key: bytes,
+    ) -> int:
+        assert numkeys == 2
+        new_status = int(status)
+        new_cost = int(tile_count)
+        should_store = True
+        old_raw = self.values.get(result_key)
+        if old_raw is not None:
+            old = json.loads(old_raw.decode("utf-8"))
+            old_status = int(old["status"])
+            old_cost = int(old["tile_count"])
+            if old_status == 0 and new_status == 0 and old_cost != new_cost:
+                return -1
+            if new_status > old_status or (
+                new_status == old_status and new_cost >= old_cost
+            ):
+                should_store = False
+
+        if should_store:
+            self.values[result_key] = payload
+        final = json.loads(self.values[result_key].decode("utf-8"))
+        members = self.sets.setdefault(hard_key, set())
+        if int(final["status"]) == 0:
+            members.discard(shape_key)
+        else:
+            members.add(shape_key)
+        return int(should_store)
+
+
+class _FakeRedisClient:
+    def __init__(self, backend: _MemoryRedis, **kwargs: Any) -> None:
+        assert kwargs["host"] == "127.0.0.1"
+        assert kwargs["port"] == 6379
+        assert kwargs["db"] == 7
+        self.backend = backend
+
+    def ping(self) -> bool:
+        return True
+
+    def get(self, key: str) -> bytes | None:
+        return self.backend.get(key)
+
+    def smembers(self, key: str) -> set[bytes]:
+        return self.backend.smembers(key)
+
+    def eval(self, *args: Any) -> int:
+        return self.backend.eval(*args)
+
 
 
 def test_family_parser_loads_proxy_owned_rectangles() -> None:
@@ -550,30 +622,19 @@ def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None
     ]
 
 
-def test_redis_persistent_cache_round_trips_between_wrappers(
+def test_redis_persistent_cache_round_trips_best_result_across_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import transformers.stencil_cache_storage as storage
 
-    persisted: Dict[str, bytes] = {}
-
-    class FakeRedis:
-        def __init__(self, **kwargs: Any) -> None:
-            assert kwargs["host"] == "127.0.0.1"
-            assert kwargs["port"] == 6379
-            assert kwargs["db"] == 7
-
-        def ping(self) -> bool:
-            return True
-
-        def get(self, key: str) -> bytes | None:
-            return persisted.get(key)
-
-        def set(self, key: str, value: bytes) -> bool:
-            persisted[key] = value
-            return True
-
-    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(Redis=FakeRedis))
+    backend = _MemoryRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(
+            Redis=lambda **kwargs: _FakeRedisClient(backend, **kwargs),
+        ),
+    )
     calls: List[int] = []
 
     def solve(
@@ -581,16 +642,111 @@ def test_redis_persistent_cache_round_trips_between_wrappers(
         time_limit_ms: int,
         family: Any,
     ) -> tuple[bool, int, bytes]:
-        calls.append(1)
-        return True, 0, b"optimal-solution"
+        calls.append(time_limit_ms)
+        return True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00"
 
     first_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
     second_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
-    args = (b"canonical-shape", 250, (("dot", ((0, 0),)),))
+    family = (("dot", ((0, 0),)),)
 
-    assert first_wrapper(*args) == (True, 0, b"optimal-solution")
-    assert second_wrapper(*args) == (True, 0, b"optimal-solution")
-    assert calls == [1]
+    assert first_wrapper(b"canonical-shape", 250, family) == (
+        True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00",
+    )
+    # Budget is intentionally not part of the persistent problem key.
+    assert second_wrapper(b"canonical-shape", 10_000, family) == (
+        True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00",
+    )
+    assert calls == [250]
+
+
+def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(
+            Redis=lambda **kwargs: _FakeRedisClient(backend, **kwargs),
+        ),
+    )
+    calls: List[int] = []
+    approximation = (False, 1, b"\\x02\\x00\\x00\\x01\\x01\\x01\\x00")
+
+    def solve(
+        shape_key: bytes,
+        time_limit_ms: int,
+        family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(time_limit_ms)
+        return approximation
+
+    wrapped = storage.redis_persistent_cache("approximation-test")(solve)
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"canonical-hard-shape"
+
+    assert wrapped(shape_key, 250, family) == approximation
+    # The approximate cover is a useful cached answer, even under a later
+    # request with a different budget; it is not thrown away.
+    assert wrapped(shape_key, 10_000, family) == approximation
+    assert calls == [250]
+
+    store = storage.RedisStencilStore(backend, "approximation-test")
+    assert store.get_result(shape_key, family) == approximation
+    assert store.hard_components(family) == frozenset({shape_key})
+
+
+def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "upgrade-test")
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"canonical-component"
+    fallback = (False, 2, b"\\x03\\x00\\x00\\x01\\x01\\x02\\x00\\x03\\x00")
+    approximation = (False, 1, b"\\x02\\x00\\x00\\x01\\x01\\x01\\x00")
+    exact = (True, 0, b"\\x01\\x00\\x00\\x01\\x00\\x00")
+
+    assert store.put_result(shape_key, family, fallback) is True
+    assert store.hard_components(family) == frozenset({shape_key})
+    assert store.put_result(shape_key, family, approximation) is True
+    assert store.get_result(shape_key, family) == approximation
+    assert store.put_result(shape_key, family, fallback) is False
+    assert store.get_result(shape_key, family) == approximation
+
+    assert store.put_result(shape_key, family, exact) is True
+    assert store.get_result(shape_key, family) == exact
+    assert store.hard_components(family) == frozenset()
+    assert store.put_result(shape_key, family, approximation) is False
+    assert store.get_result(shape_key, family) == exact
+
+    contradictory_exact = (
+        True, 0,
+        b"\\x02\\x00\\x00\\x01\\x01\\x01\\x00\\x01\\x01\\x00",
+    )
+    with pytest.raises(storage.RedisCacheConflict):
+        store.put_result(shape_key, family, contradictory_exact)
+
+
+def test_redis_stencil_store_isolates_hard_keys_by_family() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "family-isolation-test")
+    first_family = (("dot", ((0, 0),)),)
+    second_family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+    )
+    shape_key = b"same-component"
+    approximation = (False, 1, b"\\x01\\x00\\x00\\x01\\x00\\x00")
+
+    store.put_result(shape_key, first_family, approximation)
+    assert store.hard_components(first_family) == frozenset({shape_key})
+    assert store.hard_components(second_family) == frozenset()
+
 
 
 def test_redis_persistent_cache_warns_and_degrades_to_noop(
