@@ -1155,6 +1155,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
             try:
                 updated = store.put_result(
                     shape_key, family, result, provenance=provenance,
+                    work_profile=bound.arguments.get("work_profile"),
                 )
                 if not updated:
                     # A concurrent worker or request may already have stored a

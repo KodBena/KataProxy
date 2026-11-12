@@ -1179,12 +1179,13 @@ def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
     assert second == {
         "attempted": 0, "optimal": 0, "timed_out": 0, "skipped": 0,
     }
-    metadata = store.timeout_metadata(shape_key, family)
+    metadata = store.timeout_metadata(shape_key, family, worker.work_profile)
     assert metadata is not None
     assert metadata["time_limit_ms"] == 10_000
     assert metadata["attempted_at"] == 789.0
+    assert metadata["work_profile_fingerprint"] == worker.work_profile.fingerprint
     assert store.hard_components(family) == frozenset({shape_key})
-    assert store.pending_components(family) == frozenset()
+    assert store.pending_components(family, worker.work_profile) == frozenset()
 
 
 def test_bulk_worker_rejects_a_malformed_or_non_covering_solution() -> None:

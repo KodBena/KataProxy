@@ -417,6 +417,48 @@ A reviewer can use these invariants when changing this subsystem:
    lease races; the Redis result arbitration alone is not a work-claim system.
 
 
+## Solver-profile-scoped work queues (Phase 4 follow-up)
+
+The v4 best-result row remains global to the canonical component and stencil
+family. Solver work scheduling is separate and is keyed by a versioned
+SolverWorkProfile fingerprint. The profile document includes the complete
+solver identity (backend name/version, adapter version, canonical configuration
+and its fingerprint) plus the complete budget policy: wall-time milliseconds,
+native-effort limit value and unit (or an explicit not-requested reason), and
+the named policy ID. The SHA-256 of canonical compact JSON is the profile key.
+
+For each family, Redis stores a profile registry hash and separate
+pending:<profile-fingerprint> sets, timeouts:<profile-fingerprint> hashes,
+and one-time initialization markers. The global hard-component set and global
+best-result key are not duplicated per profile.
+
+Queue rules are:
+
+- Registering a new profile seeds its pending set from the complete global
+  hard-component set. It does not consult timeout metadata from any other
+  profile, nor legacy unscoped timeout state.
+- The first non-optimal result for a newly discovered instance enqueues it in
+  every profile already registered for the family.
+- A later strictly better non-optimal result re-enqueues only the profile
+  that produced that result and clears only that profile's timeout record.
+  Other profiles' pending/retired state is left unchanged. This avoids one
+  solver repeatedly reopening another solver's retired work.
+- A proven optimum removes the component from the global hard index and every
+  registered profile's pending set and timeout hash.
+- Timeout retirement atomically checks that the component is still hard and
+  pending for the exact profile. The timeout record embeds the profile
+  document and fingerprint, as well as the wall-time limit and attempt time.
+- Result arbitration remains global and preserves the winning attempt's
+  provenance. The profile affects scheduling only, never the result key.
+
+The v3-to-v4 migration continues copying the legacy hard index but deliberately
+ignores unscoped v3 timeout metadata. Existing v4 global pending/timeout keys
+are also not treated as profile state. Each profile gets a fresh initialization
+marker and is seeded from the current hard set, so an old global timeout cannot
+suppress a new solver/configuration/budget profile. Legacy unprofiled internal
+callers are mapped to a reserved legacy_unknown work profile; foreground and
+bulk production paths pass explicit profiles.
+
 ## Result provenance cutover (Phase 4)
 
 The active persistent result namespace is now
