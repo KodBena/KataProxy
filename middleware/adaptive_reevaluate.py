@@ -90,6 +90,8 @@ from typing import (
 
 import numpy as np
 
+from middleware.adaptive_errors import AdaptiveConfigurationError
+from middleware.learned_value_fn import get_registry
 from katago import (
     AnalyzeResponse,
     Color,
@@ -115,6 +117,7 @@ from middleware.visit_scaling import (
     VisitScalingModel,
     _parse_visit_scaling_model,
     _registered_model_names,
+    MonteCarloSqrtModel,
 )
 from proxy_logging import Event, get_proxy_logger
 from registry_interpreter import RegistryInterpreter
@@ -123,46 +126,6 @@ logger = logging.getLogger("kataproxy." + __name__)
 _log = get_proxy_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Configuration-consistency error class (v1.0.23)
-# ---------------------------------------------------------------------------
-#
-# Hard-refusal at the adaptive dispatch site per the cost-asymmetry
-# calibration in docs/roadmap-adaptive-selector-pluggability.md §11.4:
-# executing an expensive range-based query with conflated intent is
-# more harmful than refusing clearly. The orchestration framework's
-# exception handler synthesises a structured error response when the
-# coroutine raises (see middleware/orchestration.py); the operator's
-# log carries the full `code` + `detail` context via the exception's
-# string representation.
-
-class AdaptiveConfigurationError(RuntimeError):
-    """Raised when adaptive_reevaluate's per-query configuration is
-    inconsistent.
-
-    See docs/roadmap-adaptive-selector-pluggability.md §11.4 for the
-    cost-asymmetry principle. The `code` values across v1.0.23-v1.0.25:
-
-      v1.0.23 (selector pluggability):
-        - `ambiguous_axis`
-        - `axis_binding_mismatch`
-        - `policy_axis_mismatch`
-        - `policy_parameters_invalid`
-
-      v1.0.24 (multi-round + budget):
-        - `budget_invalid`
-
-      v1.0.25 (info-theoretic allocation):
-        - `allocation_invalid`
-    """
-
-    def __init__(self, *, code: str, detail: dict[str, Any]) -> None:
-        super().__init__(f"adaptive_reevaluate: {code} {detail}")
-        self.code = code
-        self.detail = detail
-
-
-# ---------------------------------------------------------------------------
 # Selector substrate — views and selection policies (v1.0.23 commit 1)
 #
 # The views (MoveView, TurnView) are the per-unit objects passed to
@@ -1701,7 +1664,6 @@ def _engage_phase3(
     # capability advertisement names available versions in
     # query_version's adaptive_reevaluate.available_value_bindings.
     if value_binding.startswith("learned_"):
-        from middleware.learned_value_fn import get_registry  # noqa: PLC0415
         registry = get_registry()
         predictor = registry.get(value_binding)
         if predictor is None:
@@ -1736,7 +1698,6 @@ def _engage_phase3(
         # visit_scaling_model is optional under learned_piecewise;
         # accept whatever's there (or absent) for backward compat,
         # but the allocator ignores it.
-        from middleware.visit_scaling import MonteCarloSqrtModel  # noqa: PLC0415
         return algo, MonteCarloSqrtModel(), predictor
 
     # Hand-crafted single-VF path (unchanged from v1.0.25).

@@ -40,6 +40,8 @@ import math
 import random
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
+from middleware.adaptive_errors import AdaptiveConfigurationError
+
 if TYPE_CHECKING:
     from katago import TurnIndex
     from middleware.adaptive_reevaluate import TurnView
@@ -560,9 +562,6 @@ def _parse_allocation_algorithm(cap_meta: dict[str, Any]) -> AllocationAlgorithm
     parameter errors could burn a multi-round allocation arc on the
     wrong shape.
     """
-    # Local import to avoid the module-load cycle with adaptive_reevaluate.
-    from middleware.adaptive_reevaluate import AdaptiveConfigurationError
-
     name = cap_meta.get("allocation_algorithm")
     if not isinstance(name, str) or name not in _REGISTERED_ALGORITHM_NAMES:
         raise AdaptiveConfigurationError(

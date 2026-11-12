@@ -47,11 +47,15 @@ import json
 import math
 import statistics
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+
+import numpy as np
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from katago import AnalyzeResponse, TurnIndex
-from middleware.adaptive_reevaluate import TurnView
 from proxy_logging import Event, get_proxy_logger
+
+if TYPE_CHECKING:
+    from middleware.adaptive_reevaluate import TurnView
 
 _log = get_proxy_logger(__name__)
 
@@ -387,7 +391,6 @@ class LearnedValueFn:
             opaque = turn_view.packet.opaque if isinstance(turn_view.packet, AnalyzeResponse) else {}
             self._per_turn_features[t] = _per_turn_features(opaque, turn_view.to_play)
         vec = self._build_feature_vector(t)
-        import numpy as np
         prediction = float(self._model_full.predict(np.array([vec], dtype=np.float64))[0])
         self._cache_full[t] = prediction
         return prediction
@@ -403,7 +406,6 @@ class LearnedValueFn:
             opaque = turn_view.packet.opaque if isinstance(turn_view.packet, AnalyzeResponse) else {}
             self._per_turn_features[t] = _per_turn_features(opaque, turn_view.to_play)
         vec = self._build_feature_vector(t)
-        import numpy as np
         prediction = float(self._model_int.predict(np.array([vec], dtype=np.float64))[0])
         self._cache_int[t] = prediction
         return prediction

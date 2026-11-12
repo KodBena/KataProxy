@@ -38,6 +38,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from middleware.adaptive_errors import AdaptiveConfigurationError
+
 if TYPE_CHECKING:
     # The view types live in adaptive_reevaluate; importing them at
     # type-check time only avoids the module-load cycle (adaptive_
@@ -181,9 +183,6 @@ def _parse_visit_scaling_model(name: str) -> VisitScalingModel:
     applies: silent fallback to a default model could burn many rounds
     of compute on a wrong-shape gain estimate. Hard-refuse.
     """
-    # Local import to avoid the module-load cycle with adaptive_reevaluate.
-    from middleware.adaptive_reevaluate import AdaptiveConfigurationError
-
     model = _VISIT_SCALING_MODELS.get(name)
     if model is None:
         raise AdaptiveConfigurationError(
