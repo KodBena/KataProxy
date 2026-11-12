@@ -813,6 +813,67 @@ def test_redis_persistent_cache_round_trips_best_result_across_budgets(
     assert calls == [250]
 
 
+def test_foreground_persistent_write_registers_selected_work_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import (
+        NoNativeEffortLimit, SolverBudget, SolverIdentity,
+    )
+
+    backend = _MemoryRedis()
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(
+            Redis=lambda **kwargs: _FakeRedisClient(backend, **kwargs),
+        ),
+    )
+    family = (("dot", ((0, 0),)),)
+    configuration = '{"strategy":"foreground-profile-test"}'
+    identity = SolverIdentity(
+        backend_name="fake",
+        backend_version="1",
+        adapter_version="adapter-v1",
+        configuration_json=configuration,
+        configuration_fingerprint=hashlib.sha256(configuration.encode("utf-8")).hexdigest(),
+    )
+    budget = SolverBudget(
+        wall_time_limit_ms=250,
+        native_effort_limit=NoNativeEffortLimit(),
+        policy_id="foreground-250ms",
+    )
+    profile = storage.make_solver_work_profile(identity, budget)
+    encoded = stencil._encode_cached_placements([("dot", (0,))], family)
+    calls: list[bytes] = []
+
+    def solve(
+        shape_key: bytes,
+        time_limit_ms: int,
+        selected_family: Any,
+        selected_backend: Any,
+        work_profile: storage.SolverWorkProfile,
+    ) -> tuple[bool, int, bytes]:
+        assert time_limit_ms == 250
+        assert selected_family == family
+        assert selected_backend is None
+        assert work_profile == profile
+        calls.append(shape_key)
+        return True, 0, encoded
+
+    wrapped = storage.redis_persistent_cache("foreground-profile-test")(solve)
+    shape_key = b"foreground-profile-shape"
+    assert wrapped(shape_key, 250, family, None, profile) == (True, 0, encoded)
+    assert calls == [shape_key]
+
+    store = storage.RedisStencilStore(backend, "foreground-profile-test")
+    registered = backend.hget(
+        store._profile_registry_key(family), profile.fingerprint,
+    )
+    assert registered is not None
+    assert json.loads(registered.decode("utf-8")) == profile.document
+
+
 def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

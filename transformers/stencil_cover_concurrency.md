@@ -151,8 +151,9 @@ but a result from a different stencil family cannot be mixed in.
 The Redis result identity intentionally excludes the solver time budget.
 There is one best-known result for a canonical shape and family, regardless of
 whether it was found by a 250 ms foreground solve or a 10-second background
-solve. The process-local LRU does include the time budget in its key, because
-it caches the request call's result for that call signature.
+solve. The process-local LRU includes the solver work-profile fingerprint (and the
+wall-time request dimension) in its key, because cached request results may
+differ by backend/configuration/budget profile.
 
 A stored best-result row contains:
 
@@ -185,30 +186,32 @@ silently accepting the contradiction.
 
 ## Redis indexes and their lifecycle
 
-The indexes are partitioned by cache namespace and full stencil-family
-fingerprint:
+The global hard index is partitioned by cache namespace and full stencil-family
+fingerprint. Work scheduling is partitioned further by a registered
+SolverWorkProfile:
 
-- **Hard set:** every component whose best stored row is not proven optimal.
-- **Pending set:** hard components not yet retired after a bulk attempt.
-- **Timeout hash:** metadata for a hard component that has already had its
-  bulk attempt and was not proven optimal.
-- **Pending-initialized marker:** a one-time migration marker for the pending
-  set.
+- **Hard set:** every component whose global best row is not proven optimal.
+- **Profile registry:** a hash of canonical work-profile documents keyed by
+  profile fingerprint.
+- **Profile pending set:** hard components not yet retired for that exact
+  backend/configuration/budget profile.
+- **Profile timeout hash:** retirement metadata for that exact profile.
+- **Profile initialization marker:** records that this profile has been seeded
+  from the current global hard index.
 
-When a foreground solve first stores a non-optimal result, the same Redis Lua
-operation writes the result, adds the canonical shape key to the hard set, and
-adds it to the pending set. A proven-optimal result removes the key from the
-hard and pending sets and removes any timeout metadata.
+The first valid non-optimal result for a previously unseen instance enqueues
+it into every registered profile. A newly registered profile seeds itself from
+the full hard set, irrespective of another profile's timeout state. A later
+strictly better non-optimal result requeues only the profile that produced that
+improvement and clears only that profile's timeout. An optimal result removes
+the instance from the hard set and every registered profile's pending and
+timeout indexes. An equal or worse result does not reopen work.
 
-At worker startup, a one-time atomic migration seeds the pending set from the
-pre-existing hard set, excluding entries that already have timeout metadata.
-This preserves non-optimal entries written by the earlier result-cache
-version. The marker prevents a full hard-set scan on every poll.
-
-A strictly better non-optimal result re-adds the key to the pending set and
-clears its previous timeout metadata. An equal or worse result does not
-restart work. A proven-optimal result removes the key from all three work
-indexes.
+The old v3 hard set is copied into the v4 global hard set once, but the v3
+global timeout hash is not read: it has no solver-profile identity. The same
+rule applies to the abandoned unprofiled v4 pending/timeout keys from the
+intermediate provenance-only schema. Each profile is independently seeded
+from the hard set.
 
 ## Foreground request path
 
@@ -263,7 +266,8 @@ nice 19 where the operating system supports it.
 
 For each pending key in the snapshot, the worker:
 
-1. Checks for timeout metadata and skips an already retired item.
+1. Checks timeout metadata for the worker's exact solver work profile and
+   skips an already retired item.
 2. Loads the current best result. A pending key without a result is treated as
    an inconsistent queue entry and is logged; it is not guessed or solved
    without the stored problem/result contract.
@@ -278,14 +282,15 @@ For each pending key in the snapshot, the worker:
    assume its own candidate won a concurrent write.
 6. If the best row is proven optimal, it is complete and is removed from the
    hard and pending indexes by the result-write script.
-7. Otherwise, it retires the pending attempt. The timeout Lua script checks
-   that the key is still both hard and pending and reads the current result
-   row inside the same atomic operation. It writes timeout metadata from that
-   current row and removes the key from pending, while retaining it in hard.
+7. Otherwise, it retires the pending attempt for this profile only. The timeout
+   Lua script checks that the key is still hard and pending in this profile,
+   reads the current global result row atomically, writes the profile document
+   and current result metadata, and removes the key from this profile's pending
+   set while retaining it in the global hard index.
 
-The timeout record stores its schema version, configured backend wall-clock limit,
-attempt start time, and the status/tile count from the row that was current at
-retirement. It describes an attempt that did not prove optimality under the
+The timeout record stores its schema version, complete work-profile document
+and fingerprint, configured backend wall-clock limit, attempt start time, and
+the status/tile count from the row that was current at retirement. It describes an attempt that did not prove optimality under the
 configured limit; it is not a saved solver state.
 
 The selected backend must enforce the supplied wall-clock budget. The default

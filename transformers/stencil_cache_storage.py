@@ -684,11 +684,17 @@ if redis.call('SETNX', KEYS[1], ARGV[1]) == 0 then
     return 0
 end
 local value = cjson.decode(ARGV[1])
+local family_prefix = ARGV[3]
 if tonumber(value.status) ~= 0 then
     redis.call('SADD', KEYS[2], ARGV[2])
-    local family_prefix = ARGV[3]
     for _, profile_id in ipairs(redis.call('HKEYS', KEYS[3])) do
         redis.call('SADD', family_prefix .. ':pending:' .. profile_id, ARGV[2])
+        redis.call('HDEL', family_prefix .. ':timeouts:' .. profile_id, ARGV[2])
+    end
+else
+    redis.call('SREM', KEYS[2], ARGV[2])
+    for _, profile_id in ipairs(redis.call('HKEYS', KEYS[3])) do
+        redis.call('SREM', family_prefix .. ':pending:' .. profile_id, ARGV[2])
         redis.call('HDEL', family_prefix .. ':timeouts:' .. profile_id, ARGV[2])
     end
 end
