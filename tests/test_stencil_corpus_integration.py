@@ -452,9 +452,11 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis_client.delete(CORPUS_STREAM_KEY)
-    database = tmp_path / "production-startup.sqlite3"
+    state_home = tmp_path / "xdg-state"
+    database = state_home / "kataproxy" / "stencil-cover-corpus.sqlite3"
     monkeypatch.delenv("KATAPROXY_STENCIL_CORPUS_ENABLED", raising=False)
-    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_DB", str(database))
+    monkeypatch.delenv("KATAPROXY_STENCIL_CORPUS_DB", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
     monkeypatch.setattr(corpus_publisher, "_DEFAULT_PUBLISHER", None)
     monkeypatch.setitem(
         stencil_cache_storage._PERSISTENT_CLIENTS,
@@ -463,8 +465,11 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
     )
     stencil._invalidate_component_cache()
     assert corpus_publisher.corpus_events_enabled() is True
+    assert corpus_publisher.default_corpus_database_path() == database
+    assert "KATAPROXY_STENCIL_CORPUS_DB" not in os.environ
+    assert "KATAPROXY_STENCIL_CORPUS_ENABLED" not in os.environ
 
-    supervisors: list[StencilCorpusMaterializerSupervisor] = []
+    supervisors: list[StencilCorpusMaterializerSupervisor] =
     class _TrackingSupervisor(StencilCorpusMaterializerSupervisor):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
