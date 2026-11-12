@@ -699,7 +699,7 @@ else
     end
 end
 return 1
-""
+"""
 
 _MARK_TIMED_OUT_SCRIPT = """
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
