@@ -27,6 +27,8 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import asyncio
+
 import sys
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -100,7 +102,6 @@ async def _drive_and_collect_error(
     envelope is pushed via caps.send_response, not via handle_response
     yields. Harvested from the fake caps' synthetic_sends.
     """
-    import asyncio
     m.on_query(oid, q)
     # Drive any response to tick the event loop so the coroutine's
     # _engage_phase3 raise propagates through _drive_coroutine.

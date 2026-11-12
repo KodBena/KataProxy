@@ -42,7 +42,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from AbstractProxy.proxy_core import CanonicalId, ClientId, InternalId
 
@@ -55,9 +55,14 @@ if str(_PROXY_ROOT) not in sys.path:
 from katago import (  # noqa: E402
     KataGoAction,
     KataGoQuery,
+    KataGoResponse,
     translate_query_to_wire,
 )
-from proxy_logging import Event  # noqa: E402
+from middleware.capability_gate import CapabilityGatedMiddleware  # noqa: E402
+from middleware.orchestration import OrchestrationContext, orchestration_middleware  # noqa: E402
+from middleware.session_middleware import IdentityMiddleware, SessionCapabilities  # noqa: E402
+from proxy_logging import Event, Role, get_proxy_logger, set_process_role  # noqa: E402
+from pubsub_hub import PubSubHub  # noqa: E402
 from router import (  # noqa: E402
     EchoRouter,
     InFlightQueryLoad,
@@ -118,7 +123,6 @@ def capture() -> Iterator[_CaptureHandler]:
     # never invokes proxy_server._main. In production this is set by
     # _main() before any router constructs; in tests the fixture sets
     # it explicitly so the schema-validity contract holds.
-    from proxy_logging import set_process_role, Role
     set_process_role(Role.LEAF)
     yield handler
     # Tear down.
@@ -514,9 +518,6 @@ class TestHubCoalesceEvent:
     async def test_second_identical_subscribe_emits_coalesce(
         self, capture: _CaptureHandler,
     ) -> None:
-        import asyncio
-        from pubsub_hub import PubSubHub
-        from proxy_logging import get_proxy_logger, Role
         # Bind role + session: the SUBSCRIBE / COALESCE events require
         # the session field via the bind chain (production source: the
         # ClientSession constructor binds session=peer onto self._log
@@ -582,12 +583,6 @@ class TestMiddlewareEngageEvent:
     async def test_per_query_opt_in_emits_middleware_engage(
         self, capture: _CaptureHandler,
     ) -> None:
-        from middleware.capability_gate import CapabilityGatedMiddleware
-        from middleware.session_middleware import (
-            IdentityMiddleware,
-            SessionCapabilities,
-        )
-        from proxy_logging import get_proxy_logger, Role
 
         # Recorder middleware that just identifies as "wrapped".
         wrapped = IdentityMiddleware()
@@ -648,12 +643,6 @@ class TestOrchestrationSpawnEvent:
     async def test_spawn_emits_orchestration_spawn_with_sub_orig_id(
         self, capture: _CaptureHandler,
     ) -> None:
-        import asyncio
-        from middleware.orchestration import (
-            OrchestrationContext,
-            orchestration_middleware,
-        )
-        from middleware.session_middleware import SessionCapabilities
 
         submitted: List[tuple[ClientId, KataGoQuery]] = []
 
@@ -663,14 +652,11 @@ class TestOrchestrationSpawnEvent:
         async def terminate(_oid: ClientId) -> None:
             pass
 
-        from middleware.orchestration import OrchestrationContext as _OrchCtx
-        from typing import AsyncIterator as _AsyncIterator
-        from katago import KataGoResponse as _KataGoResponse
 
         @orchestration_middleware(name="test_orch")
         async def coro(
-            parent: KataGoQuery, ctx: _OrchCtx,
-        ) -> _AsyncIterator[_KataGoResponse]:
+            parent: KataGoQuery, ctx: OrchestrationContext,
+        ) -> AsyncIterator[KataGoResponse]:
             # Discard originals so the framework doesn't buffer; we're
             # testing the spawn emission shape.
             await ctx.discard_originals()

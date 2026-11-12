@@ -38,6 +38,8 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import secrets
+
 import asyncio
 import json
 import sys
@@ -172,7 +174,6 @@ class MaxVisitsSyntheticRouter(BackendRouter):
                 await task
             except asyncio.CancelledError:
                 pass
-        import secrets
         # Synthetic ack's wire id is brand-CanonicalId at routing-key
         # sites; see SyntheticPonderingRouter.terminate for the same
         # convention.
