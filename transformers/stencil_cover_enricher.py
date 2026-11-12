@@ -12,9 +12,9 @@ and negative-ownership exact covers. Empty points use the configured ownership
 cutoff; living chains are omitted and dead chains are assigned to their
 opponent's territory.
 
-Importing this module requires HiGHS and a valid proxy-owned stencil family.
-Both are loaded eagerly: a missing dependency or invalid family prevents the
-transformer from being composed.
+The default composition selects HiGHS eagerly and requires a valid
+proxy-owned stencil family. Optional solver packages are imported only when
+their adapters are explicitly selected at the composition boundary.
 
 See NOTICE for the file-specific MIT exception and KataGo attribution.
 """
@@ -29,7 +29,6 @@ import re
 import threading
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-import highspy
 import numpy as np
 
 from AbstractProxy.protocol_transformer import Transformer
@@ -39,6 +38,18 @@ from transformers.stencil_cache_storage import (
     redis_persistent_cache,
     register_cache_invalidator,
 )
+from transformers.stencil_solver_api import NoNativeEffortLimit, SolverBackend, SolverBudget
+from transformers.stencil_solver_factory import create_solver_backend
+from transformers.stencil_solver_geometry import (
+    D4_INVERSE as _D4_INVERSE,
+    D4_MATRICES as _D4_MATRICES,
+    decode_component_shape_key as _decode_component_shape_key,
+    encode_cached_placements as _encode_cached_placements,
+    normalise_shape as _normalise_shape,
+    transform_cell as _transform_cell,
+    verify_component_placements as _verify_component_placements,
+)
+from transformers.stencil_solver_runtime import solve_component as _solve_with_backend
 
 logger = logging.getLogger("kataproxy.stencil_cover_enricher")
 
@@ -497,21 +508,6 @@ def _connected_components(
     return components
 
 
-# D4 is represented as integer matrices acting on (row, column). The
-# transforms are intentionally shared by canonicalisation and recovery.
-_D4_MATRICES = (
-    (1, 0, 0, 1),    # identity
-    (0, 1, -1, 0),   # quarter turn
-    (-1, 0, 0, -1),  # half turn
-    (0, -1, 1, 0),   # three-quarter turn
-    (-1, 0, 0, 1),   # horizontal-axis reflection
-    (1, 0, 0, -1),   # vertical-axis reflection
-    (0, 1, 1, 0),    # main-diagonal reflection
-    (0, -1, -1, 0),  # anti-diagonal reflection
-)
-_D4_INVERSE = (0, 3, 2, 1, 4, 5, 6, 7)
-
-
 @dataclass(frozen=True)
 class ComponentFrame:
     """Map between a board component and its canonical D4 frame."""
@@ -522,22 +518,6 @@ class ComponentFrame:
     offset_x: int
     canonical_width: int
     canonical_height: int
-
-
-def _transform_cell(y: int, x: int, transform: int) -> Tuple[int, int]:
-    a, b, c, d = _D4_MATRICES[transform]
-    return a * y + b * x, c * y + d * x
-
-
-def _normalise_shape(
-    cells: Sequence[Tuple[int, int]], transform: int = 0,
-) -> Tuple[Tuple[int, int], ...]:
-    mapped = [_transform_cell(int(y), int(x), transform) for y, x in cells]
-    if not mapped:
-        raise ValueError("a stencil shape must contain at least one cell")
-    min_y = min(y for y, _ in mapped)
-    min_x = min(x for _, x in mapped)
-    return tuple(sorted((y - min_y, x - min_x) for y, x in mapped))
 
 
 def _family_dihedral_group(family: Sequence[Stencil]) -> Tuple[int, ...]:
@@ -614,50 +594,6 @@ def _component_shape_key(
     return best_key, best_frame
 
 
-def _decode_component_shape_key(shape_key: bytes) -> Tuple[int, int, Tuple[int, ...]]:
-    if len(shape_key) < 2:
-        raise ValueError("component shape key is truncated")
-    height, width = shape_key[0], shape_key[1]
-    area = height * width
-    expected_bytes = (area + 7) // 8
-    if not 1 <= width <= _MAX_BOARD_SIZE or not 1 <= height <= _MAX_BOARD_SIZE:
-        raise ValueError("component shape dimensions are invalid")
-    if len(shape_key) != 2 + expected_bytes:
-        raise ValueError("component shape key has an invalid bitset length")
-    packed = shape_key[2:]
-    cells = tuple(
-        point for point in range(area)
-        if packed[point >> 3] & (1 << (point & 7))
-    )
-    return width, height, cells
-
-
-def _encode_cached_placements(
-    placements: Sequence[Tuple[str, Sequence[int]]],
-    family: Sequence[Stencil],
-) -> bytes:
-    """Compact binary encoding: count, then (family-index, size, cells...)."""
-    if len(placements) > 0xFFFF:
-        raise ValueError("too many placements for compact cache encoding")
-    name_to_index = {name: index for index, (name, _) in enumerate(family)}
-    encoded = bytearray(len(placements).to_bytes(2, "little"))
-    for name, points in placements:
-        if len(points) > 0xFF:
-            raise ValueError("stencil placement is too large for compact cache encoding")
-        # 255 is reserved for the guaranteed singleton fallback when a
-        # future family omits its explicit 1x1 stencil.
-        stencil_index = name_to_index.get(name, 255 if name == "1x1" else -1)
-        if not 0 <= stencil_index <= 255:
-            raise ValueError(f"unknown stencil name in solver result: {name!r}")
-        encoded.extend((stencil_index, len(points)))
-        for point in points:
-            point = int(point)
-            if not 0 <= point <= 0xFFFF:
-                raise ValueError("component point index exceeds compact cache encoding")
-            encoded.extend(point.to_bytes(2, "little"))
-    return bytes(encoded)
-
-
 def _decode_cached_placements(
     encoded: bytes,
     family: Sequence[Stencil],
@@ -724,126 +660,34 @@ def _decode_cached_placements(
     return placements
 
 
-def _verify_component_placements(
-    component: Sequence[int],
-    board_width: int,
-    placements: Sequence[Dict[str, Any]],
-    family: Sequence[Stencil],
-) -> None:
-    """Reject corrupt or incorrectly recovered covers before they are served."""
-    allowed = set(int(point) for point in component)
-    names = {name: _normalise_shape(cells) for name, cells in family}
-    covered: set[int] = set()
-    for placement in placements:
-        name = placement.get("stencil")
-        points = placement.get("points")
-        if (name not in names and name != "1x1") or not isinstance(points, list) or not points:
-            raise RuntimeError("cached stencil placement has an unknown shape or no points")
-        coordinates: List[Tuple[int, int]] = []
-        flattened: List[int] = []
-        for point in points:
-            if (
-                not isinstance(point, list) or len(point) != 2
-                or any(isinstance(value, bool) or not isinstance(value, int) for value in point)
-            ):
-                raise RuntimeError("cached stencil placement contains a malformed coordinate")
-            x, y = point
-            if x < 0 or not 0 <= x < board_width or y < 0:
-                raise RuntimeError("cached stencil placement is outside the board")
-            coordinates.append((y, x))
-            flattened.append(y * board_width + x)
-        expected_shape = names.get(name)
-        if expected_shape is None and name == "1x1" and len(coordinates) == 1:
-            # Explicitly preserve the solver's guaranteed singleton fallback
-            # for a family that omits a named singleton stencil.
-            expected_shape = ((0, 0),)
-        if expected_shape is None or _normalise_shape(coordinates) != expected_shape:
-            raise RuntimeError("cached stencil name does not match its recovered geometry")
-        for point in flattened:
-            if point not in allowed or point in covered:
-                raise RuntimeError("cached stencil placements do not form a disjoint component cover")
-            covered.add(point)
-    if covered != allowed:
-        raise RuntimeError("cached stencil placements leave component cells uncovered")
-
-
 def _solve_component_uncached(
     shape_key: bytes,
     time_limit_ms: int,
     family: Tuple[Stencil, ...],
+    backend: SolverBackend,
 ) -> Tuple[bool, int, bytes]:
-    """Solve one canonical component and return only compact solution data.
-
-    Status codes: 0 = proven optimal, 1 = feasible incumbent, 2 = singleton
-    fallback. The request LRU separates time budgets; the Redis result identity
-    deliberately does not, so longer solves can upgrade the same problem row.
-    """
+    """Invoke the selected backend through the neutral interface for Redis."""
     if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
         raise ValueError("solver time limit must be a positive number of milliseconds")
-    width, height, region = _decode_component_shape_key(shape_key)
-    candidates = _candidate_placements(region, width, height, family)
-    point_to_columns: Dict[int, List[int]] = {point: [] for point in region}
-    for column, (_, points) in enumerate(candidates):
-        for point in points:
-            point_to_columns[point].append(column)
-    if any(not columns for columns in point_to_columns.values()):
-        raise RuntimeError("stencil family failed to provide a feasible singleton cover")
-
-    highs = highspy.Highs()
-    highs.setOptionValue("log_to_console", False)
-    highs.setOptionValue("time_limit", time_limit_ms / 1000.0)
-    variable_count = len(candidates)
-    highs.addVars(
-        variable_count,
-        np.zeros(variable_count, dtype=np.float64),
-        np.ones(variable_count, dtype=np.float64),
+    execution = _solve_with_backend(
+        backend,
+        shape_key,
+        family,
+        SolverBudget(
+            wall_time_limit_ms=int(time_limit_ms),
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id=f"foreground-{int(time_limit_ms)}ms",
+        ),
     )
-    indices = np.arange(variable_count, dtype=np.int32)
-    highs.changeColsCost(
-        variable_count, indices, np.ones(variable_count, dtype=np.float64)
-    )
-    integrality = np.full(
-        variable_count, int(highspy.HighsVarType.kInteger), dtype=np.uint8
-    )
-    highs.changeColsIntegrality(variable_count, indices, integrality)
-
-    for point in region:
-        columns = np.asarray(point_to_columns[point], dtype=np.int32)
-        highs.addRow(
-            1.0, 1.0, int(len(columns)), columns,
-            np.ones(len(columns), dtype=np.float64),
+    if execution.outcome.status.value == "error":
+        error = execution.outcome.error
+        message = error.message if hasattr(error, "message") else "backend invocation failed"
+        logger.error(
+            "Stencil solver backend %s failed: %s",
+            execution.identity.fingerprint,
+            message,
         )
-    highs.run()
-
-    optimal = highs.getModelStatus() == highspy.HighsModelStatus.kOptimal
-    solution = highs.getSolution()
-    values = getattr(solution, "col_value", None)
-    chosen = (
-        [i for i, value in enumerate(values) if float(value) > 0.5]
-        if values is not None and len(values) == variable_count
-        else []
-    )
-
-    def is_exact_cover(selection: Sequence[int]) -> bool:
-        counts = {point: 0 for point in region}
-        for column in selection:
-            for point in candidates[column][1]:
-                counts[point] += 1
-        return all(count == 1 for count in counts.values())
-
-    fallback = not chosen or not is_exact_cover(chosen)
-    if fallback:
-        singleton_columns = {
-            points[0]: index
-            for index, (_, points) in enumerate(candidates)
-            if len(points) == 1
-        }
-        chosen = [singleton_columns[point] for point in region]
-        optimal = False
-
-    selected = [candidates[column] for column in chosen]
-    encoded = _encode_cached_placements(selected, family)
-    return bool(optimal), 2 if fallback else (0 if optimal else 1), encoded
+    return execution.cache_result
 
 
 class _SolverCacheInfo(NamedTuple):
@@ -869,7 +713,7 @@ class _InvalidatableSolverCache:
         self._function = function
         self._maxsize = maxsize
         self._cache: OrderedDict[
-            Tuple[bytes, int, Tuple[Stencil, ...]],
+            Tuple[bytes, int, Tuple[Stencil, ...], str],
             Tuple[bool, int, bytes],
         ] = OrderedDict()
         self._lock = threading.RLock()
@@ -884,8 +728,10 @@ class _InvalidatableSolverCache:
         shape_key: bytes,
         time_limit_ms: int,
         family: Tuple[Stencil, ...],
+        backend: SolverBackend | None = None,
     ) -> Tuple[bool, int, bytes]:
-        cache_key = (shape_key, time_limit_ms, family)
+        backend = backend or DEFAULT_SOLVER_BACKEND
+        cache_key = (shape_key, time_limit_ms, family, backend.identity.fingerprint)
         while True:
             with self._lock:
                 cached = self._cache.get(cache_key)
@@ -901,7 +747,7 @@ class _InvalidatableSolverCache:
                 self._inflight[shape_key] = self._inflight.get(shape_key, 0) + 1
 
             try:
-                result = self._function(shape_key, time_limit_ms, family)
+                result = self._function(shape_key, time_limit_ms, family, backend)
             except Exception:
                 with self._lock:
                     self._leave_inflight(shape_key)
@@ -964,10 +810,12 @@ class _InvalidatableSolverCache:
             )
 
 
-# The request path uses an entry-bounded local LRU and a Redis-backed miss
-# handler. The bulk worker calls _solve_component_uncached directly with its
-# larger budget. Pub/Sub invalidates only the changed canonical component;
-# reconnect notifications clear the cache once to cover any missed messages.
+# The foreground path uses an entry-bounded local LRU and a Redis-backed miss
+# handler. Foreground and bulk both call stencil_solver_runtime.solve_component;
+# the worker bypasses only the foreground LRU. Pub/Sub invalidates every local
+# backend-profile entry for the changed canonical component.
+DEFAULT_SOLVER_BACKEND: SolverBackend = create_solver_backend("highs")
+
 _SOLVER_CACHE_NAMESPACE = "solver-component-d4-v3"
 _solver_component_persistent = redis_persistent_cache(
     namespace=_SOLVER_CACHE_NAMESPACE,
@@ -992,8 +840,9 @@ def _solve_region(
     region: Sequence[int], width: int, height: int,
     family: Sequence[Stencil],
     time_limit_ms: int = _SOLVER_TIME_LIMIT_MS,
+    solver_backend: SolverBackend = DEFAULT_SOLVER_BACKEND,
 ) -> Dict[str, Any]:
-    """Decompose, expose, and solve exactly the connected components handed to HiGHS."""
+    """Decompose, expose, and solve components through the selected solver port."""
     if not region:
         return {
             "components": [],
@@ -1009,7 +858,7 @@ def _solve_region(
     for component in _connected_components(region, width, height):
         shape_key, frame = _component_shape_key(component, width, family)
         optimal, status, encoded = _solve_component_cached(
-            shape_key, time_limit_ms, family_key,
+            shape_key, time_limit_ms, family_key, solver_backend,
         )
         component_placements = _decode_cached_placements(
             encoded, family_key, frame,
@@ -1057,13 +906,14 @@ def _build_stencil_cover(
     width: int,
     height: int,
     threshold: float,
+    solver_backend: SolverBackend = DEFAULT_SOLVER_BACKEND,
 ) -> Dict[str, Any]:
     ownership = _extract_maps(opaque, width, height)
     positive_cells, negative_cells = _ownership_regions(
         ownership, board, width, height, threshold,
     )
-    positive = _solve_region(positive_cells, width, height, STENCIL_FAMILY)
-    negative = _solve_region(negative_cells, width, height, STENCIL_FAMILY)
+    positive = _solve_region(positive_cells, width, height, STENCIL_FAMILY, solver_backend=solver_backend)
+    negative = _solve_region(negative_cells, width, height, STENCIL_FAMILY, solver_backend=solver_backend)
     return {
         "version": 2,
         "threshold": threshold,
@@ -1110,8 +960,10 @@ def _request_context(query: KataGoQuery) -> Optional[RequestContext]:
 
 def stencil_cover_enricher(
     link: ProxyLink[ClientId, InternalId],
+    solver_backend: SolverBackend | None = None,
 ) -> Transformer[KataGoQuery, KataGoResponse]:
-    """Enrich explicitly opted-in final analysis packets with signed covers."""
+    """Enrich opted-in final packets; the backend is injected at composition."""
+    selected_backend = solver_backend or DEFAULT_SOLVER_BACKEND
     request_cache: Dict[ClientId, RequestContext] = {}
 
     def on_query(eid: ClientId, query: KataGoQuery) -> Optional[KataGoQuery]:
@@ -1139,6 +991,7 @@ def stencil_cover_enricher(
                         context.width,
                         context.height,
                         context.threshold,
+                        solver_backend=selected_backend,
                     )
                 except Exception:
                     # Stencil cover is optional enrichment. A malformed or

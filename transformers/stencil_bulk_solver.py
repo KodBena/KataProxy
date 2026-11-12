@@ -5,8 +5,8 @@ The normal foreground stencil-cover path does not require this process.
 Run the optional worker with `kataproxy-stencil-bulk-solver` after installing
 the project, or from a checkout with
 `python -m transformers.stencil_bulk_solver`. One worker processes the Redis
-pending set sequentially. Each canonical component receives one 10-second
-HiGHS solve; a non-optimal outcome is retained as the best result and
+pending set sequentially. Each canonical component receives one 10-second wall-clock solver budget;
+a non-optimal outcome is retained as the best result and
 accompanied by durable timeout metadata so it is not retried forever.
 """
 from __future__ import annotations
@@ -27,9 +27,13 @@ from transformers.stencil_cover_enricher import (
     Stencil,
     _decode_cached_placements,
     _decode_component_shape_key,
-    _solve_component_uncached,
     _verify_component_placements,
 )
+from transformers.stencil_solver_api import (
+    NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget,
+)
+from transformers.stencil_solver_factory import create_solver_backend
+from transformers.stencil_solver_runtime import solve_component
 
 logger = logging.getLogger("kataproxy.stencil_bulk_solver")
 
@@ -78,15 +82,13 @@ class StencilBulkSolver:
         self,
         store: RedisStencilStore,
         family: Tuple[Stencil, ...] = STENCIL_FAMILY,
-        solve: Callable[[bytes, int, Tuple[Stencil, ...]], Tuple[bool, int, bytes]] = (
-            _solve_component_uncached
-        ),
+        solver_backend: SolverBackend | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.store = store
         self.family = family
         self.store.initialize_pending_queue(self.family)
-        self.solve = solve
+        self.solver_backend = solver_backend or create_solver_backend("highs")
         self.clock = clock
 
     def process_component(self, shape_key: bytes) -> str:
@@ -104,10 +106,22 @@ class StencilBulkSolver:
             return "optimal"
 
         attempted_at = self.clock()
-        result = _validate_bulk_result(
+        execution = solve_component(
+            self.solver_backend,
             shape_key,
             self.family,
-            self.solve(shape_key, BULK_TIME_LIMIT_MS, self.family),
+            SolverBudget(
+                wall_time_limit_ms=BULK_TIME_LIMIT_MS,
+                native_effort_limit=NoNativeEffortLimit(),
+                policy_id=f"bulk-{BULK_TIME_LIMIT_MS}ms",
+            ),
+        )
+        if execution.outcome.status is OutcomeStatus.ERROR:
+            error = execution.outcome.error
+            message = error.message if hasattr(error, "message") else "backend invocation failed"
+            raise RuntimeError(f"bulk solver backend failed: {message}")
+        result = _validate_bulk_result(
+            shape_key, self.family, execution.cache_result,
         )
         self.store.put_result(shape_key, self.family, result)
         best = self.store.get_result(shape_key, self.family)
