@@ -25,6 +25,7 @@ from transformers.stencil_solver_api import (
     SolverOutcome,
 )
 from transformers.stencil_solver_runtime import solve_component
+from transformers.stencil_cache_storage import make_solver_work_profile
 from transformers.stencil_solver_factory import (
     create_solver_backend, register_solver_backend,
 )
@@ -408,3 +409,78 @@ def test_bulk_sighting_precedes_timeout_and_result_cache_returns(
     assert worker.process_component(_domino_key()) == "optimal"
     assert order == ["sighting", "timeout", "result"]
     assert backend.calls == []
+
+
+
+def test_solver_work_profile_fingerprint_is_stable_and_covers_all_budget_dimensions() -> None:
+    identity = _identity(name="profiled", mode="first")
+    baseline = SolverBudget(
+        wall_time_limit_ms=10_000,
+        native_effort_limit=NoNativeEffortLimit(),
+        policy_id="bulk-v1",
+    )
+    profile = make_solver_work_profile(identity, baseline)
+    assert make_solver_work_profile(identity, baseline) == profile
+
+    variants = (
+        make_solver_work_profile(
+            _identity(name="profiled", mode="second"), baseline,
+        ),
+        make_solver_work_profile(
+            identity,
+            SolverBudget(
+                wall_time_limit_ms=5_000,
+                native_effort_limit=NoNativeEffortLimit(),
+                policy_id="bulk-v1",
+            ),
+        ),
+        make_solver_work_profile(
+            identity,
+            SolverBudget(
+                wall_time_limit_ms=10_000,
+                native_effort_limit=NativeEffortLimit(100, "nodes"),
+                policy_id="bulk-v1",
+            ),
+        ),
+        make_solver_work_profile(
+            identity,
+            SolverBudget(
+                wall_time_limit_ms=10_000,
+                native_effort_limit=NoNativeEffortLimit(),
+                policy_id="bulk-v2",
+            ),
+        ),
+    )
+    assert all(item.fingerprint != profile.fingerprint for item in variants)
+    assert len({profile.fingerprint, *(item.fingerprint for item in variants)}) == 5
+    assert profile.document["solver_identity"]["fingerprint"] == identity.fingerprint
+    assert profile.document["budget"]["wall_time_limit_ms"] == 10_000
+
+
+def test_solver_work_profile_identity_includes_native_effort_unit_and_value() -> None:
+    identity = _identity()
+    first = make_solver_work_profile(
+        identity,
+        SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NativeEffortLimit(100, "nodes"),
+            policy_id="foreground-v1",
+        ),
+    )
+    changed_unit = make_solver_work_profile(
+        identity,
+        SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NativeEffortLimit(100, "iterations"),
+            policy_id="foreground-v1",
+        ),
+    )
+    changed_value = make_solver_work_profile(
+        identity,
+        SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NativeEffortLimit(200, "nodes"),
+            policy_id="foreground-v1",
+        ),
+    )
+    assert len({first.fingerprint, changed_unit.fingerprint, changed_value.fingerprint}) == 3

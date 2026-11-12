@@ -26,6 +26,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, FrozenSet, Iterator, TypeVar, cast
 
+from transformers.stencil_solver_api import (
+    NativeEffortLimit,
+    NoNativeEffortLimit,
+    SolverBudget,
+    SolverIdentity,
+)
+
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger("kataproxy.stencil_cache_storage")
 
@@ -259,6 +266,99 @@ class StoredSolverResult:
     result: tuple[bool, int, bytes]
     provenance: Dict[str, Any]
     quality_lower_bound: int | None
+
+
+
+@dataclass(frozen=True)
+class SolverWorkProfile:
+    """Stable identity for one backend/configuration/budget work protocol.
+
+    The best-result cache is intentionally not partitioned by this value.
+    Pending and timeout state is.  The document is canonical JSON data and its
+    SHA-256 fingerprint is the Redis-safe profile key.
+    """
+
+    fingerprint: str
+    document: Dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", self.fingerprint):
+            raise ValueError("work-profile fingerprint must be lowercase SHA-256")
+        if not isinstance(self.document, dict):
+            raise TypeError("work-profile document must be an object")
+        try:
+            encoded = json.dumps(
+                self.document, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True, allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("work-profile document must be finite JSON") from exc
+        if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != self.fingerprint:
+            raise ValueError("work-profile fingerprint does not match its document")
+        if self.document.get("schema") != "kataproxy.stencil-cover.solver-work-profile.v1":
+            raise ValueError("unsupported solver work-profile schema")
+
+
+def make_solver_work_profile(
+    identity: SolverIdentity,
+    budget: SolverBudget,
+) -> SolverWorkProfile:
+    """Build a canonical identity including every independent budget dimension."""
+    native = budget.native_effort_limit
+    if isinstance(native, NativeEffortLimit):
+        native_document: Dict[str, Any] = {
+            "disposition": "limited",
+            "value": native.value,
+            "unit": native.unit,
+        }
+    elif isinstance(native, NoNativeEffortLimit):
+        native_document = {
+            "disposition": "not_requested",
+            "reason": native.reason.value,
+        }
+    else:  # Defensive guard for callers bypassing SolverBudget validation.
+        raise TypeError("unsupported native effort budget")
+    document: Dict[str, Any] = {
+        "schema": "kataproxy.stencil-cover.solver-work-profile.v1",
+        "solver_identity": {
+            "fingerprint": identity.fingerprint,
+            "backend_name": identity.backend_name,
+            "backend_version": identity.backend_version,
+            "adapter_version": identity.adapter_version,
+            "configuration_json": identity.configuration_json,
+            "configuration_fingerprint": identity.configuration_fingerprint,
+        },
+        "budget": {
+            "wall_time_limit_ms": budget.wall_time_limit_ms,
+            "native_effort_limit": native_document,
+            "policy_id": budget.policy_id,
+        },
+    }
+    encoded = json.dumps(
+        document, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False,
+    ).encode("utf-8")
+    return SolverWorkProfile(
+        fingerprint=hashlib.sha256(encoded).hexdigest(),
+        document=document,
+    )
+
+
+_LEGACY_SOLVER_WORK_PROFILE_DOCUMENT: Dict[str, Any] = {
+    "schema": "kataproxy.stencil-cover.solver-work-profile.v1",
+    "solver_identity": {"disposition": "legacy_unknown"},
+    "budget": {"disposition": "legacy_unscoped"},
+}
+_LEGACY_SOLVER_WORK_PROFILE_JSON = json.dumps(
+    _LEGACY_SOLVER_WORK_PROFILE_DOCUMENT,
+    sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+)
+LEGACY_SOLVER_WORK_PROFILE = SolverWorkProfile(
+    fingerprint=hashlib.sha256(
+        _LEGACY_SOLVER_WORK_PROFILE_JSON.encode("utf-8")
+    ).hexdigest(),
+    document=_LEGACY_SOLVER_WORK_PROFILE_DOCUMENT,
+)
 
 
 def _validate_result_provenance(value: Any) -> Dict[str, Any]:
