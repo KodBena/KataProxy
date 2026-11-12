@@ -63,10 +63,13 @@ except ImportError:
     diptest = None
 
 try:
+    from sklearn.mixture import GaussianMixture
 except ImportError:
     GaussianMixture = None
 
 try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
 except ImportError:
     plt = None
     sns = None
