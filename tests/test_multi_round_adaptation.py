@@ -31,6 +31,8 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import asyncio
+
 import sys
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -676,7 +678,6 @@ class TestMultiRoundCoroutine:
         """Drive handle_response and harvest orchestration emissions
         for the orig_id from caps.send_response (the push-based output
         channel)."""
-        import asyncio
         sc = getattr(m, "_caps", None)
         fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
         pre = len(fake.synthetic_sends) if fake is not None else 0
@@ -692,7 +693,6 @@ class TestMultiRoundCoroutine:
     async def _wait_for_spawn_count(
         caps: Any, n: int, timeout_s: float = 1.0,
     ) -> bool:
-        import asyncio
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             if len(caps.submitted) >= n:

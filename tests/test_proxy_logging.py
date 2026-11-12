@@ -36,6 +36,9 @@ from __future__ import annotations
 import json
 import logging
 import sys
+
+import logging_config
+import proxy_logging.formatters as fmtmod
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -666,7 +669,6 @@ class TestRegexLineFilter:
 class TestEnvConfig:
     def test_unknown_format_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Reset the module-level idempotency flag so configure runs.
-        import proxy_logging.formatters as fmtmod
         monkeypatch.setattr(fmtmod, "_CONFIGURED", False)
         monkeypatch.setenv("PROXY_LOG_FORMAT", "yaml")
         with pytest.raises(ValueError, match="not one of"):
@@ -818,12 +820,10 @@ class TestLoggingConfigShim:
     def test_filter_dict_re_exported(self) -> None:
         # The shim must re-export the existing helpers so unmigrated
         # call sites continue to work unchanged.
-        import logging_config
         assert logging_config.filter_dict is filter_dict
         assert logging_config.log_safe is log_safe
 
     def test_get_logger_returns_stdlib_logger(self) -> None:
-        import logging_config
         logger = logging_config.get_logger("kataproxy.shim_test")
         assert isinstance(logger, logging.Logger)
         # Behaves like the pre-arc API: same name → same instance.

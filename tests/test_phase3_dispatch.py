@@ -29,6 +29,8 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 from __future__ import annotations
 
 import asyncio
+
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -203,7 +205,6 @@ async def _wait_for_coroutine_error(
     the first MetadataResponse with an `error` opaque field, or None
     on timeout.
     """
-    import asyncio
     fake = _fake_from_middleware(m)
     if fake is None:
         return None
