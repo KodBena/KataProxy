@@ -11,24 +11,58 @@ which operating assumptions the current implementation makes.
 There is one required solver path and one optional improvement path:
 
 1. **Foreground request path (required for the feature).** A request solves each canonical connected
-   component with a 250 ms HiGHS time limit. It first checks a process-local
+   component with a 250 ms wall-clock budget through the configured solver backend (HiGHS by default). It first checks a process-local
    LRU; on an LRU miss it consults Redis, and only solves when Redis has no
    result.
 2. **Background improvement path (optional).** A separately managed process
    reads the Redis pending set and attempts each component with a 10,000 ms
-   HiGHS time limit. It validates the cover and atomically upgrades the stored
+   wall-clock budget through the same configured solver backend. It validates the cover and atomically upgrades the stored
    result when it has found a better one. Not running this process does not
    disable stencil-cover annotations; it only means that foreground incumbents
    are not given this later, longer improvement attempt.
 
 Redis is the shared source of truth for results and work indexes. The solver
-model, HiGHS basis, and intermediate search state are deliberately not shared
+model, backend state, and intermediate search state are deliberately not shared
 or serialized. A background attempt starts from the canonical problem
 instance and solves it again.
 
 The foreground path is allowed to return a feasible incumbent. It must never
-label an incumbent or singleton fallback as proven optimal. Only a HiGHS
-optimal status is represented as an exact result.
+label an incumbent or singleton fallback as proven optimal. Only a backend outcome that explicitly proves optimality is represented as an exact result.
+
+## Solver port and composition (Phase 1)
+
+The transformer depends on `SolverBackend` from
+`transformers/stencil_solver_api.py`. Its canonical input contains only the
+canonical component, dimensions, complete active family, family fingerprint,
+and canonicalization protocol version. The backend does not see KataGo,
+WebSocket, ownership polarity, Redis, or the caller's board frame.
+
+The default adapter is `HiGHSBackend` in
+`transformers/stencil_solver_highs.py`. Its only solver-specific imports are
+owned by that module. `stencil_solver_factory.py` is the explicit composition
+root and currently registers HiGHS as the default; optional adapters must be
+registered by importing their own module at composition time. The transformer
+does not import OR-Tools or gomecsolver.
+
+Both paths use `stencil_solver_runtime.solve_component`: the foreground's
+existing Redis/LRU wrapper adapts its typed outcome to the unchanged compact
+result row, and the bulk worker calls the same runtime boundary directly. The
+runtime measures total adapter invocation time with
+`time.perf_counter_ns()`, validates a returned placement witness in the
+canonical frame, and uses the singleton fallback only when no validated
+solver cover is available. A backend error remains an error (the worker leaves
+the item pending); it is not relabeled as a feasible or optimal result.
+
+The local LRU key includes the selected backend identity fingerprint as well
+as the existing shape, family, and foreground time budget. Redis continues to
+store one global best result per canonical problem/family, independent of
+backend and budget. The work queue is still the legacy global pending/timeout
+index in this phase; solver-profile-aware queue migration remains Phase 4.
+
+Programmatic composition can inject a backend through
+`stencil_cover_enricher(link, solver_backend=...)` or
+`StencilBulkSolver(..., solver_backend=...)`. No gomecsolver or OR-Tools
+dependency is added by this phase.
 
 ## Why the queue is in Redis, not a multiprocessing.Queue
 
@@ -87,7 +121,7 @@ A stored result is only:
 - the tile count; and
 - the compact encoded stencil placements.
 
-The problem instance is the canonical shape key. No HiGHS object, model,
+The problem instance is the canonical shape key. No solver object, model,
 basis, branch-and-bound tree, solver checkpoint, or other search state is
 persisted.
 
@@ -95,7 +129,7 @@ Status codes are ordered as follows:
 
 | Code | Meaning | May be reported as optimal? |
 | --- | --- | --- |
-| `0` | HiGHS proved an optimum | Yes |
+| `0` | The selected backend proved an optimum | Yes |
 | `1` | A valid feasible incumbent, but optimality was not proved | No |
 | `2` | Guaranteed singleton fallback because no valid solver cover was available | No |
 
@@ -142,8 +176,9 @@ For each connected component:
    An LRU hit performs no Redis operation.
 3. On an LRU miss, try the persistent Redis result row. If one exists, decode
    and return it; no new solve is started.
-4. If Redis has no row, run HiGHS with the foreground time limit (currently
-   250 ms), encode the selected cover, and write the result to Redis.
+4. If Redis has no row, run the selected backend through the shared solver
+   interface with the foreground wall-clock budget (currently 250 ms), encode
+   the selected cover, and write the result to Redis.
 5. Recover the canonical placements into the caller's frame and verify that
    they cover exactly that caller's component.
 
@@ -188,9 +223,9 @@ For each pending key in the snapshot, the worker:
 2. Loads the current best result. A pending key without a result is treated as
    an inconsistent queue entry and is logged; it is not guessed or solved
    without the stored problem/result contract.
-3. Calls the uncached canonical solver with a 10,000 ms HiGHS time limit. It
-   does not use the foreground LRU and does not resume foreground solver
-   state.
+3. Calls the shared `stencil_solver_runtime.solve_component` boundary with a
+   10,000 ms wall-clock budget and the worker's selected backend. It does not
+   use the foreground LRU and does not resume foreground solver state.
 4. Validates the returned result in the canonical frame: placement encoding
    must decode, every stencil name and geometry must match the active family,
    placements must be disjoint, and their union must equal the component.
@@ -204,15 +239,16 @@ For each pending key in the snapshot, the worker:
    row inside the same atomic operation. It writes timeout metadata from that
    current row and removes the key from pending, while retaining it in hard.
 
-The timeout record stores its schema version, configured HiGHS time limit,
+The timeout record stores its schema version, configured backend wall-clock limit,
 attempt start time, and the status/tile count from the row that was current at
 retirement. It describes an attempt that did not prove optimality under the
 configured limit; it is not a saved solver state.
 
-The 10,000 ms value is HiGHS's `time_limit` option for the optimization run.
-Candidate generation, model construction, result validation, and Redis I/O
-are outside that solver option, so it is not a strict wall-clock deadline for
-the entire worker function or process.
+The selected backend must enforce the supplied wall-clock budget. The default
+HiGHS adapter maps it to HiGHS' `time_limit` option. Candidate generation,
+model construction, result validation, and Redis I/O are outside that native
+solver limit; the shared runtime separately measures the complete adapter
+invocation with a monotonic clock.
 
 ## Concurrency and race semantics
 

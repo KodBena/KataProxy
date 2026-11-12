@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: MIT
+from __future__ import annotations
+
+import hashlib
+from typing import Any
+
+from transformers import stencil_cover_enricher as stencil
+from transformers.stencil_bulk_solver import StencilBulkSolver
+from transformers.stencil_solver_api import (
+    BackendStatusReported,
+    Incumbent,
+    NativeEffortUnavailable,
+    NoNativeEffortReason,
+    NoSolverFailure,
+    OutcomeStatus,
+    NoNativeEffortLimit,
+    PlacementWitness,
+    SolverBudget,
+    ProvenLowerBound,
+    SolverIdentity,
+    SolverOutcome,
+)
+from transformers.stencil_solver_runtime import solve_component
+from transformers.stencil_solver_factory import (
+    create_solver_backend, register_solver_backend,
+)
+
+
+def _identity(name: str = "fake", mode: str = "exact") -> SolverIdentity:
+    config = '{"mode":"' + mode + '"}'
+    return SolverIdentity(
+        backend_name=name,
+        backend_version="test-1",
+        adapter_version="test-adapter-v1",
+        configuration_json=config,
+        configuration_fingerprint=hashlib.sha256(config.encode("utf-8")).hexdigest(),
+    )
+
+
+class _FakeOptimalBackend:
+    def __init__(self, *, name: str = "fake", mode: str = "exact") -> None:
+        self._identity = _identity(name, mode)
+        self.calls: list[tuple[Any, Any]] = []
+
+    @property
+    def identity(self) -> SolverIdentity:
+        return self._identity
+
+    def solve(self, problem: Any, budget: Any) -> SolverOutcome:
+        self.calls.append((problem, budget))
+        # The two-cell horizontal domino is a canonical family placement.
+        witness = PlacementWitness((("1x2", ((0, 0), (0, 1))),))
+        return SolverOutcome(
+            status=OutcomeStatus.OPTIMAL,
+            incumbent=Incumbent(1, witness),
+            lower_bound=ProvenLowerBound(1),
+            native_effort=NativeEffortUnavailable(
+                NoNativeEffortReason.BACKEND_DOES_NOT_EXPOSE_EFFORT,
+            ),
+            backend_status=BackendStatusReported("FAKE_OPTIMAL"),
+            backend_metrics_json='{"fake_metric":1}',
+            error=NoSolverFailure(),
+        )
+
+
+def _domino_family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
+    return (
+        ("1x1", ((0, 0),)),
+        ("1x2", ((0, 0), (0, 1))),
+    )
+
+
+def _domino_key() -> bytes:
+    key, _frame = stencil._component_shape_key((0, 1), 2, _domino_family())
+    return key
+
+
+def test_fake_backend_substitutes_without_transformer_solver_changes() -> None:
+    family = _domino_family()
+    backend = _FakeOptimalBackend()
+    optimal, status, encoded = stencil._solve_component_uncached(
+        _domino_key(), 250, family, backend,
+    )
+    assert optimal is True
+    assert status == 0
+    assert len(encoded) > 2
+    assert len(backend.calls) == 1
+    problem, budget = backend.calls[0]
+    assert problem.occupied_cells == ((0, 0), (0, 1))
+    assert problem.family_fingerprint
+    assert budget.wall_time_limit_ms == 250
+    assert budget.policy_id == "foreground-250ms"
+
+
+def test_solver_factory_registers_and_selects_a_second_backend() -> None:
+    name = "test-fake-backend"
+    register_solver_backend(name, lambda _configuration: _FakeOptimalBackend(name=name))
+    backend = create_solver_backend(name, {"unused": True})
+    assert backend.identity.backend_name == name
+
+
+def test_fake_backend_can_be_injected_at_transformer_component_boundary() -> None:
+    family = _domino_family()
+    backend = _FakeOptimalBackend()
+    result = stencil._solve_region(
+        [0, 1], width=2, height=1, family=family, solver_backend=backend,
+    )
+    assert result["optimal"] is True
+    assert result["tileCount"] == 1
+    assert result["placements"] == [
+        {"stencil": "1x2", "points": [[0, 0], [1, 0]]},
+    ]
+    assert len(backend.calls) == 1
+
+
+def test_shared_runtime_measures_fake_adapter_and_retains_backend_identity() -> None:
+    family = _domino_family()
+    backend = _FakeOptimalBackend(name="second-backend")
+    execution = solve_component(
+        backend,
+        _domino_key(),
+        family,
+        SolverBudget(
+            wall_time_limit_ms=10_000,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="bulk-10000ms",
+        ),
+    )
+    assert execution.identity.backend_name == "second-backend"
+    assert execution.elapsed_wall_ns >= 0
+    assert execution.outcome.status is OutcomeStatus.OPTIMAL
+    assert execution.cache_result[0:2] == (True, 0)
+    assert execution.fallback_used is False
+
+
+class _MemoryStore:
+    def __init__(self, initial: tuple[bool, int, bytes]) -> None:
+        self.result = initial
+        self.stored: list[tuple[bool, int, bytes]] = []
+
+    def initialize_pending_queue(self, _family: Any) -> int:
+        return 0
+
+    def timeout_metadata(self, _shape_key: bytes, _family: Any) -> None:
+        return None
+
+    def get_result(self, _shape_key: bytes, _family: Any) -> tuple[bool, int, bytes]:
+        return self.result
+
+    def put_result(
+        self, _shape_key: bytes, _family: Any, result: tuple[bool, int, bytes],
+    ) -> bool:
+        self.result = result
+        self.stored.append(result)
+        return True
+
+    def mark_timed_out(self, *_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+
+def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
+    family = _domino_family()
+    fallback = stencil._encode_cached_placements(
+        [("1x1", (0,)), ("1x1", (1,))], family,
+    )
+    store = _MemoryStore((False, 2, fallback))
+    backend = _FakeOptimalBackend()
+    worker = StencilBulkSolver(store, family=family, solver_backend=backend)
+
+    assert worker.process_component(_domino_key()) == "optimal"
+    assert store.result[0:2] == (True, 0)
+    assert len(backend.calls) == 1
+    _problem, budget = backend.calls[0]
+    assert budget.wall_time_limit_ms == 10_000
+    assert budget.policy_id == "bulk-10000ms"
+
+
+def test_local_lru_keeps_different_backend_profiles_separate() -> None:
+    family = _domino_family()
+    calls: list[str] = []
+
+    def invoke(
+        shape_key: bytes, time_limit_ms: int, fam: Any, backend: _FakeOptimalBackend,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(backend.identity.fingerprint)
+        return (True, 0, b"\x01\x00\x00\x02\x00\x00\x00\x01\x00")
+
+    cache = stencil._InvalidatableSolverCache(invoke, maxsize=8)
+    first = _FakeOptimalBackend(name="same", mode="first")
+    second = _FakeOptimalBackend(name="same", mode="second")
+    cache(_domino_key(), 250, family, first)
+    cache(_domino_key(), 250, family, second)
+    cache(_domino_key(), 250, family, first)
+    assert calls == [first.identity.fingerprint, second.identity.fingerprint]

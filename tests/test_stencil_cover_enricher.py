@@ -395,7 +395,7 @@ def test_canonical_solution_is_recovered_with_rotated_stencil_name(
     seen_keys: List[bytes] = []
 
     def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any,
+        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
     ) -> tuple[bool, int, bytes]:
         seen_keys.append(shape_key)
         local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
@@ -440,7 +440,7 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
     seen_keys: List[bytes] = []
 
     def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any,
+        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
     ) -> tuple[bool, int, bytes]:
         seen_keys.append(shape_key)
         local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
@@ -493,7 +493,7 @@ def test_disconnected_region_is_solved_as_independent_components(
     seen_components: List[tuple[int, ...]] = []
 
     def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any,
+        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
     ) -> tuple[bool, int, bytes]:
         local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
         # The cache/solver boundary must never receive a disconnected mask.
@@ -544,7 +544,7 @@ def test_raw_components_retain_the_cells_and_status_of_each_solver_call(
     returned_statuses = iter([(False, 1), (False, 2)])
 
     def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any,
+        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
     ) -> tuple[bool, int, bytes]:
         _optimal, status = next(returned_statuses)
         _width, _height, cells = stencil._decode_component_shape_key(shape_key)
@@ -640,7 +640,7 @@ def test_transformer_enriches_only_final_response_and_keeps_signs(
     calls: List[List[int]] = []
 
     def fake_solve(
-        cells: List[int], width: int, height: int, family: Any,
+        cells: List[int], width: int, height: int, family: Any, solver_backend: Any = None,
     ) -> Dict[str, Any]:
         calls.append(list(cells))
         components = [
@@ -1000,6 +1000,57 @@ def test_timeout_metadata_uses_result_current_at_atomic_retirement() -> None:
     assert store.hard_components(family) == frozenset()
 
 
+
+class _StaticSolverBackend:
+    """Small test backend that exposes a legacy compact fixture as a typed outcome."""
+
+    def __init__(self, family: Any, encoded: bytes, *, optimal: bool) -> None:
+        import hashlib
+        from transformers.stencil_solver_api import SolverIdentity
+        config = '{"fixture":"static"}'
+        self.identity = SolverIdentity(
+            backend_name="test-static",
+            backend_version="1",
+            adapter_version="test-adapter-v1",
+            configuration_json=config,
+            configuration_fingerprint=hashlib.sha256(config.encode("utf-8")).hexdigest(),
+        )
+        self.family = tuple(family)
+        self.encoded = encoded
+        self.optimal = optimal
+        self.calls: List[int] = []
+
+    def solve(self, problem: Any, budget: Any) -> Any:
+        from transformers.stencil_solver_api import (
+            BackendStatusReported, Incumbent, LowerBoundUnavailable,
+            NativeEffortUnavailable, NoNativeEffortReason, NoSolverFailure,
+            OutcomeStatus, PlacementWitness, ProvenLowerBound, SolverOutcome,
+        )
+        from transformers.stencil_cover_enricher import ComponentFrame
+        self.calls.append(budget.wall_time_limit_ms)
+        frame = ComponentFrame(
+            board_width=problem.width, transform=0, offset_y=0, offset_x=0,
+            canonical_width=problem.width, canonical_height=problem.height,
+        )
+        recovered = stencil._decode_cached_placements(self.encoded, self.family, frame)
+        placements = tuple(
+            (item["stencil"], tuple((point[1], point[0]) for point in item["points"]))
+            for item in recovered
+        )
+        tile_count = len(placements)
+        return SolverOutcome(
+            status=OutcomeStatus.OPTIMAL if self.optimal else OutcomeStatus.FEASIBLE,
+            incumbent=Incumbent(tile_count, PlacementWitness(placements)),
+            lower_bound=ProvenLowerBound(tile_count) if self.optimal else LowerBoundUnavailable(),
+            native_effort=NativeEffortUnavailable(
+                NoNativeEffortReason.BACKEND_DOES_NOT_EXPOSE_EFFORT
+            ),
+            backend_status=BackendStatusReported("FIXTURE_OPTIMAL" if self.optimal else "FIXTURE_FEASIBLE"),
+            backend_metrics_json="{}",
+            error=NoSolverFailure(),
+        )
+
+
 def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
     from transformers.stencil_bulk_solver import (
         BULK_TIME_LIMIT_MS,
@@ -1018,22 +1069,13 @@ def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
     exact = (True, 0, encoded)
     assert store.put_result(shape_key, family, approximation)
 
-    calls: List[int] = []
-
-    def solve(
-        key: bytes, time_limit_ms: int, family_key: Any,
-    ) -> tuple[bool, int, bytes]:
-        assert key == shape_key
-        assert family_key == family
-        calls.append(time_limit_ms)
-        return exact
-
+    solver_backend = _StaticSolverBackend(family, encoded, optimal=True)
     worker = StencilBulkSolver(
-        store, family=family, solve=solve, clock=lambda: 456.0,
+        store, family=family, solver_backend=solver_backend, clock=lambda: 456.0,
     )
     counts = worker.run_once()
 
-    assert calls == [BULK_TIME_LIMIT_MS]
+    assert solver_backend.calls == [BULK_TIME_LIMIT_MS]
     assert counts == {
         "attempted": 1, "optimal": 1, "timed_out": 0, "skipped": 0,
     }
@@ -1063,21 +1105,14 @@ def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
     approximation = (False, 1, encoded)
     assert store.put_result(shape_key, family, approximation)
 
-    calls: List[int] = []
-
-    def solve(
-        _key: bytes, time_limit_ms: int, _family: Any,
-    ) -> tuple[bool, int, bytes]:
-        calls.append(time_limit_ms)
-        return approximation
-
+    solver_backend = _StaticSolverBackend(family, encoded, optimal=False)
     worker = StencilBulkSolver(
-        store, family=family, solve=solve, clock=lambda: 789.0,
+        store, family=family, solver_backend=solver_backend, clock=lambda: 789.0,
     )
     first = worker.run_once()
     second = worker.run_once()
 
-    assert calls == [BULK_TIME_LIMIT_MS]
+    assert solver_backend.calls == [BULK_TIME_LIMIT_MS]
     assert first == {
         "attempted": 1, "optimal": 0, "timed_out": 1, "skipped": 0,
     }

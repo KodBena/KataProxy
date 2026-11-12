@@ -1,12 +1,15 @@
-# Stencil-cover solver and corpus contracts (Phase 0)
+# Stencil-cover solver and corpus contracts (Phase 0–1)
 
-**Status:** Contract proposal frozen for review; no solver extraction, event
-publisher, SQLite writer, or worker changes are part of this phase.
+**Status:** Phase 0 contracts remain frozen. Phase 1 extracts the default
+HiGHS adapter and routes foreground/background solving through the shared
+solver port. Corpus publishing and SQLite materialization remain future phases.
 
 This document is the design contract for the next stencil-cover iteration.
 The typed solver port lives in `transformers/stencil_solver_api.py`; this
-document owns the cross-process event and persistence contracts. The default
-HiGHS implementation remains in its current location until Phase 1.
+document owns the cross-process event and persistence contracts. Phase 1
+implements the default adapter in `transformers/stencil_solver_highs.py`,
+with composition in `transformers/stencil_solver_factory.py` and shared
+invocation in `transformers/stencil_solver_runtime.py`.
 
 ## 1. Solver port
 
@@ -434,8 +437,8 @@ same instance.
 
 ## 6. Phase boundaries
 
-Phase 0 freezes these contracts and adds canonicalization tests only.
-It does not extract HiGHS, change foreground/background invocation, create
-the SQLite database or writer, publish events, change Redis keys or cache
-payloads, or integrate gomecsolver / OR-Tools. Phase 1 will wire the current
-HiGHS behavior behind the port and add fake-backend conformance tests.
+Phase 0 froze these contracts and canonicalization tests. Phase 1 extracted
+the HiGHS adapter, routed foreground and bulk execution through the shared
+solver interface, and added fake-backend substitution tests. No SQLite writer,
+corpus event publisher, Redis schema migration, gomecsolver integration, or
+OR-Tools integration is part of Phase 1.
