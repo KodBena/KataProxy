@@ -12,7 +12,7 @@ import os
 import socket
 import time
 import uuid
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from transformers.stencil_cache_storage import create_redis_client
 from transformers.stencil_corpus_publisher import (
@@ -98,6 +98,7 @@ class StencilCorpusMaterializer:
         consumer_name: str | None = None,
         batch_size: int = 100,
         claim_idle_ms: int = 60_000,
+        after_sqlite_commit: Callable[[str], None] | None = None,
     ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
@@ -110,6 +111,10 @@ class StencilCorpusMaterializer:
         )
         self.batch_size = batch_size
         self.claim_idle_ms = claim_idle_ms
+        # Deterministic interruption seam: invoked after SQLite commit and
+        # before XACK. Normally unset; integration tests use it to terminate
+        # a real consumer process at the crash-recovery boundary.
+        self._after_sqlite_commit = after_sqlite_commit
         self._group_ready = False
         self._claim_cursor = "0-0"
 
@@ -222,6 +227,12 @@ class StencilCorpusMaterializer:
                     message_id,
                 )
                 continue
+
+            # store.ingest returns only after its SQLite transaction commits.
+            # This optional boundary is deliberately before XACK so a real
+            # process interruption can be tested without timing races.
+            if self._after_sqlite_commit is not None:
+                self._after_sqlite_commit(message_id)
 
             # XACK is intentionally after store.ingest's transaction commit.
             try:
