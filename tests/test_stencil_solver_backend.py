@@ -400,9 +400,11 @@ def test_bulk_sighting_precedes_timeout_and_result_cache_returns(
     original_timeout = store.timeout_metadata
     original_result = store.get_result
 
-    def timeout_lookup(shape_key: bytes, seen_family: Any) -> None:
+    def timeout_lookup(
+        shape_key: bytes, seen_family: Any, work_profile: SolverWorkProfile,
+    ) -> None:
         order.append("timeout")
-        return original_timeout(shape_key, seen_family)
+        return original_timeout(shape_key, seen_family, work_profile)
 
     def result_lookup(
         shape_key: bytes, seen_family: Any,
