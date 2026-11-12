@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from types import SimpleNamespace
@@ -48,13 +49,28 @@ class _MemoryRedis:
                 return 0
             self.values[result_key] = payload
             migrated = json.loads(payload.decode("utf-8"))
+            profiles = [
+                raw_profile.decode("utf-8")
+                for raw_profile in self.hashes.get(registry_key, {})
+            ]
             if int(migrated["status"]) != 0:
                 self.sets.setdefault(hard_key, set()).add(shape_key)
-                for raw_profile in self.hashes.get(registry_key, {}):
-                    profile_id = raw_profile.decode("utf-8")
+                for profile_id in profiles:
                     self.sets.setdefault(
                         f"{family_prefix}:pending:{profile_id}", set(),
                     ).add(shape_key)
+                    self.hashes.setdefault(
+                        f"{family_prefix}:timeouts:{profile_id}", {},
+                    ).pop(shape_key, None)
+            else:
+                self.sets.setdefault(hard_key, set()).discard(shape_key)
+                for profile_id in profiles:
+                    self.sets.setdefault(
+                        f"{family_prefix}:pending:{profile_id}", set(),
+                    ).discard(shape_key)
+                    self.hashes.setdefault(
+                        f"{family_prefix}:timeouts:{profile_id}", {},
+                    ).pop(shape_key, None)
             return 1
 
         if "STENCIL_PROFILE_INITIALIZE" in script:
