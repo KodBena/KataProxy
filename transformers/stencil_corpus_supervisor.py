@@ -275,7 +275,6 @@ class StencilCorpusMaterializerSupervisor:
                     self._restart_count,
                     process.pid,
                 )
-                delay_seconds = self.restart_initial_delay_seconds
 
             exit_code = await process.wait()
             if self._stdout_task is not None:
