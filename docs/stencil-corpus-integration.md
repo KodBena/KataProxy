@@ -136,7 +136,7 @@ During startup the proxy launches the existing
 The supervisor waits for SQLite initialization before declaring startup ready.
 It monitors the child, reports an unexpected exit, and restarts it with
 exponential backoff from 1 second up to 30 seconds. The child uses a bounded
-Redis blocking read (250 ms) and handles SIGTERM by completing its current
+Redis blocking read (100 ms, below the configured Redis socket timeout) and handles SIGTERM by completing its current
 materialization pass and then exiting. On service shutdown the proxy gives the
 worker up to 5 seconds to stop gracefully, then force-terminates it and emits
 an operational error. Shutdown is bounded; it does not wait indefinitely for
