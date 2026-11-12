@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -252,7 +253,10 @@ def test_publisher_logs_critical_but_does_not_raise_when_both_paths_fail(
 
     assert publisher.publish(event) == "failed"
     assert "Could not persist stencil corpus event" in caplog.text
+    assert "Redis unavailable" in caplog.text
+    assert "SQLite spool error" in caplog.text
     assert event["event_id"] in caplog.text
+    assert any(record.levelno == logging.CRITICAL for record in caplog.records)
 
 
 def test_publisher_requires_valid_canonical_event_before_transport(tmp_path: Path) -> None:
