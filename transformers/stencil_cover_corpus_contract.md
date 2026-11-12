@@ -1,11 +1,12 @@
-# Stencil-cover solver and corpus contracts (Phase 0–2)
+# Stencil-cover solver and corpus contracts (Phases 0–4)
 
-**Status:** Phases 0–2 are implemented: the solver port and HiGHS adapter,
-strict v1 corpus events, and opt-in foreground/bulk publishers with a raw
-SQLite outage spool. Phase 3 now materializes Redis Stream and spool events
-into the normalized SQLite v2 corpus with replay-safe receipts and
-commit-before-XACK processing. Research query/analysis tooling and later Redis
-profile-aware queue changes remain future work.
+**Status:** The Phase 0–4 implementation is present: solver port and HiGHS
+adapter; family-aware D4 identity; versioned foreground/bulk events; Redis
+Stream and local SQLite-spool publication; normalized SQLite v2 materializer
+with replay-safe receipts and commit-before-XACK; and v4 result provenance
+with solver-profile-specific work queues. Phase 5 operational verification
+and foreground-latency measurement are separate and must not be treated as
+complete until their runtime checks and measurements have actually run.
 
 This document is the design contract for the next stencil-cover iteration.
 The typed solver port lives in `transformers/stencil_solver_api.py`; this
@@ -269,17 +270,31 @@ ingest-only mode drains this stream without starting solver work. If the
 worker is stopped, the foreground can continue and the stream backlog waits
 for later materialization.
 
-A Redis Stream is not disk durability by itself. Redis persistence is
-server-wide, not DB-specific. Production operation must configure Redis AOF
-and a persistent volume (recommended baseline: `appendonly yes`,
-`appendfsync everysec`; use `always` only when the latency/durability
-trade-off is explicitly accepted). The durability guarantee is only as strong
-as that server configuration and storage.
+A Redis Stream is not disk durability by itself. Redis Open Source
+persistence is server-wide rather than independently configurable for DB 7.
+For restart durability, enable AOF (appendonly yes) and keep the AOF directory
+on persistent storage. The recommended baseline is appendfsync everysec:
+Redis documents that a disaster can lose about one second of writes under
+this policy. That is an expected loss window, not a hard storage guarantee.
+appendfsync always waits for fsync before replying and can reduce the Redis-side
+loss window at substantial write latency; appendfsync no delegates flushing
+to the OS and is unsuitable when the corpus stream is expected to survive
+failures. RDB snapshots alone can lose writes since the last snapshot. See
+the [Redis AOF persistence documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
 
-If stream publication fails, the producer writes the same event through an
-idempotent direct-SQLite/spool fallback. It must not invent another event
+The producer's local SQLite spool is used only when Redis publication fails.
+A successful XADD is not also copied to the local spool, so an accepted
+event lost inside the everysec fsync window has no automatic local duplicate.
+The spool uses WAL and synchronous=FULL, but is local to the proxy host.
+The stream is not trimmed by the producer. XACK removes the consumer-group
+pending reference, not the stream entry itself; see [Redis XACK
+semantics](https://redis.io/docs/latest/commands/xack/). Monitor stream and
+AOF disk growth, and do not trim without a reviewed retention protocol.
+
+If stream publication fails, the producer writes the same event bytes through
+the idempotent SQLite spool fallback. It must not invent another event
 format. If every persistence path fails, emit an operator-visible CRITICAL
-diagnostic including `event_id` and the persistence errors, while allowing
+diagnostic including `event_id` and both persistence errors, while allowing
 the original KataGo analysis response to proceed. A failed corpus write must
 not corrupt or block best-result cache arbitration.
 
@@ -431,13 +446,21 @@ effort, or historical attempt event. V4 queue initialization copies old hard
 components but ignores old global timeout retirements because those did not
 identify a solver profile.
 
-This Phase 4 sub-step attaches the attempt UUID, selected solver
-identity/configuration, source path, budget, start time, elapsed wall time,
-and typed outcome summary to a result only when that invocation wins result
-arbitration. For equal status and tile count, a stronger certified lower bound
-wins; the existing optimal-first and lower-tile-count ordering remains
-unchanged. Profile-specific work queues and timeout keys are a separate
-follow-on sub-step and are not claimed as complete here.
+Phase 4 adds the winning attempt UUID, selected solver identity/configuration,
+source path, budget, start time, elapsed wall time, and typed outcome summary
+to a best-result row only when that invocation wins result arbitration. For
+equal status and tile count, a stronger certified lower bound wins; the
+optimal-first and lower-tile-count ordering remains unchanged.
+
+Phase 4 also makes pending and timeout scheduling solver-profile-specific.
+Each profile fingerprint covers backend identity/configuration and the full
+budget policy (wall-time limit, native effort value/unit or explicit
+not-requested disposition, and policy ID). A new profile is seeded from the
+global hard index without inheriting another profile's timeout. A strictly
+better non-optimal result requeues only its originating profile; an optimum
+clears work across all registered profiles. Detailed queue semantics and
+legacy migration rules are recorded in
+transformers/stencil_cover_concurrency.md.
 
 The best-result row remains global to the instance/family, independent of
 backend and budget. Provenance belongs to the attempt that produced that
@@ -481,8 +504,10 @@ abandoned pending entries with XAUTOCLAIM, and offers `--spool-only` and
 `--once` modes. An attempt whose instance sighting has not yet materialized
 remains pending rather than violating the instance foreign key.
 
-The normalized database and ingestion CLI are installed. Phase 4 has begun:
-v4 result rows carry winning-attempt provenance and read through legacy v3
-rows as `legacy_unknown`. Profile-specific work queues/timeouts and
-query/analysis tooling remain subsequent work. No gomecsolver integration or
-OR-Tools integration is part of Phases 1–4.
+The normalized database and ingestion CLI are installed. Phase 4 is
+implemented: v4 result rows carry winning-attempt provenance, legacy v3
+results are read through as `legacy_unknown`, and pending/timeout queues are
+scoped by solver-profile fingerprint while the best-result row remains
+global. Operational verification and latency measurement belong to Phase 5;
+corpus query/analysis tooling remains future work. No gomecsolver integration
+or OR-Tools integration is part of Phases 1–5.

@@ -58,8 +58,9 @@ as the existing shape, family, and foreground time budget. Invalid backend
 placement witnesses normalize to error outcomes; the singleton fallback is
 marked distinctly and cannot be cached as a proven or feasible solver cover. Redis continues to
 store one global best result per canonical problem/family, independent of
-backend and budget. The work queue is still the legacy global pending/timeout
-index in this phase; solver-profile-aware queue migration remains Phase 4.
+backend and budget. Work scheduling shares a global hard-component index but
+uses separate pending and timeout state for each complete SolverWorkProfile;
+the profile-aware semantics are described under Redis indexes below.
 
 Programmatic composition can inject a backend through
 `stencil_cover_enricher(link, solver_backend=...)` or
@@ -377,24 +378,140 @@ but it is never the source used to arbitrate persistent writes.
 - **Worker and foreground both store results:** Redis arbitrates the best row;
   cache invalidation informs the other proxy processes.
 
-## Corpus event capture (Phase 2)
+## Operational persistence and recovery (Phase 5)
 
-Corpus capture is opt-in via `KATAPROXY_STENCIL_CORPUS_ENABLED=1`. A
-foreground component sighting is emitted after canonicalization and before
-the local LRU or Redis result lookup, so cache hits remain observable without
-creating synthetic solver attempts. Bulk discoveries emit a `bulk` sighting;
-the shared runtime emits one corresponding `solver_attempt` per actual
-backend invocation, tagged with the source path and the actual wall budget.
+### Redis persistence and stream retention
 
-The publisher sends the immutable v1 JSON bytes to Redis Stream
-`kataproxy:stencil-cover:corpus:events:v1` in DB 7 without trimming. If Redis
-is unavailable, the same bytes are persisted idempotently in SQLite
-(`KATAPROXY_STENCIL_CORPUS_DB`, default under
-`~/.local/state/kataproxy/`, WAL, `synchronous=FULL`). Duplicate event IDs
-with different bytes are treated as conflicts. If both persistence paths
-fail, a CRITICAL diagnostic is logged but solver and response handling
-continue. The stream consumer and normalized research-corpus materializer are
-not included in this phase.
+The corpus stream is in logical Redis DB 7, but Redis Open Source persistence
+is configured for the Redis server/process, not independently for DB 7.
+The same AOF policy therefore applies to every logical database on that
+server. A Redis Stream is not disk durability by itself.
+
+For deployments that expect events to survive a Redis restart, enable AOF
+and put the Redis persistence directory on storage that survives container
+or host replacement. The recommended throughput/durability baseline is:
+
+~~~text
+appendonly yes
+appendfsync everysec
+~~~
+
+With appendfsync everysec, Redis fsyncs in the background about once per
+second. Redis documents that a disaster can lose about one second of writes
+under this policy. Treat that as an expected loss window, not a hard
+guarantee: actual results also depend on the kernel, filesystem, storage
+controller, volume and failure mode. appendfsync always waits for fsync
+before replying to a write and offers a smaller Redis-side loss window at
+substantial write-latency cost (Redis can group writes). appendfsync no
+delegates flushing to the operating system and is not appropriate when this
+corpus is expected to survive failures. RDB snapshots alone are not an
+equivalent replacement for AOF because a crash can discard writes made
+after the most recent snapshot.
+
+The publisher returns after Redis accepts XADD; with everysec, that does
+not mean the just-accepted event has already been fsynced. The publisher uses
+its local SQLite spool only when Redis publication fails. It does not also
+spool a second copy after a successful XADD. Therefore a Redis process/host
+failure inside the AOF fsync window can lose the latest accepted events
+without a corresponding local-spool copy. Choose appendfsync always only
+when that additional write latency is acceptable, or explicitly accept and
+monitor the everysec risk. A persistent volume, backups and tested Redis
+recovery remain deployment responsibilities.
+
+The stream is written without MAXLEN trimming. XACK removes an entry from
+the consumer group's Pending Entries List; it does not delete the stream
+entry itself. The current implementation does not trim materialized entries,
+so monitor stream length, AOF growth and disk capacity. Do not add external
+XTRIM/deletion until retention is designed to preserve all unmaterialized
+and pending events.
+
+References: [Redis Open Source persistence and AOF fsync policies](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/),
+[Redis XACK semantics](https://redis.io/docs/latest/commands/xack/),
+and [Redis XAUTOCLAIM availability](https://redis.io/docs/latest/commands/xautoclaim/).
+
+### SQLite spool location and failure semantics
+
+KATAPROXY_STENCIL_CORPUS_DB selects the SQLite database used by both the
+raw fallback spool and normalized corpus. If unset, the path is
+$XDG_STATE_HOME/kataproxy/stencil-cover-corpus.sqlite3, or
+~/.local/state/kataproxy/stencil-cover-corpus.sqlite3 when XDG_STATE_HOME
+is unset. The spool and normalized tables share that file. The spool uses WAL
+and synchronous=FULL; the normalized store also enables foreign keys and
+synchronous=FULL.
+
+The fallback spool is local to the host and filesystem on which the proxy
+process runs. A materializer draining that spool must use the same database
+path on that same host (or a deliberately shared filesystem with SQLite-safe
+locking). If KATAPROXY_STENCIL_CORPUS_DB was set for the proxy, pass the same
+value to the materializer or use --database. The spool contains the exact
+canonical v1 event bytes, keyed by event ID. It is not a second event format.
+After successful ingestion, deleting the spool row and writing the normalized
+receipt happen in one SQLite transaction.
+
+If Redis publication fails, the publisher appends the event to this spool.
+If both Redis and the spool fail, it logs a CRITICAL message with the event ID
+and both errors. Corpus capture is best-effort with respect to request
+delivery: that failure does not suppress the KataGo analysis response, but
+the event cannot be claimed as durable and requires operator attention.
+
+### Materializer commands
+
+The materializer is ingest-only: it never starts a solver or runs a bulk
+search. Install the project (for example, pip install -e .) and use:
+
+~~~sh
+# Continuously ingest local spool batches and Redis Stream batches.
+kataproxy-stencil-corpus-materializer
+
+# One pass: at most one batch from the local spool and one batch from Redis.
+kataproxy-stencil-corpus-materializer --once
+
+# Continuously drain only this host's local SQLite spool; do not connect to Redis.
+kataproxy-stencil-corpus-materializer --spool-only
+
+# One local-spool batch only, then exit.
+kataproxy-stencil-corpus-materializer --spool-only --once
+
+# Equivalent module invocation, with an explicit database path.
+python -m transformers.stencil_corpus_materializer \
+  --database /path/to/stencil-cover-corpus.sqlite3 --once
+~~~
+
+The CLI defaults to batches of 100 events per source. --once means one
+bounded pass, not “drain the entire backlog”; run it repeatedly or omit
+--once to keep draining. --batch-size raises the per-source batch limit.
+--spool-only intentionally does not connect to Redis and can therefore
+materialize only the local spool file selected by --database or
+KATAPROXY_STENCIL_CORPUS_DB.
+
+After interruption, restart the same normal command with the same database
+path and Redis DB. The consumer group starts at stream ID 0-0 when first
+created so existing entries are visible. The materializer checks abandoned
+pending entries with XAUTOCLAIM before reading new entries; by default it
+claims entries that have been idle for at least 60,000 ms. SQLite commits
+before XACK, so a crash between those operations is recovered by replay:
+the event receipt and payload hash make the second ingestion idempotent.
+An attempt whose sighting has not yet been ingested remains pending rather
+than violating the SQLite foreign key.
+
+Redis 6.2 or newer is required for XAUTOCLAIM. Keep the stream untrimmed
+until a separately reviewed retention policy accounts for every consumer
+group and every unmaterialized event.
+
+### Foreground independence and worker constraints
+
+The proxy does not depend on the materializer being online. With corpus
+capture enabled, foreground events accumulate in the Redis Stream while the
+materializer is stopped, provided Redis persistence is configured as above.
+When Redis publication fails, the proxy uses its local SQLite spool. Restart
+the materializer later to ingest both available sources. The optional
+kataproxy-stencil-bulk-solver is a separate solver-improvement process; it
+does not perform corpus ingestion.
+
+Continue to run only one bulk solver worker for this namespace. It processes
+its selected solver-profile queue sequentially and has no claim/lease protocol.
+The materializer's consumer-group recovery does not grant the bulk solver
+permission to run multiple workers.
 
 ## Review invariants
 
@@ -415,14 +532,15 @@ A reviewer can use these invariants when changing this subsystem:
    disjoint exact cover of the canonical component.
 6. **The LRU is disposable.** Redis is authoritative. Cache invalidation must
    not require Redis work on an ordinary local-LRU hit.
-7. **Do not retry hard instances in a tight loop.** A non-optimal bulk attempt
-   is retired durably and only requeued after a better result.
+7. **Retire work by solver profile.** A non-optimal bulk attempt is retired
+   for its exact backend/configuration/budget profile. It must not suppress
+   an untried profile.
 8. **One bulk worker at a time.** Adding concurrent workers requires an
    explicit claim/lease protocol, expiry and crash recovery, and tests for
    lease races; the Redis result arbitration alone is not a work-claim system.
 
 
-## Solver-profile-scoped work queues (Phase 4 follow-up)
+## Solver-profile-scoped work queues (Phase 4)
 
 The v4 best-result row remains global to the canonical component and stencil
 family. Solver work scheduling is separate and is keyed by a versioned
