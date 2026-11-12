@@ -1585,7 +1585,23 @@ async def _main() -> None:
         # instance per session because middleware holds per-query state.
         middleware_factory=_make_middleware,
     )
+    from transformers.stencil_corpus_publisher import corpus_events_enabled
+    from transformers.stencil_corpus_supervisor import (
+        StencilCorpusMaterializerSupervisor,
+    )
+
+    corpus_supervisor: StencilCorpusMaterializerSupervisor | None = None
+    if corpus_events_enabled():
+        corpus_supervisor = StencilCorpusMaterializerSupervisor()
+    else:
+        _log.info(
+            Event.DIAGNOSTIC,
+            msg="stencil corpus capture is disabled by KATAPROXY_STENCIL_CORPUS_ENABLED",
+        )
+
     try:
+        if corpus_supervisor is not None:
+            await corpus_supervisor.start()
         await server.start()
     except (KeyboardInterrupt, asyncio.CancelledError):
         _log.info(
@@ -1593,7 +1609,11 @@ async def _main() -> None:
             msg="shutting down",
         )
     finally:
-        await server.stop()
+        try:
+            await server.stop()
+        finally:
+            if corpus_supervisor is not None:
+                await corpus_supervisor.stop()
 
 
 def main() -> None:
