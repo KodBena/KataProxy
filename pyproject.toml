@@ -44,6 +44,7 @@ dev = [
 [project.scripts]
 kataproxy = "proxy_server:main"
 kataproxy-stencil-bulk-solver = "transformers.stencil_bulk_solver:main"
+kataproxy-stencil-corpus-materializer = "transformers.stencil_corpus_materializer:main"
 
 [project.urls]
 Repository = "https://github.com/KodBena/kataproxy"

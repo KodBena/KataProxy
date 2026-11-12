@@ -237,9 +237,22 @@ When enabled, events are written to the Redis Stream
 the exact event bytes are appended to a local SQLite spool (default:
 `$XDG_STATE_HOME/kataproxy/stencil-cover-corpus.sqlite3`, or
 `~/.local/state/kataproxy/stencil-cover-corpus.sqlite3`). Configure Redis
-AOF and persistent storage for stream durability. The SQLite spool is a
-transport fallback; normalized corpus materialization and query tooling are
-not included yet.
+AOF and persistent storage for stream durability.
+
+Run the separate materializer to populate the normalized SQLite corpus:
+
+```sh
+kataproxy-stencil-corpus-materializer
+```
+
+Use `--once` to process one batch and exit, or `--spool-only --once` to
+ingest a local outage spool without connecting to Redis. The materializer
+creates the consumer group `stencil-corpus-materializer-v1`, reclaims
+abandoned pending entries, commits each event to SQLite before acknowledging
+the Redis entry, and safely deduplicates a replay after a crash. The Redis
+server needs XAUTOCLAIM support (Redis 6.2 or newer). The spool and normalized
+tables share the same SQLite file; a v1 raw spool is backed up and migrated to
+schema version 2 automatically. Query/analysis tooling is not included yet.
 
 ---
 

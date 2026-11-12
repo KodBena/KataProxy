@@ -310,3 +310,36 @@ def test_each_instance_sighting_updates_global_and_path_aggregates() -> None:
                 "ORDER BY producer_path"
             ).fetchall()
             assert paths == [("bulk", 1), ("foreground", 1)]
+
+
+
+def test_spool_row_changed_after_read_is_not_deleted_or_materialized() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "corpus.sqlite3"
+        spool = SQLiteEventSpool(path)
+        store = SQLiteCorpusStore(path)
+        first = _instance_event()
+        payload = serialize_event(first)
+        assert spool.append(payload) is True
+        item = store.pending_spool_events()[0]
+
+        conflicting = copy.deepcopy(first)
+        conflicting["emitted_at_utc"] = "2026-11-12T10:15:32.000000Z"
+        conflicting_payload = serialize_event(conflicting)
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE stencil_corpus_spool_events "
+                "SET event_json = ?, payload_sha256 = ? WHERE event_id = ?",
+                (
+                    conflicting_payload,
+                    hashlib.sha256(conflicting_payload).hexdigest(),
+                    item.event_id,
+                ),
+            )
+
+        with pytest.raises(CorpusStoreConflict, match="changed after it was read"):
+            store.ingest_spool_event(item)
+        assert store.counts()["spool_pending"] == 1
+        assert store.counts()["receipts"] == 0

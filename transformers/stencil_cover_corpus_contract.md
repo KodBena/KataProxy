@@ -1,13 +1,11 @@
 # Stencil-cover solver and corpus contracts (Phase 0–2)
 
-**Status:** Phase 0 contracts remain frozen. Phase 1 has extracted the default
-HiGHS adapter, routed foreground/background solving through the shared solver
-port, and added fake-backend substitution coverage. Phase 2 now implements the
-strict v1 corpus event envelope, canonical JSON serialization, and validation.
-Foreground and bulk producers now emit sightings and actual-attempt events
-through an opt-in Redis Streams publisher with an idempotent SQLite raw-event
-spool fallback. SQLite corpus materialization and analysis/consumer tooling
-remain subsequent steps.
+**Status:** Phases 0–2 are implemented: the solver port and HiGHS adapter,
+strict v1 corpus events, and opt-in foreground/bulk publishers with a raw
+SQLite outage spool. Phase 3 now materializes Redis Stream and spool events
+into the normalized SQLite v2 corpus with replay-safe receipts and
+commit-before-XACK processing. Research query/analysis tooling and later Redis
+profile-aware queue changes remain future work.
 
 This document is the design contract for the next stencil-cover iteration.
 The typed solver port lives in `transformers/stencil_solver_api.py`; this
@@ -285,7 +283,7 @@ diagnostic including `event_id` and the persistence errors, while allowing
 the original KataGo analysis response to proceed. A failed corpus write must
 not corrupt or block best-result cache arbitration.
 
-## 4. SQLite corpus schema proposal
+## 4. SQLite corpus schema
 
 The SQLite database is a durable research archive, not a runtime answer
 cache. Use `PRAGMA user_version` as the schema version. Migrations are
@@ -299,7 +297,12 @@ local durable fallback/archive unless a measured operational decision
 documents another durability trade-off. This follows the migration
 discipline in `gomecsolver/hard_region_hunt/hunt_store.py`.
 
-The following is the proposed logical schema; it is not installed in Phase 0.
+The logical schema below is implemented by `SQLiteCorpusStore` at
+`PRAGMA user_version = 2`. The v1 raw-event spool table is retained in the
+same database so fallback event bytes can be materialized locally. The
+normalized event receipt also stores `payload_sha256`, allowing a replayed
+UUID with different immutable bytes to be rejected rather than silently
+treated as an idempotent duplicate.
 
 ### `instances`
 
@@ -387,7 +390,9 @@ Indexes:
 
 - `event_id TEXT PRIMARY KEY`;
 - `event_type TEXT NOT NULL`, `schema_version TEXT NOT NULL`;
-- `emitted_at_utc TEXT NOT NULL`, `ingested_at_utc TEXT NOT NULL`.
+- `emitted_at_utc TEXT NOT NULL`, `ingested_at_utc TEXT NOT NULL`;
+- `payload_sha256 TEXT NOT NULL`: SHA-256 of the exact canonical event bytes,
+  used to distinguish an identical replay from a conflicting UUID reuse.
 
 Receipt, sighting aggregate and attempt insertions happen in one transaction.
 This makes replay idempotent for both sightings and attempts, including a
@@ -449,22 +454,25 @@ solver interface, and added fake-backend substitution tests.
 
 Phase 2 implements the transport-neutral event envelope and strict validator
 in `transformers/stencil_corpus_events.py`, and the best-effort publisher in
-`transformers/stencil_corpus_publisher.py`. It pins UUID, UTC timestamp,
-canonical instance identity, solver identity, budget units, outcome
-dispositions, placement payload codec, and canonical JSON rules. Foreground
-and bulk sightings occur before their result-cache/attempt work; actual
-foreground and bulk solver invocations publish separate attempt events. Redis Stream
-entries have no producer-side trimming policy. When Redis is unavailable, the
-publisher writes the same canonical bytes to an append-only SQLite spool
-(`user_version=1`, WAL, `synchronous=FULL`, event-ID idempotency and
-immutable-payload conflict detection). Corpus capture is opt-in via
-`KATAPROXY_STENCIL_CORPUS_ENABLED=1`; its spool path can be set with
-`KATAPROXY_STENCIL_CORPUS_DB`.
+`transformers/stencil_corpus_publisher.py`. Foreground and bulk sightings
+occur before result-cache/attempt work; actual foreground and bulk invocations
+publish attempt events. Redis Stream entries have no producer-side trimming
+policy. On Redis failure, the same canonical bytes are appended to the local
+SQLite raw-event spool. Capture remains opt-in.
 
-The SQLite spool is a raw transport fallback, not yet the normalized corpus
-database described in §4. This phase intentionally does not create the Redis
-consumer group, materialize events into `instances`/`solver_attempts`, or
-provide the analysis/ingest CLI. Those are the next delivery boundary.
+Phase 3 installs `SQLiteCorpusStore` and
+`StencilCorpusMaterializer`. The raw spool and normalized corpus share a
+single SQLite file, migrated one version at a time to user_version 2 with a
+consistent backup before each existing-database migration, WAL, foreign keys,
+and `synchronous=FULL`. Receipts, instance sightings, solver identities and
+attempt rows are inserted in one transaction. Redis events are XACKed only
+after commit; duplicate deliveries are checked by event ID and payload hash.
+The materializer drains the local raw spool before stream messages, reclaims
+abandoned pending entries with XAUTOCLAIM, and offers `--spool-only` and
+`--once` modes. An attempt whose instance sighting has not yet materialized
+remains pending rather than violating the instance foreign key.
 
-No Redis result namespace/schema migration, profile-aware queue migration,
-gomecsolver integration, or OR-Tools integration is part of Phases 1–2.
+The normalized database and ingestion CLI are now installed. Query/analysis
+tooling is a later phase. No Redis result namespace/schema migration,
+profile-aware queue migration, gomecsolver integration, or OR-Tools
+integration is part of Phases 1–3.

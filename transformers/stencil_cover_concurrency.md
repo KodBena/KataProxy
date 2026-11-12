@@ -66,12 +66,12 @@ Programmatic composition can inject a backend through
 `StencilBulkSolver(..., solver_backend=...)`. No gomecsolver or OR-Tools
 dependency is added by this phase.
 
-## Corpus event capture (Phase 2)
+## Corpus event capture and materialization (Phases 2–3)
 
 Corpus capture is opt-in. Set `KATAPROXY_STENCIL_CORPUS_ENABLED=1` to
 publish events; set `KATAPROXY_STENCIL_CORPUS_DB` to choose the SQLite
-fallback path. Without the enable flag, the normal solver path performs no
-corpus transport or filesystem I/O.
+database/spool path. Without the enable flag, the normal solver path performs
+no corpus transport or filesystem I/O.
 
 For each foreground component, the producer emits `instance_seen` before
 consulting the process-local LRU or shared Redis result cache. A cache hit
@@ -81,17 +81,28 @@ runtime emits exactly one `solver_attempt` envelope per actual backend
 invocation, preserving the backend-reported outcome separately from the
 normalized result used by KataProxy.
 
-The publisher writes the canonical v1 event bytes to the untrimmed Redis
-Stream `kataproxy:stencil-cover:corpus:events:v1`. If Redis publication fails,
-it appends those exact bytes to a local SQLite spool with event-ID
-idempotency. The spool uses WAL and `synchronous=FULL`; a repeated event ID
-with different bytes is an immutable-event conflict. If both persistence
-paths fail, the publisher logs a CRITICAL diagnostic and continues the
-analysis/worker path. Redis Stream durability still depends on the Redis
-server's persistence and volume configuration.
+The publisher writes canonical v1 event bytes to the untrimmed Redis Stream
+`kataproxy:stencil-cover:corpus:events:v1`. If Redis publication fails, it
+appends those exact bytes to a local SQLite spool with event-ID idempotency.
+The spool uses WAL and `synchronous=FULL`; a repeated event ID with different
+bytes is an immutable-event conflict. If both persistence paths fail, the
+publisher logs a CRITICAL diagnostic and continues the analysis/worker path.
 
-This is a raw event spool only. A consumer group and materializer that turn
-these events into the normalized SQLite corpus are not part of this phase.
+The separate `kataproxy-stencil-corpus-materializer` command drains the local
+spool first, then claims abandoned Redis pending entries and reads new stream
+entries. It stores a receipt, sighting aggregate and (for attempts) solver
+identity/attempt in one SQLite transaction, commits, and only then XACKs the
+stream message. Replayed entries are idempotent by event UUID and payload
+SHA-256. An attempt whose instance sighting is not yet present stays pending;
+invalid stream entries stay unacknowledged for operator investigation. Use
+`--spool-only --once` to drain a local spool without connecting to Redis.
+The Redis server must support XAUTOCLAIM (Redis 6.2 or newer).
+
+The spool and normalized tables share a single SQLite file at
+`KATAPROXY_STENCIL_CORPUS_DB` (or the default XDG state path). A v1 spool is
+backed up and migrated to schema version 2 automatically. The v2 normalized
+tables are the durable archive; the raw spool table is only a transport
+fallback and can be empty after materialization.
 
 ## Why the queue is in Redis, not a multiprocessing.Queue
 

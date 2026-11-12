@@ -131,7 +131,10 @@ class SQLiteCorpusStore:
             CREATE TABLE IF NOT EXISTS stencil_corpus_spool_events (
                 event_id TEXT PRIMARY KEY,
                 event_json BLOB NOT NULL,
-                payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+                payload_sha256 TEXT NOT NULL CHECK(
+                    length(payload_sha256) = 64
+                    AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
                 queued_at_utc TEXT NOT NULL
             )
             """
@@ -394,11 +397,23 @@ class SQLiteCorpusStore:
             raise TypeError("event ingestion requires canonical UTF-8 bytes")
         event_id = event["event_id"]
         digest = hashlib.sha256(payload).hexdigest()
+        spool_row: tuple[Any, Any] | None = None
         if spool_event_id is not None:
             if spool_event_id != event_id:
                 raise CorpusStoreConflict("spool row event_id disagrees with its event payload")
             if spool_sha256 != digest:
                 raise CorpusStoreConflict("spool row checksum disagrees with event payload")
+            raw_spool_row = connection.execute(
+                "SELECT event_json, payload_sha256 FROM stencil_corpus_spool_events "
+                "WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if raw_spool_row is not None:
+                spool_row = (bytes(raw_spool_row[0]), str(raw_spool_row[1]))
+                if spool_row != (payload, digest):
+                    raise CorpusStoreConflict(
+                        f"spool row {event_id} changed after it was read"
+                    )
 
         existing = connection.execute(
             "SELECT payload_sha256, event_type FROM corpus_event_receipts "
@@ -410,12 +425,21 @@ class SQLiteCorpusStore:
                 raise CorpusStoreConflict(
                     f"event_id {event_id} was replayed with different immutable bytes"
                 )
-            if spool_event_id is not None:
-                connection.execute(
-                    f"DELETE FROM {_SPOOL_TABLE} WHERE event_id = ?",
-                    (event_id,),
+            if spool_event_id is not None and spool_row is not None:
+                deleted = connection.execute(
+                    f"DELETE FROM {_SPOOL_TABLE} WHERE event_id = ? AND payload_sha256 = ?",
+                    (event_id, digest),
                 )
+                if deleted.rowcount != 1:
+                    raise CorpusStoreConflict(
+                        f"spool row {event_id} changed during duplicate-event cleanup"
+                    )
             return IngestResult(False, event_id, str(existing[1]))
+
+        if spool_event_id is not None and spool_row is None:
+            raise CorpusStoreConflict(
+                f"spool row {event_id} disappeared before its event was materialized"
+            )
 
         instance = event["instance"]
         instance_id, canonical_key, width, height, cell_count = _decode_instance(event)
@@ -460,10 +484,14 @@ class SQLiteCorpusStore:
             self._ingest_solver_attempt(connection, event, instance_id)
 
         if spool_event_id is not None:
-            connection.execute(
-                f"DELETE FROM {_SPOOL_TABLE} WHERE event_id = ?",
-                (event_id,),
+            deleted = connection.execute(
+                f"DELETE FROM {_SPOOL_TABLE} WHERE event_id = ? AND payload_sha256 = ?",
+                (event_id, digest),
             )
+            if deleted.rowcount != 1:
+                raise CorpusStoreConflict(
+                    f"spool row {event_id} changed before transactional removal"
+                )
         return IngestResult(True, event_id, event["event_type"])
 
     @staticmethod
