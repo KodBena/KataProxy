@@ -38,7 +38,9 @@ from transformers.stencil_cache_storage import (
     redis_persistent_cache,
     register_cache_invalidator,
 )
-from transformers.stencil_solver_api import NoNativeEffortLimit, SolverBackend, SolverBudget
+from transformers.stencil_solver_api import (
+    NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
+)
 from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_solver_geometry import (
     D4_INVERSE as _D4_INVERSE,
@@ -679,9 +681,10 @@ def _solve_component_uncached(
             policy_id=f"foreground-{int(time_limit_ms)}ms",
         ),
     )
-    if execution.outcome.status.value == "error":
+    # The shared runtime converts adapter exceptions to a typed error outcome.
+    if execution.outcome.status is OutcomeStatus.ERROR:
         error = execution.outcome.error
-        message = error.message if hasattr(error, "message") else "backend invocation failed"
+        message = error.message if isinstance(error, SolverFailure) else "backend invocation failed"
         logger.error(
             "Stencil solver backend %s failed: %s",
             execution.identity.fingerprint,

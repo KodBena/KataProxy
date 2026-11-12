@@ -365,23 +365,26 @@ class SolverOutcome:
         if not isinstance(metrics, dict):
             raise ValueError("backend metrics must be a JSON object")
 
-        has_incumbent = isinstance(self.incumbent, Incumbent)
-        has_error = isinstance(self.error, SolverFailure)
         if self.status is OutcomeStatus.OPTIMAL:
-            if not has_incumbent or has_error:
+            if not isinstance(self.incumbent, Incumbent) or isinstance(self.error, SolverFailure):
                 raise ValueError("optimal outcome requires an incumbent and no error")
             if not isinstance(self.lower_bound, ProvenLowerBound):
                 raise ValueError("optimal outcome requires a proven lower bound")
             if self.lower_bound.value != self.incumbent.tile_count:
                 raise ValueError("optimal outcome requires lower_bound == incumbent objective")
         elif self.status is OutcomeStatus.FEASIBLE:
-            if not has_incumbent or has_error:
+            if not isinstance(self.incumbent, Incumbent) or isinstance(self.error, SolverFailure):
                 raise ValueError("feasible outcome requires an incumbent and no error")
+            if (
+                isinstance(self.lower_bound, ProvenLowerBound)
+                and self.lower_bound.value > self.incumbent.tile_count
+            ):
+                raise ValueError("feasible outcome lower bound exceeds incumbent objective")
         elif self.status is OutcomeStatus.NO_INCUMBENT:
-            if has_incumbent or has_error:
+            if not isinstance(self.incumbent, NoIncumbent) or isinstance(self.error, SolverFailure):
                 raise ValueError("no_incumbent outcome requires no incumbent and no error")
         elif self.status is OutcomeStatus.ERROR:
-            if has_incumbent or not has_error:
+            if not isinstance(self.incumbent, NoIncumbent) or not isinstance(self.error, SolverFailure):
                 raise ValueError("error outcome requires a failure and no incumbent")
 
     @property

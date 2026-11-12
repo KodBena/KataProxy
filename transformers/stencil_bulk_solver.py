@@ -30,7 +30,7 @@ from transformers.stencil_cover_enricher import (
     _verify_component_placements,
 )
 from transformers.stencil_solver_api import (
-    NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget,
+    NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
 )
 from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_solver_runtime import solve_component
@@ -118,7 +118,7 @@ class StencilBulkSolver:
         )
         if execution.outcome.status is OutcomeStatus.ERROR:
             error = execution.outcome.error
-            message = error.message if hasattr(error, "message") else "backend invocation failed"
+            message = error.message if isinstance(error, SolverFailure) else "backend invocation failed"
             raise RuntimeError(f"bulk solver backend failed: {message}")
         result = _validate_bulk_result(
             shape_key, self.family, execution.cache_result,

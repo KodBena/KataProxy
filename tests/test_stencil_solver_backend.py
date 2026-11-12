@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, cast
 
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_bulk_solver import StencilBulkSolver
@@ -21,6 +21,7 @@ from transformers.stencil_solver_api import (
     SolverOutcome,
 )
 from transformers.stencil_solver_runtime import solve_component
+from transformers.stencil_cache_storage import RedisStencilStore
 from transformers.stencil_solver_factory import (
     create_solver_backend, register_solver_backend,
 )
@@ -165,7 +166,7 @@ def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
     )
     store = _MemoryStore((False, 2, fallback))
     backend = _FakeOptimalBackend()
-    worker = StencilBulkSolver(store, family=family, solver_backend=backend)
+    worker = StencilBulkSolver(cast(RedisStencilStore, store), family=family, solver_backend=backend)
 
     assert worker.process_component(_domino_key()) == "optimal"
     assert store.result[0:2] == (True, 0)
@@ -173,6 +174,30 @@ def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
     _problem, budget = backend.calls[0]
     assert budget.wall_time_limit_ms == 10_000
     assert budget.policy_id == "bulk-10000ms"
+
+
+
+def test_feasible_outcome_rejects_a_lower_bound_above_its_incumbent() -> None:
+    import pytest
+    incumbent = Incumbent(
+        tile_count=2,
+        placement_witness=PlacementWitness((
+            ("1x2", ((0, 0), (0, 1))),
+            ("1x2", ((1, 0), (1, 1))),
+        )),
+    )
+    with pytest.raises(ValueError, match="lower bound exceeds incumbent"):
+        SolverOutcome(
+            status=OutcomeStatus.FEASIBLE,
+            incumbent=incumbent,
+            lower_bound=ProvenLowerBound(3),
+            native_effort=NativeEffortUnavailable(
+                NoNativeEffortReason.BACKEND_DOES_NOT_EXPOSE_EFFORT,
+            ),
+            backend_status=BackendStatusReported("FAKE_FEASIBLE"),
+            backend_metrics_json="{}",
+            error=NoSolverFailure(),
+        )
 
 
 def test_local_lru_keeps_different_backend_profiles_separate() -> None:
