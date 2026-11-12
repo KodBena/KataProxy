@@ -6,6 +6,7 @@ from typing import Any
 
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_bulk_solver import StencilBulkSolver
+from transformers import stencil_bulk_solver as bulk_module
 from transformers.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
@@ -332,3 +333,69 @@ def test_invalid_backend_witness_is_rejected_and_not_cached_as_optimal() -> None
     assert execution.outcome.optimality_proven is False
     assert execution.cache_result[0:2] == (False, 2)
     assert execution.fallback_used is True
+
+
+def test_bulk_attempt_records_a_bulk_sighting_before_solving(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "false")
+    family = _domino_family()
+    fallback = stencil._encode_cached_placements(
+        [("1x1", (0,)), ("1x1", (1,))], family,
+    )
+    store = _MemoryStore((False, 2, fallback))
+    backend = _FakeOptimalBackend()
+    sightings: list[tuple[bytes, str]] = []
+
+    def record_sighting(
+        shape_key: bytes, seen_family: Any, producer_path: str,
+    ) -> None:
+        assert tuple(seen_family) == family
+        sightings.append((shape_key, producer_path))
+
+    monkeypatch.setattr(bulk_module, "publish_instance_seen", record_sighting)
+    worker = StencilBulkSolver(store, family=family, solver_backend=backend)
+
+    assert worker.process_component(_domino_key()) == "optimal"
+    assert sightings == [(_domino_key(), "bulk")]
+
+
+def test_bulk_sighting_precedes_timeout_and_result_cache_returns(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "false")
+    family = _domino_family()
+    optimal = stencil._encode_cached_placements([("1x2", (0, 1))], family)
+    store = _MemoryStore((True, 0, optimal))
+    order: list[str] = []
+
+    def record_sighting(
+        shape_key: bytes, seen_family: Any, producer_path: str,
+    ) -> None:
+        assert shape_key == _domino_key()
+        assert tuple(seen_family) == family
+        assert producer_path == "bulk"
+        order.append("sighting")
+
+    original_timeout = store.timeout_metadata
+    original_result = store.get_result
+
+    def timeout_lookup(shape_key: bytes, seen_family: Any) -> None:
+        order.append("timeout")
+        return original_timeout(shape_key, seen_family)
+
+    def result_lookup(
+        shape_key: bytes, seen_family: Any,
+    ) -> tuple[bool, int, bytes]:
+        order.append("result")
+        return original_result(shape_key, seen_family)
+
+    monkeypatch.setattr(bulk_module, "publish_instance_seen", record_sighting)
+    monkeypatch.setattr(store, "timeout_metadata", timeout_lookup)
+    monkeypatch.setattr(store, "get_result", result_lookup)
+    backend = _FakeOptimalBackend()
+    worker = StencilBulkSolver(store, family=family, solver_backend=backend)
+
+    assert worker.process_component(_domino_key()) == "optimal"
+    assert order == ["sighting", "timeout", "result"]
+    assert backend.calls == []

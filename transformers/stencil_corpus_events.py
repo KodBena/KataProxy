@@ -570,8 +570,11 @@ def _validate_outcome(
             raise CorpusEventError("placement payload is not valid Base64 JSON") from exc
         if base64.b64encode(raw).decode("ascii") != encoded:
             raise CorpusEventError("placement payload Base64 must be canonical")
-        if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(
-            payload.get("placements"), list,
+        if (
+            not isinstance(payload, dict)
+            or isinstance(payload.get("version"), bool)
+            or payload.get("version") != 1
+            or not isinstance(payload.get("placements"), list)
         ):
             raise CorpusEventError("placement payload has an unsupported structure")
         if len(payload["placements"]) == 0:
@@ -616,6 +619,8 @@ def _validate_outcome(
             and disposition != "rejected_invalid"
         ):
             raise CorpusEventError("an invalid incumbent witness must be marked rejected_invalid")
+        if disposition == "rejected_invalid" and tile_count is None:
+            raise CorpusEventError("rejected placements require a reported incumbent")
     else:
         raise CorpusEventError("unknown placements disposition")
 
@@ -720,4 +725,6 @@ def parse_event(raw: bytes | str) -> _JSON:
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise CorpusEventError("event payload is not valid UTF-8 JSON") from exc
     validate_event(event)
+    if serialize_event(event) != decoded.encode("utf-8"):
+        raise CorpusEventError("event payload must use canonical compact JSON")
     return event

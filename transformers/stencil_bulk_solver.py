@@ -121,6 +121,8 @@ class StencilBulkSolver:
 
     def process_component(self, shape_key: bytes) -> str:
         """Return 'optimal', 'timed_out', or 'already_retired'."""
+        # Record every bulk component visit before timeout/result cache returns.
+        publish_instance_seen(shape_key, self.family, "bulk")
         if self.store.timeout_metadata(shape_key, self.family) is not None:
             return "already_retired"
 
@@ -134,9 +136,6 @@ class StencilBulkSolver:
             return "optimal"
 
         attempted_at = self.clock()
-        # Bulk discovery is also a sighting, regardless of whether the result
-        # is improved; an attempt event is emitted by the shared runtime below.
-        publish_instance_seen(shape_key, self.family, "bulk")
         execution = solve_component(
             self.solver_backend,
             shape_key,
@@ -146,6 +145,7 @@ class StencilBulkSolver:
                 native_effort_limit=NoNativeEffortLimit(),
                 policy_id=f"bulk-{BULK_TIME_LIMIT_MS}ms",
             ),
+            producer_path="bulk",
         )
         if execution.outcome.status is OutcomeStatus.ERROR:
             error = execution.outcome.error

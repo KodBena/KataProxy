@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -60,8 +61,8 @@ class SQLiteEventSpool:
     """Append-only, idempotent local fallback for exact serialized event bytes."""
 
     def __init__(self, path: str | Path, timeout_seconds: float = 2.0) -> None:
-        if timeout_seconds <= 0:
-            raise ValueError("SQLite spool timeout must be positive")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("SQLite spool timeout must be positive and finite")
         self.path = Path(path).expanduser()
         self.timeout_seconds = timeout_seconds
         self._init_lock = threading.Lock()
@@ -97,7 +98,10 @@ class SQLiteEventSpool:
                     )
                 connection.execute("PRAGMA journal_mode = WAL")
                 if existed and version == 0:
-                    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                    stamp = (
+                        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                        + f"-{time.time_ns()}"
+                    )
                     backup_path = self.path.with_name(
                         self.path.name + f".pre-v1-{stamp}.bak"
                     )
@@ -106,19 +110,53 @@ class SQLiteEventSpool:
                         connection.backup(backup)
                     finally:
                         backup.close()
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS stencil_corpus_spool_events (
-                        event_id TEXT PRIMARY KEY,
-                        event_json BLOB NOT NULL,
-                        payload_sha256 TEXT NOT NULL
-                            CHECK(length(payload_sha256) = 64),
-                        queued_at_utc TEXT NOT NULL
+                table_row = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='stencil_corpus_spool_events'"
+                ).fetchone()
+                if version == 1 and table_row is None:
+                    raise RuntimeError(
+                        "SQLite corpus spool declares user_version=1 but its event table is missing"
                     )
-                    """
-                )
                 if version == 0:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS stencil_corpus_spool_events (
+                            event_id TEXT PRIMARY KEY,
+                            event_json BLOB NOT NULL,
+                            payload_sha256 TEXT NOT NULL
+                                CHECK(
+                                    length(payload_sha256) = 64
+                                    AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                                ),
+                            queued_at_utc TEXT NOT NULL
+                        )
+                        """
+                    )
+                    columns = tuple(
+                        row[1] for row in connection.execute(
+                            "PRAGMA table_info(stencil_corpus_spool_events)"
+                        ).fetchall()
+                    )
+                    if columns != (
+                        "event_id", "event_json", "payload_sha256", "queued_at_utc",
+                    ):
+                        raise RuntimeError(
+                            "SQLite corpus spool event table has an unsupported schema"
+                        )
                     connection.execute("PRAGMA user_version = 1")
+                else:
+                    columns = tuple(
+                        row[1] for row in connection.execute(
+                            "PRAGMA table_info(stencil_corpus_spool_events)"
+                        ).fetchall()
+                    )
+                    if columns != (
+                        "event_id", "event_json", "payload_sha256", "queued_at_utc",
+                    ):
+                        raise RuntimeError(
+                            "SQLite corpus spool event table has an unsupported schema"
+                        )
                 connection.commit()
                 self._initialised = True
             finally:
@@ -138,12 +176,12 @@ class SQLiteEventSpool:
         try:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT payload_sha256 FROM stencil_corpus_spool_events "
+                "SELECT payload_sha256, event_json FROM stencil_corpus_spool_events "
                 "WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
             if existing is not None:
-                if existing[0] != digest:
+                if existing[0] != digest or bytes(existing[1]) != payload:
                     raise CorpusEventConflict(
                         f"event_id {event_id} already exists with different bytes"
                     )
