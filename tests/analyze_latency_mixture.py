@@ -52,15 +52,19 @@ import gzip
 import json
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, List, Optional, cast
 
 import numpy as np
 from scipy.stats import ks_2samp, norm
 
+diptest: ModuleType | None
 try:
-    import diptest
+    import diptest as _diptest
 except ImportError:
     diptest = None
+else:
+    diptest = _diptest
 
 try:
     from sklearn.mixture import GaussianMixture
