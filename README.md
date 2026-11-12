@@ -400,3 +400,19 @@ drive the engine's cache actions through the proxy or DIRECTLY, note
 - Upgrade RELAYs before (or together with) any SELECTOR that uses the
   new `|internalName` component — an old RELAY between them silently
   strips the injected model.
+
+
+### Automated stencil corpus validation
+
+The real-Redis integration suite and capture benchmark run together with one
+command:
+
+    make test-stencil-corpus-integration
+
+It starts an isolated temporary Redis server, creates temporary SQLite corpus
+and spool paths, exercises the production proxy/publisher/materializer
+recovery paths, runs the enabled-versus-disabled capture benchmark, and writes
+JSON, JUnit, and diagnostic logs under .artifacts/stencil-corpus/. See
+the [integration workflow documentation](docs/stencil-corpus-integration.md)
+for prerequisites, scenario coverage, report formats, and the current runtime
+lifecycle finding.
