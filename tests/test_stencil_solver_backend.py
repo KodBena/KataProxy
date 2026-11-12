@@ -166,7 +166,7 @@ class _MemoryStore:
 
     def put_result(
         self, _shape_key: bytes, _family: Any, result: tuple[bool, int, bytes],
-        *, provenance: Dict[str, Any] | None = None,
+        *, provenance: dict[str, Any] | None = None,
         work_profile: SolverWorkProfile | None = None,
     ) -> bool:
         self.result = result
