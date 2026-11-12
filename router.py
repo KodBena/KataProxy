@@ -1227,7 +1227,7 @@ class RelayRouter(BackendRouter):
         self._tracker: CompletionTracker[CanonicalId, int] = CompletionTracker()
         # canonical_id → (on_response, on_complete, url)
         self._callbacks: dict[
-            str,
+            CanonicalId,
             tuple[OnResponse, OnComplete, str | SyntheticCallbackOrigin],
         ] = {}
 
@@ -1726,7 +1726,7 @@ class RelayRouter(BackendRouter):
         """
         act_name = wire_dict.get("action", query.action.name.lower())
         members: dict[str, Any] = {}
-        pending: dict[str, str] = {}  # sub_id → url
+        pending: dict[CanonicalId, str] = {}  # sub_id → url
         finalized = False
 
         async def _finalize() -> None:
@@ -1747,8 +1747,10 @@ class RelayRouter(BackendRouter):
             await on_response(canonical_id, aggregate)
             await on_complete(canonical_id)
 
-        def _member_callbacks(sub_id: str, url: str) -> tuple[OnResponse, OnComplete]:
-            async def member_on_response(_sid: str, wire: Dict[str, Any]) -> None:
+        def _member_callbacks(
+            sub_id: CanonicalId, url: str,
+        ) -> tuple[OnResponse, OnComplete]:
+            async def member_on_response(_sid: CanonicalId, wire: WireDict) -> None:
                 members[url] = {k: v for k, v in wire.items() if k != "id"}
 
             async def member_on_complete(_sid: str) -> None:
@@ -1795,7 +1797,7 @@ class RelayRouter(BackendRouter):
                 )
             await _finalize()
 
-        to_send: list[tuple[str, str, Any]] = []  # (sub_id, url, ws)
+        to_send: list[tuple[CanonicalId, str, Any]] = []  # (sub_id, url, ws)
         for i, url in enumerate(self._urls):
             ws = self._connections.get(url)
             if ws is None:
@@ -1804,7 +1806,7 @@ class RelayRouter(BackendRouter):
                     field="action",
                 )
                 continue
-            sub_id = f"{canonical_id}:cv{i}"
+            sub_id = CanonicalId(f"{canonical_id}:cv{i}")
             self._tracker.register_count(sub_id, 1)
             m_resp, m_done = _member_callbacks(sub_id, url)
             self._callbacks[sub_id] = (
@@ -2149,16 +2151,12 @@ class SelectorRouter(BackendRouter):
 
     def __init__(
         self,
-        models: tuple[tuple[str, ...], ...],
+        models: tuple[SelectorModel, ...],
         max_connect_failures: Optional[int] = None,
     ) -> None:
-        # Normalise: accept both legacy (label, url) 2-tuples and
-        # (label, url, engine_model) 3-tuples / SelectorModel entries.
-        # One normalisation site, so everything downstream reads the
-        # typed record instead of positional unpacking.
-        self._models: tuple[SelectorModel, ...] = tuple(
-            SelectorModel(*m) for m in models
-        )
+        # Composition normalises environment tuples into SelectorModel
+        # records before crossing this constructor boundary.
+        self._models = models
         self._max_connect_failures = (
             self._MAX_CONNECT_FAILURES
             if max_connect_failures is None
@@ -2206,7 +2204,7 @@ class SelectorRouter(BackendRouter):
         # the routing record consulted by terminate() to send the
         # cancel to the correct upstream.
         self._callbacks: dict[
-            str,
+            CanonicalId,
             tuple[OnResponse, OnComplete, str | SyntheticCallbackOrigin],
         ] = {}
 
@@ -3154,7 +3152,8 @@ def make_router(
         # var puts the structural difference in configuration space.
         # Empty configuration / duplicate labels raise
         # SelectorStartupError at start() per ADR-0002.
-        return SelectorRouter(models=cfg.SELECTOR_MODELS)
+        models = tuple(SelectorModel(*model) for model in cfg.SELECTOR_MODELS)
+        return SelectorRouter(models=models)
 
     if role_upper == "ECHO":
         return EchoRouter()

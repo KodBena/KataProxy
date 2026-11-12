@@ -717,9 +717,10 @@ def parse_event(raw: bytes | str) -> _JSON:
             decoded = raw
         else:
             raise TypeError("event payload must be bytes or text")
-        event = json.loads(decoded)
+        event_value = json.loads(decoded)
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise CorpusEventError("event payload is not valid UTF-8 JSON") from exc
+    event = _expect_object(event_value, "event")
     validate_event(event)
     if serialize_event(event) != decoded.encode("utf-8"):
         raise CorpusEventError("event payload must use canonical compact JSON")

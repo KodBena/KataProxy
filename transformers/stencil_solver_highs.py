@@ -9,7 +9,7 @@ import hashlib
 import json
 import math
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import highspy
 import numpy as np
@@ -92,7 +92,8 @@ class HiGHSBackend(SolverBackend):
         if any(not columns for columns in point_to_columns.values()):
             raise RuntimeError("stencil family failed to provide singleton feasibility")
 
-        highs = highspy.Highs()
+        highs_constructor = cast(Any, highspy.Highs)
+        highs = highs_constructor()
         highs.setOptionValue("log_to_console", self._log_to_console)
         highs.setOptionValue("time_limit", budget.wall_time_limit_ms / 1000.0)
         variable_count = len(candidates)
@@ -120,6 +121,7 @@ class HiGHSBackend(SolverBackend):
             node_count = float(raw_nodes) if raw_nodes is not None else float("nan")
         except (TypeError, ValueError, OverflowError):
             node_count = float("nan")
+        native_effort: NativeEffortReported | NativeEffortUnavailable
         if math.isfinite(node_count) and node_count >= 0:
             native_value: int | float = (
                 int(node_count) if node_count.is_integer() else node_count
@@ -135,7 +137,9 @@ class HiGHSBackend(SolverBackend):
             "constraint_count": len(problem.occupied_cells),
         }
         raw_bound = getattr(info, "mip_dual_bound", None)
-        lower_bound = LowerBoundUnavailable(NoLowerBoundReason.BACKEND_DID_NOT_REPORT_BOUND)
+        lower_bound: LowerBoundUnavailable | ProvenLowerBound = LowerBoundUnavailable(
+            NoLowerBoundReason.BACKEND_DID_NOT_REPORT_BOUND,
+        )
         try:
             dual_bound = float(raw_bound) if raw_bound is not None else float("nan")
         except (TypeError, ValueError, OverflowError):

@@ -257,11 +257,12 @@ def decode_cached_placements(
         elif stencil_index < len(family):
             canonical_stencil = family[stencil_index][1]
             recovered_shape = normalise_shape(canonical_stencil, inverse)
-            stencil_name = names_by_shape.get(recovered_shape)
-            if stencil_name is None:
+            recovered_name = names_by_shape.get(recovered_shape)
+            if recovered_name is None:
                 raise RuntimeError(
                     "the active family is not closed under the component's recovery transform"
                 )
+            stencil_name = recovered_name
         else:
             raise ValueError("cached stencil index is outside the active family")
 
