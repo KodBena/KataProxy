@@ -48,11 +48,28 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 import numpy as np
+from scipy.stats import ks_2samp, norm
+
+try:
+    import diptest
+except ImportError:
+    diptest = None
+
+try:
+except ImportError:
+    GaussianMixture = None
+
+try:
+except ImportError:
+    plt = None
+    sns = None
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +85,6 @@ def _load(run_dir: Path) -> Dict[str, Any]:
         return cast(Dict[str, Any], json.loads(p.read_text()))
     pgz = run_dir / "summary.json.gz"
     if pgz.exists():
-        import gzip
         with gzip.open(pgz, "rt") as f:
             return cast(Dict[str, Any], json.load(f))
     raise FileNotFoundError(f"neither {p} nor {pgz} found")
@@ -109,7 +125,8 @@ def dip_test(arr: np.ndarray) -> tuple[float, float]:
     Null hypothesis: arr is sampled from a unimodal distribution.
     Small p-value = evidence against unimodality.
     """
-    import diptest  # lazy import; not all callers need this
+    if diptest is None:
+        raise ImportError("dip_test requires the optional 'diptest' package")
     # diptest lacks type stubs; coerce the documented (float, float)
     # return so the function's typed contract holds.
     dip, p = diptest.diptest(arr)
@@ -127,7 +144,8 @@ def fit_gmm_log_space(
 ) -> List[Dict[str, Any]]:
     """Fit GMM in log-latency space for each k; return BIC, AIC, and
     component params per fit. Caller compares BICs across k."""
-    from sklearn.mixture import GaussianMixture
+    if GaussianMixture is None:
+        raise ImportError("GMM fitting requires the optional 'scikit-learn' package")
     log_lats = np.log(lats).reshape(-1, 1)
     results: List[Dict[str, Any]] = []
     for k in k_range:
@@ -192,7 +210,6 @@ def ks_compare(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
 
     Null: a and b are from the same distribution. Small p = different.
     """
-    from scipy.stats import ks_2samp
     stat, p = ks_2samp(a, b)
     return float(stat), float(p)
 
@@ -214,10 +231,9 @@ def render_mixture_chart(
              + GMM(k=3) fit.
     Panel 3: GMM(k=3) component density curves over the full-run histogram.
     """
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from scipy.stats import norm
 
+    if plt is None or sns is None:
+        raise ImportError("chart rendering requires optional 'matplotlib' and 'seaborn' packages")
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.05)
     pal = sns.color_palette("Set2", n_colors=8)
 
@@ -388,5 +404,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())

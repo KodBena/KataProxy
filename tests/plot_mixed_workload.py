@@ -47,12 +47,14 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -95,7 +97,6 @@ def _load(run_dir: Path) -> Dict[str, Any]:
         return cast(Dict[str, Any], json.loads(p.read_text()))
     pgz = run_dir / "summary.json.gz"
     if pgz.exists():
-        import gzip
         with gzip.open(pgz, "rt") as f:
             return cast(Dict[str, Any], json.load(f))
     raise FileNotFoundError(
@@ -268,7 +269,6 @@ def render_headline(summary: Dict[str, Any], out_path: Path) -> None:
 
     # ---- Panel 2: Latency CDF by visit bucket ----
     ax2 = axes[0, 1]
-    from typing import Callable
     BucketPred = Callable[[Dict[str, Any]], bool]
     buckets: List[Tuple[str, BucketPred]] = [
         ("hot (coalesced)", lambda r: bool(r["kind"] == "hot")),
@@ -754,5 +754,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
