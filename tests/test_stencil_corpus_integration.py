@@ -23,6 +23,18 @@ from typing import Any, Iterator
 import pytest
 import redis
 import websockets
+from urllib.parse import urlsplit
+
+_TEST_REDIS_URL = os.environ.get("KATAPROXY_TEST_REDIS_URL")
+if not _TEST_REDIS_URL:
+    pytest.skip(
+        "run make test-stencil-corpus-integration to start isolated Redis",
+        allow_module_level=True,
+    )
+_test_redis = urlsplit(_TEST_REDIS_URL)
+os.environ["KATAPROXY_REDIS_HOST"] = _test_redis.hostname or "127.0.0.1"
+os.environ["KATAPROXY_REDIS_PORT"] = str(_test_redis.port or 6379)
+os.environ["KATAPROXY_REDIS_DB"] = (_test_redis.path.lstrip("/") or "0")
 
 import proxy_server
 import sproxy_config as cfg
