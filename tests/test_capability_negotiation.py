@@ -30,6 +30,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, cast
@@ -51,6 +52,10 @@ from katago import (  # noqa: E402
     TurnIndex,
     translate_query_to_wire,
 )
+from middleware.adaptive_reevaluate import (
+    _build_deeper_query,
+    adaptive_reevaluate,
+)  # noqa: E402
 from middleware.capability_gate import CapabilityGatedMiddleware  # noqa: E402
 from middleware.session_middleware import (  # noqa: E402
     SessionCapabilities,
@@ -502,7 +507,6 @@ class TestAdaptiveReevaluateMetadata:
 
     @staticmethod
     def _make_middleware() -> Any:
-        from middleware.adaptive_reevaluate import adaptive_reevaluate
         # The factory now returns a factory; call () to instantiate.
         return adaptive_reevaluate(
             worst_quantile=0.25,
@@ -537,7 +541,6 @@ class TestAdaptiveReevaluateMetadata:
         c.submitted = []
         c.terminated = []
         c.synthetic_sends = []
-        from middleware.session_middleware import SessionCapabilities
         return c, SessionCapabilities(
             submit_query=c.submit,
             terminate_query=c.terminate,
@@ -573,7 +576,6 @@ class TestAdaptiveReevaluateMetadata:
         the union, with a brief settle so the driver task's push has
         a chance to land before we read.
         """
-        import asyncio
         sc = getattr(m, "_caps", None)
         fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
         pre = len(fake.synthetic_sends) if fake is not None else 0
@@ -588,7 +590,6 @@ class TestAdaptiveReevaluateMetadata:
     @staticmethod
     async def _wait_for_spawn(caps: Any, timeout_s: float = 1.0) -> bool:
         """Poll until caps.submitted has at least one entry."""
-        import asyncio
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             if caps.submitted:
@@ -709,7 +710,6 @@ class TestAdaptiveReevaluateMetadata:
         # _build_deeper_query is now a module-level pure helper
         # (no longer a method on a class). The increment-not-absolute
         # contract is preserved.
-        from middleware.adaptive_reevaluate import _build_deeper_query
         orig = KataGoQuery(
             action=KataGoAction.ANALYZE,
             opaque={"maxVisits": 1000, "moves": []},
@@ -720,7 +720,6 @@ class TestAdaptiveReevaluateMetadata:
         assert deeper.opaque["maxVisits"] == 1500
 
     def test_build_deeper_query_strips_cache_flags(self) -> None:
-        from middleware.adaptive_reevaluate import _build_deeper_query
         orig = KataGoQuery(
             action=KataGoAction.ANALYZE,
             opaque={
@@ -762,7 +761,6 @@ class TestAdaptiveStreamingPreviews:
 
     @staticmethod
     def _make_middleware(window_size: int = 1) -> Any:
-        from middleware.adaptive_reevaluate import adaptive_reevaluate
         return adaptive_reevaluate(
             worst_quantile=0.25,
             extra_visits=800,
@@ -789,7 +787,6 @@ class TestAdaptiveStreamingPreviews:
         c.submitted = []
         c.terminated = []
         c.synthetic_sends = []
-        from middleware.session_middleware import SessionCapabilities
         return c, SessionCapabilities(
             submit_query=c.submit,
             terminate_query=c.terminate,
@@ -830,7 +827,6 @@ class TestAdaptiveStreamingPreviews:
         for the orig_id from caps.send_response (the push-based output
         channel introduced by the orchestration output-channel arc).
         """
-        import asyncio
         sc = getattr(m, "_caps", None)
         fake = getattr(getattr(sc, "send_response", None), "__self__", None) if sc else None
         pre = len(fake.synthetic_sends) if fake is not None else 0
@@ -844,7 +840,6 @@ class TestAdaptiveStreamingPreviews:
 
     @staticmethod
     async def _wait_for_spawn(caps: Any, timeout_s: float = 1.0) -> bool:
-        import asyncio
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             if caps.submitted:

@@ -39,6 +39,7 @@ if str(_PROXY_ROOT) not in sys.path:
 
 import sproxy_config as cfg  # noqa: E402
 from pubsub_hub import LRUCacheStore  # noqa: E402
+from proxy_server import ProxyServer, _build_advertised_capabilities  # noqa: E402
 
 
 # ===========================================================================
@@ -92,7 +93,6 @@ class TestProxyServerHubCacheWiring:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", True)
-        from proxy_server import ProxyServer
 
         server = ProxyServer()
         assert server._hub_cache is None
@@ -103,7 +103,6 @@ class TestProxyServerHubCacheWiring:
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", False)
         monkeypatch.setattr(cfg, "HUB_CACHE_MAX", 10)
-        from proxy_server import ProxyServer
 
         server = ProxyServer()
         assert isinstance(server._hub_cache, LRUCacheStore)
@@ -121,7 +120,6 @@ class TestUnboundedCacheStartupLog:
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", False)
         monkeypatch.setattr(cfg, "HUB_CACHE_MAX", 0)
-        from proxy_server import ProxyServer
 
         with caplog.at_level(logging.INFO, logger="kataproxy.proxy_server"):
             ProxyServer()
@@ -136,7 +134,6 @@ class TestUnboundedCacheStartupLog:
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", False)
         monkeypatch.setattr(cfg, "HUB_CACHE_MAX", 10)
-        from proxy_server import ProxyServer
 
         with caplog.at_level(logging.INFO, logger="kataproxy.proxy_server"):
             ProxyServer()
@@ -151,7 +148,6 @@ class TestUnboundedCacheStartupLog:
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", True)
         monkeypatch.setattr(cfg, "HUB_CACHE_MAX", 0)
-        from proxy_server import ProxyServer
 
         with caplog.at_level(logging.INFO, logger="kataproxy.proxy_server"):
             ProxyServer()
@@ -172,7 +168,6 @@ class TestCacheCapabilityAdvertisement:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", True)
-        from proxy_server import _build_advertised_capabilities
 
         advertised = _build_advertised_capabilities()
         assert "cache" not in advertised
@@ -182,7 +177,6 @@ class TestCacheCapabilityAdvertisement:
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", False)
         monkeypatch.setattr(cfg, "HUB_CACHE_MAX", 1024)
-        from proxy_server import _build_advertised_capabilities
 
         advertised = _build_advertised_capabilities()
         assert advertised["cache"] == {
@@ -196,7 +190,6 @@ class TestCacheCapabilityAdvertisement:
     ) -> None:
         monkeypatch.setattr(cfg, "HUB_CACHE_DISABLED", False)
         monkeypatch.setattr(cfg, "HUB_CACHE_MAX", 0)
-        from proxy_server import _build_advertised_capabilities
 
         advertised = _build_advertised_capabilities()
         assert advertised["cache"] == {

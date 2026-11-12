@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
