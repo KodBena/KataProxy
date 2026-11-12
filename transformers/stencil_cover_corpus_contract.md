@@ -224,9 +224,9 @@ A `solver_attempt` event is emitted once per actual backend invocation,
 whether the result is fast, easy, optimal, feasible, no-incumbent, or error.
 It carries:
 
-- `attempt_id` (equal to the event UUID), `solver_identity_fingerprint`,
-  backend name/version, adapter version, canonical configuration JSON and
-  configuration fingerprint;
+- `attempt_id` (equal to the event UUID) and a `solver_identity` object
+  containing the identity fingerprint, backend name/version, adapter
+  version, canonical configuration JSON and configuration fingerprint;
 - `budget`: wall limit in milliseconds, policy ID, and a tagged native
   effort limit with explicit unit or `not_requested`;
 - `started_at_utc`, plus `elapsed_wall_ns` measured as a monotonic
@@ -241,7 +241,8 @@ It carries:
   canonical coordinates with its payload codec version.
 
 The event format uses tagged dispositions where absence has a meaningful
-reason. The v1 closed vocabularies are: incumbent
+reason. The v1 JSON groups solver identity, budget and outcome values in
+objects; the nested names are stable parts of the wire contract. The v1 closed vocabularies are: incumbent
 `present|not_returned`; lower bound `reported|not_reported`; native effort
 `reported|not_supported|not_reported`; backend status
 `reported|not_reported`; placements
@@ -451,8 +452,8 @@ in `transformers/stencil_corpus_events.py`, and the best-effort publisher in
 `transformers/stencil_corpus_publisher.py`. It pins UUID, UTC timestamp,
 canonical instance identity, solver identity, budget units, outcome
 dispositions, placement payload codec, and canonical JSON rules. Foreground
-sightings occur before local-LRU/Redis result-cache lookup; actual foreground
-and bulk solver invocations publish separate attempt events. Redis Stream
+and bulk sightings occur before their result-cache/attempt work; actual
+foreground and bulk solver invocations publish separate attempt events. Redis Stream
 entries have no producer-side trimming policy. When Redis is unavailable, the
 publisher writes the same canonical bytes to an append-only SQLite spool
 (`user_version=1`, WAL, `synchronous=FULL`, event-ID idempotency and

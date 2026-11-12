@@ -357,6 +357,25 @@ but it is never the source used to arbitrate persistent writes.
 - **Worker and foreground both store results:** Redis arbitrates the best row;
   cache invalidation informs the other proxy processes.
 
+## Corpus event capture (Phase 2)
+
+Corpus capture is opt-in via `KATAPROXY_STENCIL_CORPUS_ENABLED=1`. A
+foreground component sighting is emitted after canonicalization and before
+the local LRU or Redis result lookup, so cache hits remain observable without
+creating synthetic solver attempts. Bulk discoveries emit a `bulk` sighting;
+the shared runtime emits one corresponding `solver_attempt` per actual
+backend invocation, tagged with the source path and the actual wall budget.
+
+The publisher sends the immutable v1 JSON bytes to Redis Stream
+`kataproxy:stencil-cover:corpus:events:v1` in DB 7 without trimming. If Redis
+is unavailable, the same bytes are persisted idempotently in SQLite
+(`KATAPROXY_STENCIL_CORPUS_DB`, default under
+`~/.local/state/kataproxy/`, WAL, `synchronous=FULL`). Duplicate event IDs
+with different bytes are treated as conflicts. If both persistence paths
+fail, a CRITICAL diagnostic is logged but solver and response handling
+continue. The stream consumer and normalized research-corpus materializer are
+not included in this phase.
+
 ## Review invariants
 
 A reviewer can use these invariants when changing this subsystem:
