@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -43,6 +44,7 @@ from katago import KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
 from transformers import stencil_cover_enricher as stencil
 from transformers import stencil_corpus_publisher as corpus_publisher
+from transformers import stencil_corpus_supervisor
 from transformers import stencil_cache_storage
 from transformers.stencil_cache_storage import (
     RedisCacheConflict,
@@ -64,7 +66,10 @@ from transformers.stencil_corpus_publisher import (
     CorpusEventPublisher,
 )
 from transformers.stencil_corpus_store import SQLiteCorpusStore
+from transformers.stencil_solver_api import NoNativeEffortLimit, SolverBudget
+from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_solver_problem import canonical_problem_from_key
+from transformers.stencil_solver_runtime import solve_component
 
 
 @pytest.fixture
