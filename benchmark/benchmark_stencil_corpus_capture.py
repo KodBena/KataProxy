@@ -30,6 +30,13 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
+# Running this file directly puts ``benchmark/`` at sys.path[0]. In developer
+# environments PYTHONPATH may also contain another checkout with a top-level
+# ``transformers`` package, so explicitly prefer the repository this script
+# belongs to before importing project modules.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
+
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_corpus_events import (
     make_instance_seen_event,
