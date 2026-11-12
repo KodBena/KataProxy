@@ -37,8 +37,7 @@ from transformers.stencil_cache_storage import (
     CacheResult,
     SolverCacheCandidate,
     SolverCacheRequest,
-    SolverWorkProfile,
-    make_solver_work_profile,
+    SolverCacheResultFunction,
     redis_persistent_cache,
     register_cache_invalidator,
 )
@@ -509,7 +508,7 @@ class _InvalidatableSolverCache:
 
     def __init__(
         self,
-        function: CacheResultFunction,
+        function: SolverCacheResultFunction,
         maxsize: int,
     ) -> None:
         self._function = function
