@@ -19,6 +19,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
+import time as _time
+
+import numpy as np
 import functools
 from functools import lru_cache
 import logging
@@ -39,7 +42,6 @@ def _are_equal(a: Any, b: Any) -> bool:
 #            return False
     # NumPy arrays
     if hasattr(a, "shape") and hasattr(a, "all"):
-        import numpy as np
         return bool(np.array_equal(a, b))
     try:
         return bool(a == b)
@@ -174,7 +176,6 @@ class MonitoredNode(CompiledNode):
         self._pending: Dict[int, Any] = {}
 
     def update(self, idx: int, val: Any) -> List[Tuple[int, Any]]:
-        import time as _time
         now = _time.monotonic()
 
         # Always buffer the incoming update.
