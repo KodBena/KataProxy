@@ -20,10 +20,9 @@ import re
 import threading
 import time
 import uuid
-from inspect import signature
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, FrozenSet, Iterator, cast
+from typing import Any, Callable, Dict, FrozenSet, Iterator, TypeAlias
 
 import redis
 
@@ -40,7 +39,6 @@ from transformers.stencil_solver_identity import (
     stable_digest as _stable_digest,
 )
 
-F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger("kataproxy.stencil_cache_storage")
 
 _INVALIDATORS: Dict[str, list[Callable[[bytes], None]]] = {}
@@ -318,6 +316,40 @@ def make_solver_work_profile(
     )
 
 
+CacheResult: TypeAlias = tuple[bool, int, bytes]
+
+
+@dataclass(frozen=True)
+class SolverCacheRequest:
+    """Complete typed input for one foreground solver/cache invocation.
+
+    The global result identity remains shape plus family. This value also
+    carries the selected backend and budget so local LRU and work-profile
+    identity derive from one immutable request contract.
+    """
+
+    shape_key: bytes
+    family: tuple[Stencil, ...]
+    backend: SolverBackend
+    budget: SolverBudget
+    work_profile: SolverWorkProfile = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.shape_key, bytes) or not self.shape_key:
+            raise ValueError("solver cache request shape_key must be non-empty bytes")
+        if not isinstance(self.family, tuple) or not self.family:
+            raise TypeError("solver cache request family must be a non-empty immutable tuple")
+        if not isinstance(self.budget, SolverBudget):
+            raise TypeError("solver cache request budget must be SolverBudget")
+        if not callable(getattr(self.backend, "solve", None)):
+            raise TypeError("solver cache request backend must implement solve()")
+        profile = make_solver_work_profile(self.backend.identity, self.budget)
+        object.__setattr__(self, "work_profile", profile)
+
+
+SolverCacheFunction: TypeAlias = Callable[[SolverCacheRequest], SolverCacheCandidate]
+SolverCacheResultFunction: TypeAlias = Callable[[SolverCacheRequest], CacheResult]
+
 _LEGACY_SOLVER_WORK_PROFILE_DOCUMENT: Dict[str, Any] = {
     "schema": "kataproxy.stencil-cover.solver-work-profile.v1",
     "solver_identity": {"disposition": "legacy_unknown"},
@@ -547,15 +579,12 @@ def _decode_solver_result(raw: Any) -> tuple[bool, int, bytes]:
     return _decode_solver_result_record(raw).result
 
 
-def _candidate_fields(value: Any) -> tuple[tuple[bool, int, bytes], Dict[str, Any]]:
-    if isinstance(value, SolverCacheCandidate):
-        result = value.result
-        provenance = _validate_result_provenance(value.provenance)
-    else:
-        result = value
-        provenance = {"disposition": "legacy_unknown"}
-    _result_fields(result)
-    return result, provenance
+def _candidate_fields(
+    value: SolverCacheCandidate,
+) -> tuple[CacheResult, Dict[str, Any]]:
+    provenance = _validate_result_provenance(value.provenance)
+    _result_fields(value.result)
+    return value.result, provenance
 
 
 # A single Lua operation stores improvements and atomically maintains the
@@ -1049,20 +1078,20 @@ class RedisStencilStore:
 
 
 
-def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
-    """Persist solver results; Redis is optional and failures degrade to a no-op.
+def redis_persistent_cache(
+    namespace: str,
+) -> Callable[[SolverCacheFunction], SolverCacheResultFunction]:
+    """Decorate the typed solver request port with the global Redis best result.
 
-    The Redis key deliberately excludes solver profile and time budget. A better
-    solution found by any backend can therefore upgrade the same global problem
-    record. Profile-specific scheduling is maintained separately by Redis Lua.
-    No solver checkpoint/state is written.
+    Redis result identity excludes solver profile and budget; work scheduling
+    remains profile-specific in the Redis Lua scripts.
     """
     if not namespace or not all(
         char.isalnum() or char in "-_." for char in namespace
     ):
         raise ValueError("persistent cache namespace must be a non-empty safe token")
 
-    def decorate(function: F) -> F:
+    def decorate(function: SolverCacheFunction) -> SolverCacheResultFunction:
         client = None
         try:
             client = create_redis_client()
@@ -1076,7 +1105,6 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
             )
 
         store = RedisStencilStore(client, namespace) if client is not None else None
-        function_signature = signature(function)
         enabled = True
         state_lock = threading.Lock()
 
@@ -1092,14 +1120,13 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
                     )
 
         @functools.wraps(function)
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
+        def wrapped(request: SolverCacheRequest) -> CacheResult:
             nonlocal store
             if not enabled:
-                return _candidate_fields(function(*args, **kwargs))[0]
+                return _candidate_fields(function(request))[0]
 
-            # If Redis was unavailable during module import, the background
-            # subscriber may reconnect later. Adopt its client lazily here;
-            # this work occurs only on an LRU miss, not on the hot cache hit.
+            # The invalidation listener may reconnect after a startup outage.
+            # Adopting its already-validated client is the composition handoff.
             if store is None:
                 with state_lock:
                     if store is None:
@@ -1108,42 +1135,12 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
                         if recovered_client is not None:
                             store = RedisStencilStore(recovered_client, namespace)
             if store is None:
-                return _candidate_fields(function(*args, **kwargs))[0]
-
-            bound = function_signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            positional_parameters = tuple(
-                parameter.name
-                for parameter in function_signature.parameters.values()
-                if parameter.kind in (
-                    parameter.POSITIONAL_ONLY,
-                    parameter.POSITIONAL_OR_KEYWORD,
-                )
-            )
-
-            def semantic_argument(
-                aliases: tuple[str, ...], position: int, label: str,
-            ) -> Any:
-                for alias in aliases:
-                    if alias in bound.arguments:
-                        return bound.arguments[alias]
-                if position < len(positional_parameters):
-                    return bound.arguments[positional_parameters[position]]
-                raise TypeError(
-                    f"persistent stencil solver requires a {label} argument"
-                )
-
-            shape_key = semantic_argument(
-                ("shape_key", "_shape_key"), 0, "shape_key",
-            )
-            family = semantic_argument(
-                ("family", "_family", "selected_family"), 2, "family",
-            )
-            if not isinstance(shape_key, bytes):
-                raise TypeError("persistent stencil solver shape_key must be bytes")
+                return _candidate_fields(function(request))[0]
 
             try:
-                cached_record = store.get_result_record(shape_key, family)
+                cached_record = store.get_result_record(
+                    request.shape_key, request.family,
+                )
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
                 logger.warning(
                     "Ignoring malformed Redis stencil cache entry (%s)", exc,
@@ -1151,22 +1148,22 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
                 cached_record = None
             except Exception as exc:
                 disable_after_error(exc)
-                return _candidate_fields(function(*args, **kwargs))[0]
+                return _candidate_fields(function(request))[0]
 
             if cached_record is not None:
                 return cached_record.result
 
-            result, provenance = _candidate_fields(function(*args, **kwargs))
+            result, provenance = _candidate_fields(function(request))
             try:
                 updated = store.put_result(
-                    shape_key, family, result, provenance=provenance,
-                    work_profile=bound.arguments.get("work_profile"),
+                    request.shape_key,
+                    request.family,
+                    result,
+                    provenance=provenance,
+                    work_profile=request.work_profile,
                 )
                 if not updated:
-                    # A concurrent worker or request may already have stored a
-                    # better result. Return that row so the outer LRU cannot
-                    # re-cache a stale incumbent after an invalidation race.
-                    latest = store.get_result(shape_key, family)
+                    latest = store.get_result(request.shape_key, request.family)
                     if latest is not None:
                         return latest
             except RedisCacheConflict:
@@ -1174,5 +1171,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
             except Exception as exc:
                 disable_after_error(exc)
             return result
-        return cast(F, wrapped)
+
+        return wrapped
+
     return decorate

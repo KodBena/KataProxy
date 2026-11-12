@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from transformers.stencil_cache_storage import _stable_digest
 from transformers.stencil_corpus_events import ProducerPath, make_solver_attempt_event
 from transformers.stencil_corpus_publisher import (
     CorpusEventSink, get_default_event_publisher,
@@ -20,9 +21,9 @@ from transformers.stencil_solver_api import (
     SolverFailure, SolverIdentity, SolverOutcome, STENCIL_CANONICALIZATION_VERSION,
 )
 from transformers.stencil_solver_geometry import (
-    Stencil, encode_cached_placements, verify_canonical_placements,
+    Stencil, decode_component_shape_key, encode_cached_placements,
+    verify_canonical_placements,
 )
-from transformers.stencil_solver_problem import canonical_problem_from_key
 
 logger = logging.getLogger("kataproxy.stencil_solver_runtime")
 
@@ -41,6 +42,25 @@ class SolverExecution:
     cache_result: tuple[bool, int, bytes]
     fallback_used: bool
     result_provenance: dict[str, Any]
+
+
+def canonical_problem_from_key(
+    shape_key: bytes, family: Sequence[Stencil],
+) -> CanonicalProblem:
+    width, height, flat_cells = decode_component_shape_key(shape_key)
+    occupied_cells = tuple((point // width, point % width) for point in flat_cells)
+    family_value = tuple(
+        (name, tuple((int(y), int(x)) for y, x in cells))
+        for name, cells in family
+    )
+    return CanonicalProblem(
+        width=width,
+        height=height,
+        occupied_cells=occupied_cells,
+        stencil_family=family_value,
+        family_fingerprint=_stable_digest(family_value),
+        canonicalization_version=STENCIL_CANONICALIZATION_VERSION,
+    )
 
 
 def _error_outcome(exc: Exception) -> SolverOutcome:

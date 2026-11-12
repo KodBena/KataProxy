@@ -34,15 +34,16 @@ from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, KataGoResponse
 from transformers.stencil_cache_storage import (
+    CacheResult,
     SolverCacheCandidate,
+    SolverCacheRequest,
+    SolverWorkProfile,
+    make_solver_work_profile,
     redis_persistent_cache,
     register_cache_invalidator,
 )
 from transformers.stencil_solver_api import (
     NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
-)
-from transformers.stencil_cache_storage import (
-    SolverWorkProfile, make_solver_work_profile,
 )
 from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_family import (
@@ -469,30 +470,15 @@ def _component_shape_key(
 
 
 def _solve_component_uncached(
-    shape_key: bytes,
-    time_limit_ms: int,
-    family: Tuple[Stencil, ...],
-    backend: SolverBackend,
-    work_profile: SolverWorkProfile | None = None,
+    request: SolverCacheRequest,
 ) -> SolverCacheCandidate:
-    """Invoke the selected backend and retain its provenance for Redis."""
-    if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
-        raise ValueError("solver time limit must be a positive number of milliseconds")
-    budget = SolverBudget(
-        wall_time_limit_ms=int(time_limit_ms),
-        native_effort_limit=NoNativeEffortLimit(),
-        policy_id=f"foreground-{int(time_limit_ms)}ms",
-    )
-    expected_profile = make_solver_work_profile(backend.identity, budget)
-    if work_profile is not None and work_profile != expected_profile:
-        raise ValueError("foreground work profile disagrees with backend or solver budget")
+    """Invoke the backend named by one immutable request and retain provenance."""
     execution = _solve_with_backend(
-        backend,
-        shape_key,
-        family,
-        budget,
+        request.backend,
+        request.shape_key,
+        request.family,
+        request.budget,
     )
-    # The shared runtime converts adapter exceptions to a typed error outcome.
     if execution.outcome.status is OutcomeStatus.ERROR:
         error = execution.outcome.error
         message = error.message if isinstance(error, SolverFailure) else "backend invocation failed"
@@ -501,8 +487,10 @@ def _solve_component_uncached(
             execution.identity.fingerprint,
             message,
         )
-    return SolverCacheCandidate(execution.cache_result, execution.result_provenance)
-
+    return SolverCacheCandidate(
+        result=execution.cache_result,
+        provenance=execution.result_provenance,
+    )
 
 class _SolverCacheInfo(NamedTuple):
     hits: int
@@ -521,14 +509,14 @@ class _InvalidatableSolverCache:
 
     def __init__(
         self,
-        function: Any,
+        function: CacheResultFunction,
         maxsize: int,
     ) -> None:
         self._function = function
         self._maxsize = maxsize
         self._cache: OrderedDict[
-            Tuple[bytes, int, Tuple[Stencil, ...], str],
-            Tuple[bool, int, bytes],
+            tuple[bytes, int, tuple[Stencil, ...], str],
+            CacheResult,
         ] = OrderedDict()
         self._lock = threading.RLock()
         self._hits = 0
@@ -537,21 +525,14 @@ class _InvalidatableSolverCache:
         self._generations: Dict[bytes, int] = {}
         self._inflight: Dict[bytes, int] = {}
 
-    def __call__(
-        self,
-        shape_key: bytes,
-        time_limit_ms: int,
-        family: Tuple[Stencil, ...],
-        backend: SolverBackend | None = None,
-    ) -> Tuple[bool, int, bytes]:
-        backend = DEFAULT_SOLVER_BACKEND if backend is None else backend
-        budget = SolverBudget(
-            wall_time_limit_ms=int(time_limit_ms),
-            native_effort_limit=NoNativeEffortLimit(),
-            policy_id=f"foreground-{int(time_limit_ms)}ms",
+    def __call__(self, request: SolverCacheRequest) -> CacheResult:
+        shape_key = request.shape_key
+        cache_key = (
+            shape_key,
+            request.budget.wall_time_limit_ms,
+            request.family,
+            request.work_profile.fingerprint,
         )
-        work_profile = make_solver_work_profile(backend.identity, budget)
-        cache_key = (shape_key, time_limit_ms, family, work_profile.fingerprint)
         while True:
             with self._lock:
                 cached = self._cache.get(cache_key)
@@ -567,12 +548,7 @@ class _InvalidatableSolverCache:
                 self._inflight[shape_key] = self._inflight.get(shape_key, 0) + 1
 
             try:
-                result = cast(
-                    Tuple[bool, int, bytes],
-                    self._function(
-                        shape_key, time_limit_ms, family, backend, work_profile,
-                    ),
-                )
+                result = self._function(request)
             except Exception:
                 with self._lock:
                     self._leave_inflight(shape_key)
@@ -586,8 +562,6 @@ class _InvalidatableSolverCache:
                 changed_during_solve = generation != current_generation
                 self._leave_inflight(shape_key)
                 if changed_during_solve:
-                    # The cache miss may have computed against an older Redis
-                    # row. Retry through the persistent layer before caching.
                     continue
 
                 cached = self._cache.get(cache_key)
@@ -598,7 +572,6 @@ class _InvalidatableSolverCache:
                 if len(self._cache) > self._maxsize:
                     self._cache.popitem(last=False)
                 return result
-
     def _leave_inflight(self, shape_key: bytes) -> None:
         remaining = self._inflight[shape_key] - 1
         if remaining:
@@ -677,6 +650,11 @@ def _solve_region(
             "status": "empty",
         }
     family_key = tuple(family)
+    budget = SolverBudget(
+        wall_time_limit_ms=int(time_limit_ms),
+        native_effort_limit=NoNativeEffortLimit(),
+        policy_id=f"foreground-{int(time_limit_ms)}ms",
+    )
     components: List[Dict[str, Any]] = []
     placements: List[Dict[str, Any]] = []
     statuses: List[int] = []
@@ -685,9 +663,13 @@ def _solve_region(
         # A component sighting is recorded before either the local LRU or
         # shared Redis result cache can return early. A hit is not an attempt.
         publish_instance_seen(shape_key, family_key, "foreground")
-        optimal, status, encoded = _solve_component_cached(
-            shape_key, time_limit_ms, family_key, solver_backend,
+        request = SolverCacheRequest(
+            shape_key=shape_key,
+            family=family_key,
+            backend=solver_backend,
+            budget=budget,
         )
+        optimal, status, encoded = _solve_component_cached(request)
         component_placements = _decode_cached_placements(
             encoded, family_key, frame,
         )
