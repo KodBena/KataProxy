@@ -14,3 +14,6 @@ wheelhouse/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
+
+# Local integration and benchmark artifacts
+.artifacts/
