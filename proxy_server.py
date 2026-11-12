@@ -79,6 +79,8 @@ _log = get_proxy_logger(__name__)
 
 
 import sproxy_config as cfg
+from transformers.stencil_corpus_publisher import corpus_events_enabled
+from transformers.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
 from katago import (
     AnalyzeResponse,
     KataGoAction,
@@ -1585,11 +1587,6 @@ async def _main() -> None:
         # instance per session because middleware holds per-query state.
         middleware_factory=_make_middleware,
     )
-    from transformers.stencil_corpus_publisher import corpus_events_enabled
-    from transformers.stencil_corpus_supervisor import (
-        StencilCorpusMaterializerSupervisor,
-    )
-
     corpus_supervisor: StencilCorpusMaterializerSupervisor | None = None
     if corpus_events_enabled():
         corpus_supervisor = StencilCorpusMaterializerSupervisor()
