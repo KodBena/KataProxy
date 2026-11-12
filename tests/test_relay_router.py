@@ -159,8 +159,8 @@ class TestSingleTargetDispatch:
         )
         # _callbacks records the URL the canonical was sent to —
         # used by terminate() to route the cancel correctly.
-        assert "cid-analyze" in router._callbacks
-        _, _, recorded_url = router._callbacks["cid-analyze"]
+        assert CanonicalId("cid-analyze") in router._callbacks
+        _, _, recorded_url = router._callbacks[CanonicalId("cid-analyze")]
         assert recorded_url in router._urls
         assert isinstance(recorded_url, str), (
             "single-target dispatch must record a real URL, not a "
@@ -216,8 +216,8 @@ class TestBroadcastDispatch:
             )
         # _callbacks holds a single entry with the typed broadcast
         # discriminant in the URL slot (v1.0.32; was "__broadcast__").
-        assert "cid-qv" in router._callbacks
-        _, _, label_slot = router._callbacks["cid-qv"]
+        assert CanonicalId("cid-qv") in router._callbacks
+        _, _, label_slot = router._callbacks[CanonicalId("cid-qv")]
         assert label_slot is SyntheticCallbackOrigin.BROADCAST
 
     async def test_terminate_all_broadcasts_to_all_connected(self) -> None:
@@ -295,7 +295,7 @@ class TestBroadcastDispatch:
                 f"{url} should still have received the broadcast wire"
             )
         # _callbacks still has the entry — broadcast didn't abort.
-        assert "cid-qv" in router._callbacks
+        assert CanonicalId("cid-qv") in router._callbacks
 
     async def test_broadcast_all_sends_failing_drops(self) -> None:
         # Degenerate case: every connected upstream's send raised.
@@ -367,10 +367,10 @@ class TestFirstResponseWins:
         wire = translate_query_to_wire(q, "cid-qv")
         await router.dispatch(CanonicalId("cid-qv"), wire, q, on_response, on_complete)
         # Broadcast installed the callback.
-        assert "cid-qv" in router._callbacks
+        assert CanonicalId("cid-qv") in router._callbacks
         # Simulate the read loop's QUERY_COMPLETE branch popping the
         # callback after the first response.
-        router._callbacks.pop("cid-qv", None)
+        router._callbacks.pop(CanonicalId("cid-qv"), None)
         # Second upstream's response would now find no callback. The
         # _read_loop's "no callback for {canonical_id!r}" branch
         # would log and continue, dropping the response. The

@@ -593,8 +593,8 @@ class TestSelectorDispatch:
         # _callbacks holds a single entry for the canonical, with the
         # typed broadcast discriminant as the label slot (v1.0.32;
         # was "__broadcast__").
-        assert "cid-qv" in router._callbacks
-        _on_resp, _on_comp, label_slot = router._callbacks["cid-qv"]
+        assert CanonicalId("cid-qv") in router._callbacks
+        _on_resp, _on_comp, label_slot = router._callbacks[CanonicalId("cid-qv")]
         assert label_slot is SyntheticCallbackOrigin.BROADCAST
         # The SPA hasn't seen a synthetic response — it waits for the
         # first upstream's reply through the read loop.
@@ -698,7 +698,7 @@ class TestSelectorDispatch:
         assert sockets["strong"].sent == []
         assert len(sockets["weak"].sent) == 1
         # _callbacks still has the entry — broadcast didn't abort.
-        assert "cid-qv" in router._callbacks
+        assert CanonicalId("cid-qv") in router._callbacks
 
     async def test_broadcast_all_sends_failing_returns_error(self) -> None:
         # Degenerate case: every healthy upstream's send raised. The
