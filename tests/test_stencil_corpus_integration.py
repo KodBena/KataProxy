@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 import pytest
 import redis
@@ -54,7 +54,10 @@ from transformers.stencil_corpus_events import (
     parse_event,
     serialize_event,
 )
-from transformers.stencil_corpus_materializer import StencilCorpusMaterializer
+from transformers.stencil_corpus_materializer import (
+    RedisStreamPort,
+    StencilCorpusMaterializer,
+)
 from transformers.stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
     CORPUS_STREAM_KEY,
@@ -82,6 +85,12 @@ def redis_client() -> Iterator[redis.Redis]:
         yield client
     finally:
         client.close()
+
+
+def _stream_port(client: redis.Redis) -> RedisStreamPort:
+    # redis-py models several Streams return shapes as optional/unions; the
+    # materializer only consumes the narrow operations declared by its port.
+    return cast(RedisStreamPort, client)
 
 
 def _profile(name: str) -> SolverWorkProfile:
@@ -376,12 +385,19 @@ async def test_real_proxy_capture_backlogs_then_materializes_with_materializer_s
         await _stop_proxy(server, task, websocket)
 
     # No materializer has been constructed or started during proxy capture.
-    stream_rows = redis_client.xrange(CORPUS_STREAM_KEY)
-    assert len(stream_rows) >= 2
-    events = [
-        parse_event(fields[b"event"])
-        for _message_id, fields in stream_rows
+    stream_response = redis_client.xrange(CORPUS_STREAM_KEY)
+    assert stream_response is not None
+    stream_rows = [
+        (message_id, fields)
+        for message_id, fields in stream_response
+        if message_id is not None and fields is not None
     ]
+    assert len(stream_rows) >= 2
+    events: list[dict[str, Any]] = []
+    for _message_id, fields in stream_rows:
+        payload = fields.get(b"event")
+        assert isinstance(payload, (bytes, str))
+        events.append(parse_event(payload))
     assert any(event["event_type"] == "instance_seen" for event in events)
     assert all(event["producer_path"] == "foreground" for event in events)
     assert all("instance" in event for event in events)
@@ -389,7 +405,7 @@ async def test_real_proxy_capture_backlogs_then_materializes_with_materializer_s
     store = SQLiteCorpusStore(database)
     assert store.counts()["receipts"] == 0
     materializer = StencilCorpusMaterializer(
-        store, redis_client, consumer_name="proxy-capture-drain",
+        store, _stream_port(redis_client), consumer_name="proxy-capture-drain",
     )
     counts = materializer.run_once(block_ms=0)
     assert counts["stream_ingested"] == len(stream_rows)
@@ -434,7 +450,7 @@ async def test_real_proxy_capture_spools_exact_bytes_on_redis_failure_and_recove
 
     store = SQLiteCorpusStore(database)
     materializer = StencilCorpusMaterializer(
-        store, redis_client, consumer_name="spool-recovery",
+        store, _stream_port(redis_client), consumer_name="spool-recovery",
     )
     first = materializer.run_once(block_ms=0)
     assert first["spool_ingested"] == len(payloads)
@@ -467,7 +483,7 @@ def test_real_redis_stream_backlog_is_consumed_after_materializer_resumes(
     assert store.counts()["receipts"] == 0
 
     materializer = StencilCorpusMaterializer(
-        store, redis_client, consumer_name="backlog-resumed",
+        store, _stream_port(redis_client), consumer_name="backlog-resumed",
     )
     counts = materializer.run_once(block_ms=0)
     assert counts["stream_ingested"] == len(events)
@@ -551,7 +567,7 @@ def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
     # A new consumer uses the production XAUTOCLAIM path, replays the already
     # committed event, observes the receipt as a duplicate, then acknowledges.
     restarted = StencilCorpusMaterializer(
-        store, redis_client, consumer_name="restarted-worker", claim_idle_ms=1,
+        store, _stream_port(redis_client), consumer_name="restarted-worker", claim_idle_ms=1,
     )
     replay = restarted.run_once(block_ms=0)
     assert replay["duplicates"] == 1
