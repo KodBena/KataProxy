@@ -22,6 +22,7 @@ from transformers.stencil_corpus_materializer import StencilCorpusMaterializer
 from transformers.stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
     CORPUS_STREAM_KEY,
+    CorpusEventPublisher,
     SQLiteEventSpool,
 )
 from transformers.stencil_corpus_store import (

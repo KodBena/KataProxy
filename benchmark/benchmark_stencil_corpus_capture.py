@@ -168,9 +168,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     keys, workload_description = _load_workload(args.corpus_db)
     canonical_inputs = tuple(_decode_key_cells(key) for key in keys)
     canonical_cycle = itertools.cycle(canonical_inputs)
-    canonicalization = lambda: stencil._component_shape_key(
-        *next(canonical_cycle), stencil.STENCIL_FAMILY,
-    )
+
+    def canonicalization() -> Any:
+        cells, width = next(canonical_cycle)
+        return stencil._component_shape_key(cells, width, stencil.STENCIL_FAMILY)
 
     event_cycle = itertools.cycle(keys)
     event_construction = lambda: _new_event(next(event_cycle))
@@ -223,15 +224,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             direct_sqlite = lambda: direct_spool.append(next(spool_payload_cycle))
             redis_cycle = itertools.cycle(keys)
-            capture_redis = lambda: publish_instance_seen(
-                next(redis_cycle), stencil.STENCIL_FAMILY, "foreground",
-                publisher=redirected_publisher,
-            )
+
+            def capture_redis() -> None:
+                result = publish_instance_seen(
+                    next(redis_cycle), stencil.STENCIL_FAMILY, "foreground",
+                    publisher=redirected_publisher,
+                )
+                if result != "redis_stream":
+                    raise RuntimeError(
+                        f"expected Redis publication, observed {result!r}"
+                    )
+
             fallback_cycle = itertools.cycle(keys)
-            capture_fallback = lambda: publish_instance_seen(
-                next(fallback_cycle), stencil.STENCIL_FAMILY, "foreground",
-                publisher=fallback_publisher,
-            )
+
+            def capture_fallback() -> None:
+                result = publish_instance_seen(
+                    next(fallback_cycle), stencil.STENCIL_FAMILY, "foreground",
+                    publisher=fallback_publisher,
+                )
+                if result != "sqlite_spool":
+                    raise RuntimeError(
+                        f"expected SQLite fallback, observed {result!r}"
+                    )
 
             measurements = {
                 "canonicalization_only": _summary(_measure(
