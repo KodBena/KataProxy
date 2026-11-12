@@ -12,7 +12,6 @@ from __future__ import annotations
 import base64
 import functools
 import hashlib
-import importlib
 import json
 import logging
 import math
@@ -22,15 +21,23 @@ import threading
 import time
 import uuid
 from inspect import signature
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, FrozenSet, Iterator, TypeVar, cast
+from typing import Any, Callable, Dict, FrozenSet, Iterator, cast
+
+import redis
 
 from transformers.stencil_solver_api import (
     NativeEffortLimit,
     NoNativeEffortLimit,
+    SolverBackend,
     SolverBudget,
     SolverIdentity,
+)
+from transformers.stencil_solver_geometry import Stencil
+from transformers.stencil_solver_identity import (
+    canonical_json_value as _json_key_value,
+    stable_digest as _stable_digest,
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -163,8 +170,7 @@ def register_cache_invalidator(
 
 def create_redis_client() -> Any:
     """Connect to the proxy's dedicated Redis database, failing explicitly."""
-    redis_module = importlib.import_module("redis")
-    client = redis_module.Redis(
+    client = redis.Redis(
         host=_REDIS_HOST,
         port=_REDIS_PORT,
         db=_REDIS_DB,
@@ -188,37 +194,6 @@ _LEGACY_VALUE_SCHEMA_VERSION = 2
 
 class RedisCacheConflict(RuntimeError):
     """Two independently optimal results disagree on the same exact problem."""
-
-
-def _json_key_value(value: Any) -> Any:
-    """Convert supported solver arguments to stable JSON-compatible values."""
-    if isinstance(value, bytes):
-        return {"bytes_base64": base64.b64encode(value).decode("ascii")}
-    if isinstance(value, tuple):
-        return [_json_key_value(item) for item in value]
-    if isinstance(value, list):
-        return [_json_key_value(item) for item in value]
-    if isinstance(value, dict):
-        if not all(isinstance(key, str) for key in value):
-            raise TypeError("persistent cache key dictionaries require string keys")
-        return {key: _json_key_value(value[key]) for key in sorted(value)}
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("persistent cache keys cannot contain non-finite floats")
-        return value
-    raise TypeError(f"unsupported persistent cache key value: {type(value).__name__}")
-
-
-def _stable_digest(value: Any) -> str:
-    encoded = json.dumps(
-        _json_key_value(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _result_cost(encoded_placements: bytes) -> int:

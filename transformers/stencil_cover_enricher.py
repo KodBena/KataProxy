@@ -24,7 +24,6 @@ import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from pathlib import Path
 import re
 import threading
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
@@ -46,12 +45,21 @@ from transformers.stencil_cache_storage import (
     SolverWorkProfile, make_solver_work_profile,
 )
 from transformers.stencil_solver_factory import create_solver_backend
+from transformers.stencil_family import (
+    STENCIL_FAMILY,
+    parse_stencil_family as _parse_stencil_family,
+)
 from transformers.stencil_solver_geometry import (
     MAX_COMPONENT_DIMENSION as _MAX_BOARD_SIZE,
     D4_INVERSE as _D4_INVERSE,
     D4_MATRICES as _D4_MATRICES,
+    ComponentFrame,
+    Stencil,
+    component_shape_key as _component_shape_key_impl,
+    decode_cached_placements as _decode_cached_placements,
     decode_component_shape_key as _decode_component_shape_key,
     encode_cached_placements as _encode_cached_placements,
+    family_dihedral_group as _family_dihedral_group,
     normalise_shape as _normalise_shape,
     transform_cell as _transform_cell,
     verify_component_placements as _verify_component_placements,
@@ -60,8 +68,6 @@ from transformers.stencil_solver_runtime import solve_component as _solve_with_b
 from transformers.stencil_corpus_publisher import publish_instance_seen
 
 logger = logging.getLogger("kataproxy.stencil_cover_enricher")
-
-Stencil = Tuple[str, Tuple[Tuple[int, int], ...]]
 
 
 @dataclass(frozen=True)
@@ -88,69 +94,6 @@ _STONE_WORST_LIVENESS_THRESHOLD = 0.6
 _MAX_INITIAL_STONES = 1_000
 _MAX_REPLAY_MOVES = 1_000
 _MAX_COORDINATE_LENGTH = 16
-
-
-def _parse_stencil_family(source: str) -> Tuple[Stencil, ...]:
-    """Parse the small name:/ASCII-row family format kept beside this module."""
-    lines = source.splitlines()
-    family: List[Stencil] = []
-    names = set()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        i += 1
-        if not line:
-            continue
-        if not line.startswith("name:"):
-            raise ValueError(f"expected 'name:' at family line {i}")
-        name = line.partition(":")[2].strip()
-        if not name or name in names:
-            raise ValueError(f"empty or duplicate stencil name at family line {i}")
-        rows: List[str] = []
-        while i < len(lines) and lines[i].strip():
-            row = lines[i].strip()
-            if any(char not in "#." for char in row):
-                raise ValueError(f"invalid stencil row at family line {i + 1}")
-            rows.append(row)
-            i += 1
-        if not rows or not any("#" in row for row in rows):
-            raise ValueError(f"stencil {name!r} has no occupied cells")
-        width = max(map(len, rows))
-        if any(len(row) != width for row in rows):
-            raise ValueError(f"stencil {name!r} has ragged rows")
-        cells = tuple(
-            (y, x)
-            for y, row in enumerate(rows)
-            for x, char in enumerate(row)
-            if char == "#"
-        )
-        # The family is intentionally made of connected stencils; this also
-        # prevents a single placement from jumping between regions.
-        pending = {cells[0]}
-        reached = set()
-        cell_set = set(cells)
-        while pending:
-            y, x = pending.pop()
-            if (y, x) in reached:
-                continue
-            reached.add((y, x))
-            pending.update(
-                (ny, nx)
-                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1))
-                if (ny, nx) in cell_set and (ny, nx) not in reached
-            )
-        if reached != cell_set:
-            raise ValueError(f"stencil {name!r} is not 4-connected")
-        family.append((name, cells))
-        names.add(name)
-    if not family:
-        raise ValueError("stencil family is empty")
-    return tuple(family)
-
-
-STENCIL_FAMILY: Tuple[Stencil, ...] = _parse_stencil_family(
-    Path(__file__).with_name("stencil_family.txt").read_text(encoding="utf-8")
-)
 
 
 def _threshold_from_metadata(metadata: Any) -> float:
@@ -515,159 +458,14 @@ def _connected_components(
     return components
 
 
-@dataclass(frozen=True)
-class ComponentFrame:
-    """Map between a board component and its canonical D4 frame."""
-
-    board_width: int
-    transform: int
-    offset_y: int
-    offset_x: int
-    canonical_width: int
-    canonical_height: int
-
-
-def _family_dihedral_group(family: Sequence[Stencil]) -> Tuple[int, ...]:
-    """Return exactly the D4 maps that preserve the family's shape set."""
-    shapes = {_normalise_shape(cells) for _name, cells in family}
-    group = tuple(
-        transform for transform in range(8)
-        if {
-            _normalise_shape(cells, transform)
-            for _name, cells in family
-        } == shapes
-    )
-    if not group or group[0] != 0:
-        raise RuntimeError("the stencil family's symmetry group lost the identity")
-    return group
-
 
 def _component_shape_key(
     component: Sequence[int],
     board_width: int,
     family: Sequence[Stencil] = STENCIL_FAMILY,
-) -> Tuple[bytes, ComponentFrame]:
-    """Return the least translation/D4 representative allowed by the family.
-
-    The key is bytes([height, width]) followed by an LSB-first packed bitmap.
-    The frame records the chosen map from caller coordinates into that
-    canonical rectangle, so cached placements can be mapped back exactly.
-    Only symmetries preserving the complete stencil shape set are admitted.
-    """
-    if isinstance(board_width, bool) or not isinstance(board_width, int) or board_width <= 0:
-        raise ValueError("board_width must be a positive integer")
-    points = tuple(sorted({int(point) for point in component}))
-    if not points:
-        raise ValueError("cannot canonicalise an empty component")
-    if points[0] < 0:
-        raise ValueError("component points must be non-negative board indices")
-
-    coordinates = [(point // board_width, point % board_width) for point in points]
-    best_key: Optional[bytes] = None
-    best_frame: Optional[ComponentFrame] = None
-
-    for transform in _family_dihedral_group(family):
-        mapped = [
-            _transform_cell(y, x, transform)
-            for y, x in coordinates
-        ]
-        offset_y = min(y for y, _ in mapped)
-        offset_x = min(x for _, x in mapped)
-        local = [(y - offset_y, x - offset_x) for y, x in mapped]
-        canonical_height = max(y for y, _ in local) + 1
-        canonical_width = max(x for _, x in local) + 1
-        if canonical_height > 255 or canonical_width > 255:
-            raise ValueError("canonical component dimensions exceed the key format")
-
-        bits = bytearray((canonical_width * canonical_height + 7) // 8)
-        for y, x in local:
-            index = y * canonical_width + x
-            bits[index >> 3] |= 1 << (index & 7)
-        candidate_key = bytes((canonical_height, canonical_width)) + bytes(bits)
-
-        # Iteration is in transform order, so the first transform wins ties.
-        if best_key is None or candidate_key < best_key:
-            best_key = candidate_key
-            best_frame = ComponentFrame(
-                board_width=board_width,
-                transform=transform,
-                offset_y=offset_y,
-                offset_x=offset_x,
-                canonical_width=canonical_width,
-                canonical_height=canonical_height,
-            )
-
-    assert best_key is not None and best_frame is not None
-    return best_key, best_frame
-
-
-def _decode_cached_placements(
-    encoded: bytes,
-    family: Sequence[Stencil],
-    frame: ComponentFrame,
-) -> List[Dict[str, Any]]:
-    """Recover a canonical solution into board coordinates and stencil names.
-
-    A D4 map can rotate a rectangle into a differently named family member
-    (for example, canonical 1x2 becomes caller-facing 2x1). Both points and
-    stencil geometry are therefore transformed back together.
-    """
-    if len(encoded) < 2:
-        raise ValueError("cached stencil solution is truncated")
-    count = int.from_bytes(encoded[:2], "little")
-    offset = 2
-    inverse = _D4_INVERSE[frame.transform]
-    names_by_shape: Dict[Tuple[Tuple[int, int], ...], str] = {}
-    for name, cells in family:
-        names_by_shape.setdefault(_normalise_shape(cells), name)
-
-    placements: List[Dict[str, Any]] = []
-    for _ in range(count):
-        if offset + 2 > len(encoded):
-            raise ValueError("cached stencil placement header is truncated")
-        stencil_index, point_count = encoded[offset], encoded[offset + 1]
-        offset += 2
-        if offset + point_count * 2 > len(encoded):
-            raise ValueError("cached stencil placement points are truncated")
-
-        stencil_name: Optional[str]
-        if stencil_index == 255:
-            stencil_name = "1x1"
-        elif stencil_index < len(family):
-            canonical_stencil = family[stencil_index][1]
-            recovered_shape = _normalise_shape(canonical_stencil, inverse)
-            stencil_name = names_by_shape.get(recovered_shape)
-            if stencil_name is None:
-                raise RuntimeError(
-                    "the active family is not closed under the component's recovery transform"
-                )
-        else:
-            raise ValueError("cached stencil index is outside the active family")
-
-        if stencil_name is None:
-            raise RuntimeError("could not recover the selected stencil family member")
-        points: List[List[int]] = []
-        for _ in range(point_count):
-            local = int.from_bytes(encoded[offset:offset + 2], "little")
-            offset += 2
-            if local >= frame.canonical_width * frame.canonical_height:
-                raise ValueError("cached stencil point is outside the canonical component frame")
-            canonical_y, canonical_x = divmod(local, frame.canonical_width)
-            transformed_y = canonical_y + frame.offset_y
-            transformed_x = canonical_x + frame.offset_x
-            original_y, original_x = _transform_cell(
-                transformed_y, transformed_x, inverse,
-            )
-            if original_y < 0 or not 0 <= original_x < frame.board_width:
-                raise ValueError("recovered stencil point is outside the caller's board frame")
-            points.append([original_x, original_y])
-
-        points.sort(key=lambda point: (point[1], point[0]))
-        placements.append({"stencil": stencil_name, "points": points})
-
-    if offset != len(encoded):
-        raise ValueError("cached stencil solution has trailing bytes")
-    return placements
+) -> tuple[bytes, ComponentFrame]:
+    """Compatibility entry point; canonical geometry is owned by solver_geometry."""
+    return _component_shape_key_impl(component, board_width, family)
 
 
 def _solve_component_uncached(
