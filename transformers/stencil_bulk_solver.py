@@ -22,13 +22,13 @@ from transformers.stencil_cache_storage import (
     create_redis_client,
 )
 from transformers.stencil_corpus_publisher import publish_instance_seen
-from transformers.stencil_cover_enricher import (
+from transformers.stencil_family import STENCIL_FAMILY
+from transformers.stencil_solver_geometry import (
     ComponentFrame,
-    STENCIL_FAMILY,
     Stencil,
-    _decode_cached_placements,
-    _decode_component_shape_key,
-    _verify_component_placements,
+    decode_cached_placements,
+    decode_component_shape_key,
+    verify_component_placements,
 )
 from transformers.stencil_solver_api import (
     NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
@@ -98,7 +98,7 @@ def _validate_bulk_result(
     if optimal != (status == 0) or not isinstance(encoded, bytes):
         raise ValueError("bulk solver result status and payload disagree")
 
-    width, height, cells = _decode_component_shape_key(shape_key)
+    width, height, cells = decode_component_shape_key(shape_key)
     canonical_frame = ComponentFrame(
         board_width=width,
         transform=0,
@@ -107,8 +107,8 @@ def _validate_bulk_result(
         canonical_width=width,
         canonical_height=height,
     )
-    placements = _decode_cached_placements(encoded, family, canonical_frame)
-    _verify_component_placements(cells, width, placements, family)
+    placements = decode_cached_placements(encoded, family, canonical_frame)
+    verify_component_placements(cells, width, placements, family)
     return optimal, status, encoded
 
 
