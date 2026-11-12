@@ -40,7 +40,7 @@ from transformers.stencil_solver_api import (
     SolverIdentity,
     SolverOutcome,
 )
-from transformers.stencil_solver_runtime import canonical_problem_from_key
+from transformers.stencil_solver_problem import canonical_problem_from_key
 
 
 def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
