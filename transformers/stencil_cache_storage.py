@@ -595,6 +595,7 @@ local new_status = tonumber(ARGV[2])
 local new_cost = tonumber(ARGV[3])
 local new_bound = tonumber(ARGV[6])
 local should_store = true
+local had_valid_old = false
 
 if old_raw then
     local ok, old = pcall(cjson.decode, old_raw)
@@ -617,6 +618,7 @@ if old_raw then
     end
     if old_status ~= nil and old_cost ~= nil and
        old_status >= 0 and old_status <= 2 and old_cost >= 0 then
+        had_valid_old = true
         if old_status == 0 and new_status == 0 and old_cost ~= new_cost then
             return -1
         end
@@ -653,7 +655,7 @@ if tonumber(final.status) == 0 then
 else
     redis.call('SADD', KEYS[2], ARGV[5])
     if should_store then
-        if not old_raw then
+        if not had_valid_old then
             -- A newly discovered hard instance is eligible in every profile
             -- that has already registered with this family.
             for _, profile_id in ipairs(profile_ids) do
@@ -687,6 +689,7 @@ if tonumber(value.status) ~= 0 then
     local family_prefix = ARGV[3]
     for _, profile_id in ipairs(redis.call('HKEYS', KEYS[3])) do
         redis.call('SADD', family_prefix .. ':pending:' .. profile_id, ARGV[2])
+        redis.call('HDEL', family_prefix .. ':timeouts:' .. profile_id, ARGV[2])
     end
 end
 return 1
@@ -745,12 +748,12 @@ return queued
 """
 
 class RedisStencilStore:
-    """Persist best results and maintain pending and timed-out component indexes.
+    """Persist global best results and profile-scoped work scheduling state.
 
-    Hard components are all non-optimal problems. Pending components are the
-    subset not yet given the bulk solver's full time budget. Timeout metadata
-    remains durable after a worker attempt so hard components are not retried
-    continuously.
+    Hard components are global non-optimal problems. Each registered solver
+    work profile has an independent pending set and timeout hash; optimality
+    clears all profiles, while non-optimal improvements reopen only the
+    profile that produced the improvement.
     """
 
     def __init__(self, client: Any, namespace: str) -> None:
@@ -1069,10 +1072,10 @@ class RedisStencilStore:
 def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
     """Persist solver results; Redis is optional and failures degrade to a no-op.
 
-    The Redis key deliberately excludes time_limit_ms. A better solution found
-    by an offline, longer solve can therefore upgrade the exact same problem
-    record. Feasible results are cached and their canonical problem keys are
-    added to the hard and pending indexes. No solver checkpoint/state is written.
+    The Redis key deliberately excludes solver profile and time budget. A better
+    solution found by any backend can therefore upgrade the same global problem
+    record. Profile-specific scheduling is maintained separately by Redis Lua.
+    No solver checkpoint/state is written.
     """
     if not namespace or not all(
         char.isalnum() or char in "-_." for char in namespace

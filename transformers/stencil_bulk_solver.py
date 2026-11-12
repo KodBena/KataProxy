@@ -151,7 +151,10 @@ class StencilBulkSolver:
         if previous[0] and previous[1] == 0:
             # Repair a stale queue entry should one ever be left by an older
             # version of the storage schema.
-            self.store.put_result(shape_key, self.family, previous)
+            self.store.put_result(
+                shape_key, self.family, previous,
+                work_profile=self.work_profile,
+            )
             return "optimal"
 
         attempted_at = self.clock()

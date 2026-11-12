@@ -18,6 +18,7 @@ from transformers.stencil_solver_api import (
     NoSolverFailure,
     OutcomeStatus,
     NoNativeEffortLimit,
+    NativeEffortLimit,
     PlacementWitness,
     SolverBudget,
     ProvenLowerBound,
@@ -25,8 +26,10 @@ from transformers.stencil_solver_api import (
     SolverOutcome,
 )
 from transformers.stencil_solver_runtime import solve_component
-from transformers.stencil_cache_storage import SolverWorkProfile
-from transformers.stencil_cache_storage import make_solver_work_profile
+from transformers.stencil_cache_storage import (
+    SolverWorkProfile,
+    make_solver_work_profile,
+)
 from transformers.stencil_solver_factory import (
     create_solver_backend, register_solver_backend,
 )
@@ -146,7 +149,7 @@ class _MemoryStore:
     def __init__(self, initial: tuple[bool, int, bytes]) -> None:
         self.result = initial
         self.stored: list[tuple[bool, int, bytes]] = []
-        self.provenance: Dict[str, Any] | None = None
+        self.provenance: dict[str, Any] | None = None
 
     def initialize_pending_queue(
         self, _family: Any, _work_profile: SolverWorkProfile,

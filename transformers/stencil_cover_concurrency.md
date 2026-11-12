@@ -475,5 +475,6 @@ path, budget, start timestamp, elapsed wall time, and typed outcome summary.
 For equal result status and tile count, a larger certified lower bound is a
 better result. The old optimal-first and tile-count ranking remains in force.
 
-Profile-specific pending/timeout keys are not part of this sub-step. Until
-that follow-on change, v4 uses the existing single active work profile.
+Profile-specific pending/timeout keys are now active. Each running bulk
+worker initializes and drains only the queue for its exact solver work
+profile; all profiles continue to share one global best-result row.
