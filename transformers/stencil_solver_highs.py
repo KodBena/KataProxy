@@ -116,11 +116,15 @@ class HiGHSBackend(SolverBackend):
         backend_status = BackendStatusReported(str(model_status))
         info = highs.getInfo()
         raw_nodes = getattr(info, "mip_node_count", None)
-        if (
-            isinstance(raw_nodes, (int, float)) and not isinstance(raw_nodes, bool)
-            and math.isfinite(float(raw_nodes)) and raw_nodes >= 0
-        ):
-            native_effort = NativeEffortReported(raw_nodes, "mip_nodes")
+        try:
+            node_count = float(raw_nodes) if raw_nodes is not None else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            node_count = float("nan")
+        if math.isfinite(node_count) and node_count >= 0:
+            native_value: int | float = (
+                int(node_count) if node_count.is_integer() else node_count
+            )
+            native_effort = NativeEffortReported(native_value, "mip_nodes")
         else:
             native_effort = NativeEffortUnavailable(
                 NoNativeEffortReason.BACKEND_DID_NOT_REPORT_EFFORT
@@ -132,12 +136,14 @@ class HiGHSBackend(SolverBackend):
         }
         raw_bound = getattr(info, "mip_dual_bound", None)
         lower_bound = LowerBoundUnavailable(NoLowerBoundReason.BACKEND_DID_NOT_REPORT_BOUND)
-        if (
-            isinstance(raw_bound, (int, float)) and not isinstance(raw_bound, bool)
-            and math.isfinite(float(raw_bound))
-        ):
-            metrics["mip_dual_bound"] = float(raw_bound)
-            conservative_integer_bound = math.floor(float(raw_bound))
+        try:
+            dual_bound = float(raw_bound) if raw_bound is not None else float("nan")
+        except (TypeError, ValueError, OverflowError):
+            dual_bound = float("nan")
+        if math.isfinite(dual_bound):
+            metrics["mip_dual_bound"] = dual_bound
+            # The integer objective makes floor(bound) a conservative integer LB.
+            conservative_integer_bound = math.floor(dual_bound)
             if conservative_integer_bound >= 0:
                 lower_bound = ProvenLowerBound(conservative_integer_bound)
 

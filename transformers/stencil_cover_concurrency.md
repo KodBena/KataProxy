@@ -54,7 +54,9 @@ solver cover is available. A backend error remains an error (the worker leaves
 the item pending); it is not relabeled as a feasible or optimal result.
 
 The local LRU key includes the selected backend identity fingerprint as well
-as the existing shape, family, and foreground time budget. Redis continues to
+as the existing shape, family, and foreground time budget. Invalid backend
+placement witnesses normalize to error outcomes; the singleton fallback is
+marked distinctly and cannot be cached as a proven or feasible solver cover. Redis continues to
 store one global best result per canonical problem/family, independent of
 backend and budget. The work queue is still the legacy global pending/timeout
 index in this phase; solver-profile-aware queue migration remains Phase 4.

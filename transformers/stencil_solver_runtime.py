@@ -73,7 +73,7 @@ def _error_outcome(exc: Exception) -> SolverOutcome:
 
 def _cache_result(
     problem: CanonicalProblem, outcome: SolverOutcome,
-) -> tuple[tuple[bool, int, bytes], bool]:
+) -> tuple[SolverOutcome, tuple[bool, int, bytes], bool]:
     if (
         isinstance(outcome.incumbent, Incumbent)
         and isinstance(outcome.incumbent.placement_witness, PlacementWitness)
@@ -90,9 +90,28 @@ def _cache_result(
             ]
             encoded = encode_cached_placements(flat_placements, problem.stencil_family)
             optimal = outcome.status is OutcomeStatus.OPTIMAL
-            return ((optimal, 0 if optimal else 1, encoded), False)
+            return outcome, (optimal, 0 if optimal else 1, encoded), False
         except Exception as exc:
             logger.error("Rejected invalid solver cover: %s", exc)
+            # A proof paired with a malformed cover is not a validated result.
+            # Preserve backend diagnostics while marking the invocation ERROR.
+            outcome = SolverOutcome(
+                status=OutcomeStatus.ERROR,
+                incumbent=NoIncumbent(NoIncumbentReason.INVOCATION_FAILED),
+                lower_bound=outcome.lower_bound,
+                native_effort=outcome.native_effort,
+                backend_status=outcome.backend_status,
+                backend_metrics_json=outcome.backend_metrics_json,
+                error=SolverFailure(
+                    error_type="InvalidPlacementWitness",
+                    message=str(exc) or "solver returned an invalid placement witness",
+                    details_json=json.dumps(
+                        {"validation_failure": True},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
 
     # Preserve the legacy fallback choice: prefer an existing one-cell family
     # member in family order, otherwise use the synthetic "1x1" name (index 255).
@@ -105,6 +124,7 @@ def _cache_result(
         for y, x in problem.occupied_cells
     ]
     return (
+        outcome,
         (False, 2, encode_cached_placements(singleton_cover, problem.stencil_family)),
         True,
     )
@@ -127,9 +147,9 @@ def solve_component(
     except Exception as exc:
         outcome = _error_outcome(exc)
     elapsed_wall_ns = time.perf_counter_ns() - started_ns
-    cache_result, fallback_used = _cache_result(problem, outcome)
+    normalized_outcome, cache_result, fallback_used = _cache_result(problem, outcome)
     return SolverExecution(
-        problem=problem, identity=identity, outcome=outcome,
+        problem=problem, identity=identity, outcome=normalized_outcome,
         elapsed_wall_ns=elapsed_wall_ns, cache_result=cache_result,
         fallback_used=fallback_used,
     )

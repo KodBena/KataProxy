@@ -1,8 +1,9 @@
 # Stencil-cover solver and corpus contracts (Phase 0–1)
 
-**Status:** Phase 0 contracts remain frozen. Phase 1 extracts the default
-HiGHS adapter and routes foreground/background solving through the shared
-solver port. Corpus publishing and SQLite materialization remain future phases.
+**Status:** Phase 0 contracts remain frozen. Phase 1 has extracted the default
+HiGHS adapter, routed foreground/background solving through the shared solver
+port, and added fake-backend substitution coverage. Corpus publishing and
+SQLite materialization remain future phases.
 
 This document is the design contract for the next stencil-cover iteration.
 The typed solver port lives in `transformers/stencil_solver_api.py`; this
@@ -87,9 +88,9 @@ those fields. A different configuration is a different identity. Time limit,
 native effort budget, and foreground/background policy are recorded on each
 attempt, not folded into backend implementation identity.
 
-HiGHS remains the default and will be the first adapter extracted in Phase 1.
-No gomecsolver or OR-Tools dependency is introduced in this phase. A fake
-backend will exercise substitution in Phase 1.
+HiGHS remains the default behind the extracted `HiGHSBackend` adapter. No
+gomecsolver or OR-Tools dependency is introduced. Phase 1 exercises
+substitution with a fake backend through foreground and bulk paths.
 
 The seam follows ADR-0012 P2: the transformer depends on the port, and the
 selected backend is composed at the boundary. It also follows ADR-0012 P12:

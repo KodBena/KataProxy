@@ -1,11 +1,13 @@
 """Solver-independent geometry and compact legacy-result codecs."""
 from __future__ import annotations
 
-from typing import Sequence, TypeAlias
+from typing import Mapping, Sequence, TypeAlias
 
 Cell: TypeAlias = tuple[int, int]
 Stencil: TypeAlias = tuple[str, tuple[Cell, ...]]
 Placement: TypeAlias = tuple[str, tuple[Cell, ...]]
+
+MAX_COMPONENT_DIMENSION = 25
 
 D4_MATRICES: tuple[tuple[int, int, int, int], ...] = (
     (1, 0, 0, 1), (0, 1, -1, 0), (-1, 0, 0, -1), (0, -1, 1, 0),
@@ -31,7 +33,7 @@ def normalise_shape(cells: Sequence[Cell], transform: int = 0) -> tuple[Cell, ..
 
 
 def decode_component_shape_key(
-    shape_key: bytes, *, max_dimension: int = 25,
+    shape_key: bytes, *, max_dimension: int = MAX_COMPONENT_DIMENSION,
 ) -> tuple[int, int, tuple[int, ...]]:
     """Decode the canonical height/width + row-major LSB-first bitmap."""
     if not isinstance(shape_key, bytes) or len(shape_key) < 2:
@@ -108,7 +110,7 @@ def verify_canonical_placements(
 def verify_component_placements(
     component: Sequence[int],
     board_width: int,
-    placements: Sequence[dict[str, object]],
+    placements: Sequence[Mapping[str, object]],
     family: Sequence[Stencil],
 ) -> None:
     """Reject corrupt or incorrectly recovered covers before they are served."""

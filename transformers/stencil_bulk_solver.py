@@ -15,7 +15,7 @@ import argparse
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, Sequence, Tuple
+from typing import Any, Callable, Dict, Protocol, Sequence, Tuple
 
 from transformers.stencil_cache_storage import (
     RedisStencilStore,
@@ -40,6 +40,33 @@ logger = logging.getLogger("kataproxy.stencil_bulk_solver")
 CACHE_NAMESPACE = "solver-component-d4-v3"
 BULK_TIME_LIMIT_MS = 10_000
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+
+
+class StencilQueueStore(Protocol):
+    """Minimal shared state port needed by the sequential bulk worker."""
+
+    def initialize_pending_queue(self, family: Sequence[Stencil]) -> int: ...
+
+    def timeout_metadata(
+        self, shape_key: bytes, family: Sequence[Stencil],
+    ) -> Dict[str, Any] | None: ...
+
+    def get_result(
+        self, shape_key: bytes, family: Sequence[Stencil],
+    ) -> Tuple[bool, int, bytes] | None: ...
+
+    def put_result(
+        self, shape_key: bytes, family: Sequence[Stencil],
+        result: Tuple[bool, int, bytes],
+    ) -> bool: ...
+
+    def mark_timed_out(
+        self, shape_key: bytes, family: Sequence[Stencil],
+        result: Tuple[bool, int, bytes], *,
+        time_limit_ms: int, attempted_at: float,
+    ) -> bool: ...
+
+    def pending_components(self, family: Sequence[Stencil]) -> frozenset[bytes]: ...
 
 
 def _validate_bulk_result(
@@ -80,7 +107,7 @@ class StencilBulkSolver:
 
     def __init__(
         self,
-        store: RedisStencilStore,
+        store: StencilQueueStore,
         family: Tuple[Stencil, ...] = STENCIL_FAMILY,
         solver_backend: SolverBackend | None = None,
         clock: Callable[[], float] = time.time,
@@ -88,7 +115,7 @@ class StencilBulkSolver:
         self.store = store
         self.family = family
         self.store.initialize_pending_queue(self.family)
-        self.solver_backend = solver_backend or create_solver_backend("highs")
+        self.solver_backend = create_solver_backend("highs") if solver_backend is None else solver_backend
         self.clock = clock
 
     def process_component(self, shape_key: bytes) -> str:

@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, cast
+from typing import Any
 
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_bulk_solver import StencilBulkSolver
 from transformers.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
+    LowerBoundUnavailable,
+    NoIncumbent,
+    NoIncumbentReason,
     NativeEffortUnavailable,
     NoNativeEffortReason,
     NoSolverFailure,
@@ -21,7 +24,6 @@ from transformers.stencil_solver_api import (
     SolverOutcome,
 )
 from transformers.stencil_solver_runtime import solve_component
-from transformers.stencil_cache_storage import RedisStencilStore
 from transformers.stencil_solver_factory import (
     create_solver_backend, register_solver_backend,
 )
@@ -155,8 +157,19 @@ class _MemoryStore:
         self.stored.append(result)
         return True
 
-    def mark_timed_out(self, *_args: Any, **_kwargs: Any) -> bool:
+    def mark_timed_out(
+        self,
+        _shape_key: bytes,
+        _family: Any,
+        _result: tuple[bool, int, bytes],
+        *,
+        time_limit_ms: int,
+        attempted_at: float,
+    ) -> bool:
         return True
+
+    def pending_components(self, _family: Any) -> frozenset[bytes]:
+        return frozenset()
 
 
 def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
@@ -166,7 +179,7 @@ def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
     )
     store = _MemoryStore((False, 2, fallback))
     backend = _FakeOptimalBackend()
-    worker = StencilBulkSolver(cast(RedisStencilStore, store), family=family, solver_backend=backend)
+    worker = StencilBulkSolver(store, family=family, solver_backend=backend)
 
     assert worker.process_component(_domino_key()) == "optimal"
     assert store.result[0:2] == (True, 0)
@@ -217,3 +230,105 @@ def test_local_lru_keeps_different_backend_profiles_separate() -> None:
     cache(_domino_key(), 250, family, second)
     cache(_domino_key(), 250, family, first)
     assert calls == [first.identity.fingerprint, second.identity.fingerprint]
+
+
+class _FakeNoIncumbentBackend:
+    @property
+    def identity(self) -> SolverIdentity:
+        return _identity(name="empty", mode="no-incumbent")
+
+    def solve(self, problem: Any, budget: Any) -> SolverOutcome:
+        return SolverOutcome(
+            status=OutcomeStatus.NO_INCUMBENT,
+            incumbent=NoIncumbent(NoIncumbentReason.BUDGET_EXHAUSTED),
+            lower_bound=LowerBoundUnavailable(),
+            native_effort=NativeEffortUnavailable(
+                NoNativeEffortReason.BACKEND_DID_NOT_REPORT_EFFORT,
+            ),
+            backend_status=BackendStatusReported("TIME_LIMIT"),
+            backend_metrics_json="{}",
+            error=NoSolverFailure(),
+        )
+
+
+def test_no_incumbent_uses_a_distinct_singleton_fallback() -> None:
+    family = (("domino", ((0, 0), (0, 1))),)
+    key, _frame = stencil._component_shape_key((0,), 1, family)
+    execution = solve_component(
+        _FakeNoIncumbentBackend(),
+        key,
+        family,
+        SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="foreground-250ms",
+        ),
+    )
+    assert execution.outcome.status is OutcomeStatus.NO_INCUMBENT
+    assert execution.fallback_used is True
+    assert execution.cache_result[0:2] == (False, 2)
+
+
+class _FakeFeasibleBackend(_FakeOptimalBackend):
+    def solve(self, problem: Any, budget: Any) -> SolverOutcome:
+        optimal_result = super().solve(problem, budget)
+        return SolverOutcome(
+            status=OutcomeStatus.FEASIBLE,
+            incumbent=optimal_result.incumbent,
+            lower_bound=LowerBoundUnavailable(),
+            native_effort=optimal_result.native_effort,
+            backend_status=BackendStatusReported("TIME_LIMIT_WITH_INCUMBENT"),
+            backend_metrics_json=optimal_result.backend_metrics_json,
+            error=NoSolverFailure(),
+        )
+
+
+def test_valid_feasible_incumbent_is_preserved_without_claiming_optimality() -> None:
+    execution = solve_component(
+        _FakeFeasibleBackend(),
+        _domino_key(),
+        _domino_family(),
+        SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="foreground-250ms",
+        ),
+    )
+    assert execution.outcome.status is OutcomeStatus.FEASIBLE
+    assert execution.outcome.optimality_proven is False
+    assert execution.cache_result[0:2] == (False, 1)
+    assert execution.fallback_used is False
+
+
+class _FakeInvalidWitnessBackend(_FakeOptimalBackend):
+    def solve(self, problem: Any, budget: Any) -> SolverOutcome:
+        self.calls.append((problem, budget))
+        invalid = PlacementWitness((("1x2", ((0, 0), (0, 2))),))
+        return SolverOutcome(
+            status=OutcomeStatus.OPTIMAL,
+            incumbent=Incumbent(1, invalid),
+            lower_bound=ProvenLowerBound(1),
+            native_effort=NativeEffortUnavailable(
+                NoNativeEffortReason.BACKEND_DOES_NOT_EXPOSE_EFFORT,
+            ),
+            backend_status=BackendStatusReported("FAKE_OPTIMAL"),
+            backend_metrics_json="{}",
+            error=NoSolverFailure(),
+        )
+
+
+def test_invalid_backend_witness_is_rejected_and_not_cached_as_optimal() -> None:
+    execution = solve_component(
+        _FakeInvalidWitnessBackend(),
+        _domino_key(),
+        _domino_family(),
+        SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="foreground-250ms",
+        ),
+    )
+    assert execution.outcome.status is OutcomeStatus.ERROR
+    assert execution.outcome.optimality_proven is False
+    assert execution.cache_result[0:2] == (False, 2)
+    assert execution.fallback_used is True

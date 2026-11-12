@@ -43,6 +43,7 @@ from transformers.stencil_solver_api import (
 )
 from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_solver_geometry import (
+    MAX_COMPONENT_DIMENSION as _MAX_BOARD_SIZE,
     D4_INVERSE as _D4_INVERSE,
     D4_MATRICES as _D4_MATRICES,
     decode_component_shape_key as _decode_component_shape_key,
@@ -67,7 +68,6 @@ class RequestContext:
     moves: Tuple[Tuple[str, Optional[int]], ...]
 
 
-_MAX_BOARD_SIZE = 25
 _SOLVER_TIME_LIMIT_MS = 250
 # lru_cache is entry-bounded, not byte-bounded. Results are compact binary
 # placement lists (<= about 2.5 KB even for a 25x25 all-singleton cover),
@@ -733,7 +733,7 @@ class _InvalidatableSolverCache:
         family: Tuple[Stencil, ...],
         backend: SolverBackend | None = None,
     ) -> Tuple[bool, int, bytes]:
-        backend = backend or DEFAULT_SOLVER_BACKEND
+        backend = DEFAULT_SOLVER_BACKEND if backend is None else backend
         cache_key = (shape_key, time_limit_ms, family, backend.identity.fingerprint)
         while True:
             with self._lock:
@@ -966,7 +966,7 @@ def stencil_cover_enricher(
     solver_backend: SolverBackend | None = None,
 ) -> Transformer[KataGoQuery, KataGoResponse]:
     """Enrich opted-in final packets; the backend is injected at composition."""
-    selected_backend = solver_backend or DEFAULT_SOLVER_BACKEND
+    selected_backend = DEFAULT_SOLVER_BACKEND if solver_backend is None else solver_backend
     request_cache: Dict[ClientId, RequestContext] = {}
 
     def on_query(eid: ClientId, query: KataGoQuery) -> Optional[KataGoQuery]:
