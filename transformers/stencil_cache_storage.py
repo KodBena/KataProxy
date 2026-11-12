@@ -17,11 +17,14 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
 from inspect import signature
-from typing import Any, Callable, Dict, FrozenSet, TypeVar, cast
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable, Dict, FrozenSet, Iterator, TypeVar, cast
 
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger("kataproxy.stencil_cache_storage")
@@ -170,7 +173,10 @@ _REDIS_PORT = 6379
 _REDIS_DB = 7
 _CONNECT_TIMEOUT_SECONDS = 0.25
 _SOCKET_TIMEOUT_SECONDS = 0.25
-_VALUE_SCHEMA_VERSION = 2
+_VALUE_SCHEMA_VERSION = 3
+_LEGACY_CACHE_NAMESPACE = "solver-component-d4-v3"
+_CURRENT_CACHE_NAMESPACE = "solver-component-d4-v4"
+_LEGACY_VALUE_SCHEMA_VERSION = 2
 
 
 class RedisCacheConflict(RuntimeError):
@@ -234,21 +240,166 @@ def _result_fields(result: Any) -> tuple[bool, int, bytes, int]:
     return optimal, status, encoded_placements, cost
 
 
-def _encode_solver_result(result: Any) -> bytes:
+@dataclass(frozen=True)
+@dataclass(frozen=True)
+class SolverCacheCandidate:
+    """New solver result plus the invocation provenance that produced it."""
+
+    result: tuple[bool, int, bytes]
+    provenance: Dict[str, Any]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.result)
+
+
+@dataclass(frozen=True)
+class StoredSolverResult:
+    """Decoded result row, including explicit legacy provenance disposition."""
+
+    result: tuple[bool, int, bytes]
+    provenance: Dict[str, Any]
+    quality_lower_bound: int | None
+
+
+def _validate_result_provenance(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Redis result provenance must be an object")
+    disposition = value.get("disposition")
+    if disposition == "legacy_unknown":
+        if set(value) != {"disposition"}:
+            raise ValueError("legacy_unknown provenance must not invent attempt fields")
+    elif disposition == "present":
+        required = {
+            "disposition", "attempt_id", "solver_identity", "producer_path",
+            "budget", "started_at_utc", "elapsed_wall_ns", "outcome",
+        }
+        if set(value) != required:
+            raise ValueError("result provenance has an unsupported field set")
+        try:
+            parsed_id = str(uuid.UUID(value["attempt_id"]))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("result provenance attempt_id must be a canonical UUID") from exc
+        if parsed_id != value["attempt_id"]:
+            raise ValueError("result provenance attempt_id must be lowercase canonical UUID")
+        identity = value["solver_identity"]
+        if not isinstance(identity, dict):
+            raise ValueError("result provenance solver_identity must be an object")
+        expected_identity = {
+            "fingerprint", "backend_name", "backend_version", "adapter_version",
+            "configuration_json", "configuration_fingerprint",
+        }
+        if set(identity) != expected_identity:
+            raise ValueError("result provenance solver identity is malformed")
+        for key in expected_identity:
+            if not isinstance(identity[key], str) or not identity[key]:
+                raise ValueError("result provenance solver identity fields must be non-empty")
+        if not re.fullmatch(r"[0-9a-f]{64}", identity["fingerprint"]):
+            raise ValueError("result provenance solver fingerprint must be lowercase SHA-256")
+        try:
+            configuration = json.loads(identity["configuration_json"])
+            canonical_configuration = json.dumps(
+                configuration, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True, allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("result provenance configuration must be finite JSON") from exc
+        if not isinstance(configuration, dict) or (
+            canonical_configuration != identity["configuration_json"]
+        ):
+            raise ValueError("result provenance configuration must be canonical JSON")
+        expected_configuration_fingerprint = hashlib.sha256(
+            canonical_configuration.encode("utf-8")
+        ).hexdigest()
+        if identity["configuration_fingerprint"] != expected_configuration_fingerprint:
+            raise ValueError("result provenance configuration fingerprint is inconsistent")
+        identity_fields = {
+            "adapter_version": identity["adapter_version"],
+            "backend_name": identity["backend_name"],
+            "backend_version": identity["backend_version"],
+            "configuration_fingerprint": identity["configuration_fingerprint"],
+        }
+        expected_solver_fingerprint = hashlib.sha256(
+            json.dumps(
+                identity_fields, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if identity["fingerprint"] != expected_solver_fingerprint:
+            raise ValueError("result provenance solver fingerprint is inconsistent")
+        if value["producer_path"] not in ("foreground", "bulk"):
+            raise ValueError("result provenance producer_path is unsupported")
+        budget = value["budget"]
+        if not isinstance(budget, dict) or set(budget) != {
+            "wall_time_limit_ms", "policy_id", "native_effort_limit",
+        }:
+            raise ValueError("result provenance budget is malformed")
+        if (
+            isinstance(budget["wall_time_limit_ms"], bool)
+            or not isinstance(budget["wall_time_limit_ms"], int)
+            or budget["wall_time_limit_ms"] <= 0
+            or not isinstance(budget["policy_id"], str)
+            or not budget["policy_id"]
+            or not isinstance(budget["native_effort_limit"], dict)
+        ):
+            raise ValueError("result provenance budget fields are malformed")
+        started_at = value["started_at_utc"]
+        if not isinstance(started_at, str) or not started_at.endswith("Z"):
+            raise ValueError("result provenance started_at_utc must be UTC")
+        try:
+            datetime.fromisoformat(started_at[:-1] + "+00:00")
+        except ValueError as exc:
+            raise ValueError("result provenance started_at_utc is malformed") from exc
+        elapsed = value["elapsed_wall_ns"]
+        if isinstance(elapsed, bool) or not isinstance(elapsed, int) or elapsed < 0:
+            raise ValueError("result provenance elapsed_wall_ns is malformed")
+        if not isinstance(value["outcome"], dict):
+            raise ValueError("result provenance outcome must be an object")
+        try:
+            json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("result provenance must be finite JSON data") from exc
+    else:
+        raise ValueError("Redis result provenance disposition is unsupported")
+    return value
+
+
+def _quality_lower_bound(provenance: Dict[str, Any]) -> int | None:
+    if provenance.get("disposition") != "present":
+        return None
+    lower = provenance["outcome"].get("lower_bound")
+    if isinstance(lower, dict) and lower.get("disposition") == "reported":
+        value = lower.get("value")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def _encode_solver_result(
+    result: Any,
+    provenance: Dict[str, Any] | None = None,
+) -> bytes:
     optimal, status, encoded_placements, cost = _result_fields(result)
+    provenance_value = _validate_result_provenance(
+        {"disposition": "legacy_unknown"} if provenance is None else provenance
+    )
+    quality_bound = _quality_lower_bound(provenance_value)
+    if quality_bound is not None and quality_bound > cost:
+        raise ValueError("result provenance lower bound exceeds incumbent tile count")
     payload = {
         "version": _VALUE_SCHEMA_VERSION,
         "optimal": optimal,
         "status": status,
         "tile_count": cost,
         "placements": base64.b64encode(encoded_placements).decode("ascii"),
+        "quality_lower_bound": quality_bound,
+        "provenance": provenance_value,
     }
     return json.dumps(
-        payload, sort_keys=True, separators=(",", ":"),
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
     ).encode("utf-8")
 
 
-def _decode_solver_result(raw: Any) -> tuple[bool, int, bytes]:
+def _decode_solver_result_record(raw: Any) -> StoredSolverResult:
     if isinstance(raw, bytes):
         text = raw.decode("utf-8")
     elif isinstance(raw, str):
@@ -256,10 +407,10 @@ def _decode_solver_result(raw: Any) -> tuple[bool, int, bytes]:
     else:
         raise ValueError("Redis cache value is not bytes or text")
     payload = json.loads(text)
-    if (
-        not isinstance(payload, dict)
-        or payload.get("version") != _VALUE_SCHEMA_VERSION
-    ):
+    if not isinstance(payload, dict):
+        raise ValueError("Redis cache value must be an object")
+    version = payload.get("version")
+    if version not in (_LEGACY_VALUE_SCHEMA_VERSION, _VALUE_SCHEMA_VERSION):
         raise ValueError("Redis cache value has an unsupported schema")
 
     optimal = payload.get("optimal")
@@ -290,7 +441,47 @@ def _decode_solver_result(raw: Any) -> tuple[bool, int, bytes]:
         raise ValueError("Redis cache placements are not valid base64") from exc
     if _result_cost(encoded_placements) != tile_count:
         raise ValueError("Redis cache tile count does not match its placement list")
-    return optimal, status, encoded_placements
+
+    if version == _LEGACY_VALUE_SCHEMA_VERSION:
+        provenance = {"disposition": "legacy_unknown"}
+        quality_bound = None
+    else:
+        provenance = _validate_result_provenance(payload.get("provenance"))
+        quality_bound = payload.get("quality_lower_bound")
+        if quality_bound is not None and (
+            isinstance(quality_bound, bool)
+            or not isinstance(quality_bound, int)
+            or quality_bound < 0
+            or quality_bound > tile_count
+        ):
+            raise ValueError("Redis cache quality lower bound is malformed")
+        if (
+            provenance["disposition"] == "present"
+            and status == 0
+            and quality_bound != tile_count
+        ):
+            raise ValueError("proven optimal result provenance requires a matching lower bound")
+
+    return StoredSolverResult(
+        result=(optimal, status, encoded_placements),
+        provenance=provenance,
+        quality_lower_bound=quality_bound,
+    )
+
+
+def _decode_solver_result(raw: Any) -> tuple[bool, int, bytes]:
+    return _decode_solver_result_record(raw).result
+
+
+def _candidate_fields(value: Any) -> tuple[tuple[bool, int, bytes], Dict[str, Any]]:
+    if isinstance(value, SolverCacheCandidate):
+        result = value.result
+        provenance = _validate_result_provenance(value.provenance)
+    else:
+        result = value
+        provenance = {"disposition": "legacy_unknown"}
+    _result_fields(result)
+    return result, provenance
 
 
 # A single Lua operation stores improvements and atomically maintains the
@@ -301,12 +492,14 @@ _STORE_RESULT_SCRIPT = """
 local old_raw = redis.call('GET', KEYS[1])
 local new_status = tonumber(ARGV[2])
 local new_cost = tonumber(ARGV[3])
+local new_bound = tonumber(ARGV[6])
 local should_store = true
 
 if old_raw then
     local ok, old = pcall(cjson.decode, old_raw)
     local old_status = nil
     local old_cost = nil
+    local old_bound = nil
     if ok and type(old) == 'table' and
        old.version == tonumber(ARGV[4]) and
        type(old.optimal) == 'boolean' and
@@ -314,9 +507,11 @@ if old_raw then
        string.len(old.placements) > 0 then
         old_status = tonumber(old.status)
         old_cost = tonumber(old.tile_count)
+        old_bound = tonumber(old.quality_lower_bound)
         if old.optimal ~= (old_status == 0) then
             old_status = nil
             old_cost = nil
+            old_bound = nil
         end
     end
     if old_status ~= nil and old_cost ~= nil and
@@ -325,8 +520,16 @@ if old_raw then
             return -1
         end
         if new_status > old_status or
-           (new_status == old_status and new_cost >= old_cost) then
+           (new_status == old_status and new_cost > old_cost) then
             should_store = false
+        elseif new_status == old_status and new_cost == old_cost then
+            if new_bound == nil and old_bound == nil then
+                should_store = false
+            elseif new_bound == nil and old_bound ~= nil then
+                should_store = false
+            elseif new_bound ~= nil and old_bound ~= nil and new_bound <= old_bound then
+                should_store = false
+            end
         end
     end
 end
@@ -353,6 +556,17 @@ if should_store then
     return 1
 end
 return 0
+"""
+
+_MIGRATE_LEGACY_RESULT_SCRIPT = """
+if redis.call('SETNX', KEYS[1], ARGV[1]) == 0 then
+    return 0
+end
+local value = cjson.decode(ARGV[1])
+if tonumber(value.status) ~= 0 then
+    redis.call('SADD', KEYS[2], ARGV[2])
+end
+return 1
 """
 
 _MARK_TIMED_OUT_SCRIPT = """
@@ -392,6 +606,11 @@ _INITIALIZE_PENDING_SCRIPT = """
 if redis.call('SETNX', KEYS[4], '1') == 0 then
     return 0
 end
+-- Preserve the old v3 hard index, but deliberately ignore its timeout hash:
+-- v3 retirement metadata was not tied to a solver work profile.
+for _, shape_key in ipairs(redis.call('SMEMBERS', KEYS[5])) do
+    redis.call('SADD', KEYS[1], shape_key)
+end
 local queued = 0
 for _, shape_key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
     if redis.call('HEXISTS', KEYS[3], shape_key) == 0 then
@@ -417,16 +636,27 @@ class RedisStencilStore:
             raise ValueError("persistent cache namespace must be a non-empty safe token")
         self._client = client
         self._namespace = namespace
+        self._legacy_namespace = (
+            _LEGACY_CACHE_NAMESPACE
+            if namespace == _CURRENT_CACHE_NAMESPACE
+            else None
+        )
 
-    def _problem_key(self, shape_key: bytes, family: Any) -> str:
+    @staticmethod
+    def _problem_key_for_namespace(
+        namespace: str, shape_key: bytes, family: Any,
+    ) -> str:
         if not isinstance(shape_key, bytes) or not shape_key:
             raise TypeError("canonical stencil component key must be non-empty bytes")
         digest = _stable_digest({
-            "namespace": self._namespace,
+            "namespace": namespace,
             "shape": shape_key,
             "family": family,
         })
-        return f"kataproxy:stencil-cover:{self._namespace}:result:{digest}"
+        return f"kataproxy:stencil-cover:{namespace}:result:{digest}"
+
+    def _problem_key(self, shape_key: bytes, family: Any) -> str:
+        return self._problem_key_for_namespace(self._namespace, shape_key, family)
 
     def _family_key(self, kind: str, family: Any) -> str:
         fingerprint = _stable_digest(family)
@@ -448,19 +678,25 @@ class RedisStencilStore:
         return self._family_key("pending-initialized", family)
 
     def initialize_pending_queue(self, family: Any) -> int:
-        """Seed the new queue from pre-existing non-optimal v3 result indexes.
+        """Seed v4 work from non-optimal results, ignoring old global timeouts.
 
-        This one-time atomic migration preserves components cached before the
-        pending queue existed. A marker prevents rescanning the hard index on
-        every worker poll or after process restarts.
+        The old v3 hard index is copied into v4. Its timeout hash is deliberately
+        not consulted because those retirements did not name a solver profile.
         """
+        legacy_hard = (
+            f"kataproxy:stencil-cover:{self._legacy_namespace}:"
+            f"hard:{_stable_digest(family)}"
+            if self._legacy_namespace is not None
+            else self._hard_set_key(family)
+        )
         return int(self._client.eval(
             _INITIALIZE_PENDING_SCRIPT,
-            4,
+            5,
             self._hard_set_key(family),
             self._pending_set_key(family),
             self._timeout_hash_key(family),
             self._pending_initialized_key(family),
+            legacy_hard,
         ))
 
     def _members(self, redis_key: str) -> FrozenSet[bytes]:
@@ -475,23 +711,60 @@ class RedisStencilStore:
                 raise ValueError("Redis stencil index contains a non-byte member")
         return frozenset(result)
 
+    def get_result_record(
+        self, shape_key: bytes, family: Any,
+    ) -> StoredSolverResult | None:
+        current_key = self._problem_key(shape_key, family)
+        raw = self._client.get(current_key)
+        if raw is None and self._legacy_namespace is not None:
+            legacy_key = self._problem_key_for_namespace(
+                self._legacy_namespace, shape_key, family,
+            )
+            legacy_raw = self._client.get(legacy_key)
+            if legacy_raw is not None:
+                legacy_record = _decode_solver_result_record(legacy_raw)
+                # Copy the best result without claiming that the old attempt's
+                # solver identity, budget, timing or event provenance is known.
+                migrated = _encode_solver_result(
+                    legacy_record.result,
+                    {"disposition": "legacy_unknown"},
+                )
+                self._client.eval(
+                    _MIGRATE_LEGACY_RESULT_SCRIPT,
+                    2,
+                    current_key,
+                    self._hard_set_key(family),
+                    migrated,
+                    shape_key,
+                )
+                raw = self._client.get(current_key)
+                if raw is None:
+                    raw = migrated
+        if raw is None:
+            return None
+        return _decode_solver_result_record(raw)
+
     def get_result(
         self, shape_key: bytes, family: Any,
     ) -> tuple[bool, int, bytes] | None:
-        raw = self._client.get(self._problem_key(shape_key, family))
-        if raw is None:
-            return None
-        return _decode_solver_result(raw)
+        record = self.get_result_record(shape_key, family)
+        return None if record is None else record.result
 
     def put_result(
         self,
         shape_key: bytes,
         family: Any,
         result: tuple[bool, int, bytes],
+        *,
+        provenance: Dict[str, Any] | None = None,
     ) -> bool:
-        """Persist a result, queueing each newly improved non-optimal result."""
+        """Persist a best result and the provenance of the attempt that won it."""
         _optimal, status, _placements, cost = _result_fields(result)
-        raw = _encode_solver_result(result)
+        provenance_value = _validate_result_provenance(
+            {"disposition": "legacy_unknown"} if provenance is None else provenance
+        )
+        raw = _encode_solver_result(result, provenance_value)
+        quality_bound = _quality_lower_bound(provenance_value)
         outcome = self._client.eval(
             _STORE_RESULT_SCRIPT,
             4,
@@ -504,6 +777,7 @@ class RedisStencilStore:
             str(cost),
             str(_VALUE_SCHEMA_VERSION),
             shape_key,
+            "" if quality_bound is None else str(quality_bound),
         )
         if int(outcome) == -1:
             raise RedisCacheConflict(
@@ -626,7 +900,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             nonlocal store
             if not enabled:
-                return function(*args, **kwargs)
+                return _candidate_fields(function(*args, **kwargs))[0]
 
             # If Redis was unavailable during module import, the background
             # subscriber may reconnect later. Adopt its client lazily here;
@@ -639,7 +913,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
                         if recovered_client is not None:
                             store = RedisStencilStore(recovered_client, namespace)
             if store is None:
-                return function(*args, **kwargs)
+                return _candidate_fields(function(*args, **kwargs))[0]
 
             bound = function_signature.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -652,22 +926,24 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
                 ) from exc
 
             try:
-                cached = store.get_result(shape_key, family)
+                cached_record = store.get_result_record(shape_key, family)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
                 logger.warning(
                     "Ignoring malformed Redis stencil cache entry (%s)", exc,
                 )
-                cached = None
+                cached_record = None
             except Exception as exc:
                 disable_after_error(exc)
-                return function(*args, **kwargs)
+                return _candidate_fields(function(*args, **kwargs))[0]
 
-            if cached is not None:
-                return cached
+            if cached_record is not None:
+                return cached_record.result
 
-            result = function(*args, **kwargs)
+            result, provenance = _candidate_fields(function(*args, **kwargs))
             try:
-                updated = store.put_result(shape_key, family, result)
+                updated = store.put_result(
+                    shape_key, family, result, provenance=provenance,
+                )
                 if not updated:
                     # A concurrent worker or request may already have stored a
                     # better result. Return that row so the outer LRU cannot

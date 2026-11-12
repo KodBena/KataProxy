@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Sequence
+from typing import Any, Sequence
 
 from transformers.stencil_cache_storage import _stable_digest
 from transformers.stencil_corpus_events import ProducerPath, make_solver_attempt_event
@@ -32,6 +33,7 @@ class SolverExecution:
     canonical_key: bytes
     problem: CanonicalProblem
     identity: SolverIdentity
+    attempt_id: str
     outcome: SolverOutcome
     reported_outcome: SolverOutcome
     started_at_utc: str
@@ -39,6 +41,7 @@ class SolverExecution:
     placements_disposition: str
     cache_result: tuple[bool, int, bytes]
     fallback_used: bool
+    result_provenance: dict[str, Any]
 
 
 def canonical_problem_from_key(
@@ -154,6 +157,7 @@ def solve_component(
     """Shared foreground/background path; no cache, Redis, SQLite, or request state."""
     problem = canonical_problem_from_key(shape_key, family)
     identity = backend.identity
+    attempt_id = str(uuid.uuid4())
     started_at_utc = datetime.now(timezone.utc).isoformat(
         timespec="microseconds",
     ).replace("+00:00", "Z")
@@ -173,6 +177,7 @@ def solve_component(
         canonical_key=shape_key,
         problem=problem,
         identity=identity,
+        attempt_id=attempt_id,
         outcome=normalized_outcome,
         reported_outcome=reported_outcome,
         started_at_utc=started_at_utc,
@@ -180,20 +185,55 @@ def solve_component(
         placements_disposition=placements_disposition,
         cache_result=cache_result,
         fallback_used=fallback_used,
+        result_provenance={"disposition": "legacy_unknown"},
     )
     selected_publisher = (
         get_default_event_publisher() if event_publisher is None else event_publisher
     )
-    if selected_publisher is not None:
-        try:
-            event = make_solver_attempt_event(
-                execution, shape_key, budget, producer_path,
-            )
+    try:
+        event = make_solver_attempt_event(
+            execution, shape_key, budget, producer_path, event_id=attempt_id,
+        )
+        outcome_document = event["outcome"]
+        provenance = {
+            "disposition": "present",
+            "attempt_id": attempt_id,
+            "solver_identity": event["solver_identity"],
+            "producer_path": event["producer_path"],
+            "budget": event["budget"],
+            "started_at_utc": event["started_at_utc"],
+            "elapsed_wall_ns": event["elapsed_wall_ns"],
+            "outcome": {
+                "status": outcome_document["status"],
+                "optimality_proven": outcome_document["optimality_proven"],
+                "incumbent": outcome_document["incumbent"],
+                "lower_bound": outcome_document["lower_bound"],
+                "native_effort": outcome_document["native_effort"],
+                "backend_status": outcome_document["backend_status"],
+                "error": outcome_document["error"],
+                "fallback_disposition": event["fallback_disposition"],
+            },
+        }
+        execution = SolverExecution(
+            canonical_key=execution.canonical_key,
+            problem=execution.problem,
+            identity=execution.identity,
+            attempt_id=execution.attempt_id,
+            outcome=execution.outcome,
+            reported_outcome=execution.reported_outcome,
+            started_at_utc=execution.started_at_utc,
+            elapsed_wall_ns=execution.elapsed_wall_ns,
+            placements_disposition=execution.placements_disposition,
+            cache_result=execution.cache_result,
+            fallback_used=execution.fallback_used,
+            result_provenance=provenance,
+        )
+        if selected_publisher is not None:
             selected_publisher.publish(event)
-        except Exception:
-            # Corpus logging must never suppress or alter the solver result.
-            logger.exception(
-                "Could not construct stencil solver_attempt event for key %s",
-                shape_key.hex(),
-            )
+    except Exception:
+        # Provenance/event capture must never suppress or alter the solver result.
+        logger.exception(
+            "Could not construct or publish stencil solver_attempt event for key %s",
+            shape_key.hex(),
+        )
     return execution

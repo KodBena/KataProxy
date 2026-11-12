@@ -154,16 +154,18 @@ whether it was found by a 250 ms foreground solve or a 10-second background
 solve. The process-local LRU does include the time budget in its key, because
 it caches the request call's result for that call signature.
 
-A stored result is only:
+A stored best-result row contains:
 
-- an `optimal` flag;
-- a status code;
-- the tile count; and
-- the compact encoded stencil placements.
+- an `optimal` flag and status code;
+- incumbent tile count and compact encoded stencil placements;
+- a certified quality lower bound when one was reported; and
+- provenance for the attempt that won result arbitration, or the explicit
+  `legacy_unknown` disposition for a migrated v3 row.
 
-The problem instance is the canonical shape key. No solver object, model,
-basis, branch-and-bound tree, solver checkpoint, or other search state is
-persisted.
+Winning provenance includes attempt UUID, backend/configuration identity,
+producer path, budget, start timestamp, elapsed wall time, and typed outcome
+summary. It does not contain a solver model, basis, branch-and-bound tree,
+checkpoint, or other resumable search state.
 
 Status codes are ordered as follows:
 
@@ -174,10 +176,12 @@ Status codes are ordered as follows:
 | `2` | Guaranteed singleton fallback because no valid solver cover was available | No |
 
 For non-optimal rows, status 1 ranks ahead of status 2. Within the same
-non-optimal status, fewer tiles ranks ahead of more tiles. A proven-optimal
-row always ranks ahead of either non-optimal status. If two proven-optimal
-writes disagree on tile count for the same canonical problem, the store raises
-a `RedisCacheConflict` rather than silently accepting the contradiction.
+status, fewer tiles ranks ahead of more tiles. When status and tile count are
+equal, a stronger certified lower bound wins; an absent bound never replaces
+a known bound. A proven-optimal row always ranks ahead of either non-optimal
+status. If two proven-optimal writes disagree on tile count for the same
+canonical problem, the store raises a `RedisCacheConflict` rather than
+silently accepting the contradiction.
 
 ## Redis indexes and their lifecycle
 
@@ -411,3 +415,23 @@ A reviewer can use these invariants when changing this subsystem:
 8. **One bulk worker at a time.** Adding concurrent workers requires an
    explicit claim/lease protocol, expiry and crash recovery, and tests for
    lease races; the Redis result arbitration alone is not a work-claim system.
+
+
+## Result provenance cutover (Phase 4)
+
+The active persistent result namespace is now
+`solver-component-d4-v4` with value schema 3. The old v3 namespace/value
+schema 2 remains in Redis and is read through on demand. A copied old row is
+marked `legacy_unknown`; no historical solver profile or attempt metadata is
+fabricated. V4 queue initialization copies old hard components but ignores
+old global timeout retirements because those did not identify a solver
+profile.
+
+New v4 rows preserve invocation provenance only for the candidate that wins
+result arbitration: attempt UUID, solver identity/configuration, producer
+path, budget, start timestamp, elapsed wall time, and typed outcome summary.
+For equal result status and tile count, a larger certified lower bound is a
+better result. The old optimal-first and tile-count ranking remains in force.
+
+Profile-specific pending/timeout keys are not part of this sub-step. Until
+that follow-on change, v4 uses the existing single active work profile.

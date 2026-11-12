@@ -82,9 +82,12 @@ def _domino_key() -> bytes:
 def test_fake_backend_substitutes_without_transformer_solver_changes() -> None:
     family = _domino_family()
     backend = _FakeOptimalBackend()
-    optimal, status, encoded = stencil._solve_component_uncached(
+    candidate = stencil._solve_component_uncached(
         _domino_key(), 250, family, backend,
     )
+    optimal, status, encoded = candidate
+    assert candidate.provenance["disposition"] == "present"
+    assert candidate.provenance["producer_path"] == "foreground"
     assert optimal is True
     assert status == 0
     assert len(encoded) > 2
@@ -141,6 +144,7 @@ class _MemoryStore:
     def __init__(self, initial: tuple[bool, int, bytes]) -> None:
         self.result = initial
         self.stored: list[tuple[bool, int, bytes]] = []
+        self.provenance: Dict[str, Any] | None = None
 
     def initialize_pending_queue(self, _family: Any) -> int:
         return 0
@@ -153,9 +157,11 @@ class _MemoryStore:
 
     def put_result(
         self, _shape_key: bytes, _family: Any, result: tuple[bool, int, bytes],
+        *, provenance: Dict[str, Any] | None = None,
     ) -> bool:
         self.result = result
         self.stored.append(result)
+        self.provenance = provenance
         return True
 
     def mark_timed_out(
@@ -188,6 +194,9 @@ def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
     _problem, budget = backend.calls[0]
     assert budget.wall_time_limit_ms == 10_000
     assert budget.policy_id == "bulk-10000ms"
+    assert store.provenance is not None
+    assert store.provenance["disposition"] == "present"
+    assert store.provenance["producer_path"] == "bulk"
 
 
 

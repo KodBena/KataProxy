@@ -38,7 +38,7 @@ from transformers.stencil_solver_runtime import solve_component
 
 logger = logging.getLogger("kataproxy.stencil_bulk_solver")
 
-CACHE_NAMESPACE = "solver-component-d4-v3"
+CACHE_NAMESPACE = "solver-component-d4-v4"
 BULK_TIME_LIMIT_MS = 10_000
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 
@@ -58,7 +58,8 @@ class StencilQueueStore(Protocol):
 
     def put_result(
         self, shape_key: bytes, family: Sequence[Stencil],
-        result: Tuple[bool, int, bytes],
+        result: Tuple[bool, int, bytes], *,
+        provenance: Dict[str, Any] | None = None,
     ) -> bool: ...
 
     def mark_timed_out(
@@ -154,7 +155,10 @@ class StencilBulkSolver:
         result = _validate_bulk_result(
             shape_key, self.family, execution.cache_result,
         )
-        self.store.put_result(shape_key, self.family, result)
+        self.store.put_result(
+            shape_key, self.family, result,
+            provenance=execution.result_provenance,
+        )
         best = self.store.get_result(shape_key, self.family)
         if best is None:
             raise RuntimeError("bulk solver result disappeared from Redis")

@@ -422,13 +422,22 @@ version fence for the unchanged Redis key bytes. A future code change that
 alters the raw key encoding must bump both the protocol version and Redis
 namespace/schema.
 
-When Phase 4 adds result provenance, make the planned compatibility break
-explicit: use a new namespace (`solver-component-d4-v4`) and value schema
-3. Preserve old v3 data during cutover. Existing rows migrate/read through as
-a best result with provenance disposition `legacy_unknown`; do not invent a
-solver identity, elapsed time, native effort, or historical attempt event.
-Old non-profile-aware timeout retirement metadata must not suppress work for
-a newly selected profile.
+Phase 4 provenance cutover uses namespace
+`solver-component-d4-v4` and value schema 3. The v3 result namespace/value
+schema 2 and its data remain untouched. A v4 read-through copies a legacy v3
+result into the new namespace as a best result with provenance disposition
+`legacy_unknown`; it does not invent a solver identity, elapsed time, native
+effort, or historical attempt event. V4 queue initialization copies old hard
+components but ignores old global timeout retirements because those did not
+identify a solver profile.
+
+This Phase 4 sub-step attaches the attempt UUID, selected solver
+identity/configuration, source path, budget, start time, elapsed wall time,
+and typed outcome summary to a result only when that invocation wins result
+arbitration. For equal status and tile count, a stronger certified lower bound
+wins; the existing optimal-first and lower-tile-count ordering remains
+unchanged. Profile-specific work queues and timeout keys are a separate
+follow-on sub-step and are not claimed as complete here.
 
 The best-result row remains global to the instance/family, independent of
 backend and budget. Provenance belongs to the attempt that produced that
@@ -472,7 +481,8 @@ abandoned pending entries with XAUTOCLAIM, and offers `--spool-only` and
 `--once` modes. An attempt whose instance sighting has not yet materialized
 remains pending rather than violating the instance foreign key.
 
-The normalized database and ingestion CLI are now installed. Query/analysis
-tooling is a later phase. No Redis result namespace/schema migration,
-profile-aware queue migration, gomecsolver integration, or OR-Tools
-integration is part of Phases 1–3.
+The normalized database and ingestion CLI are installed. Phase 4 has begun:
+v4 result rows carry winning-attempt provenance and read through legacy v3
+rows as `legacy_unknown`. Profile-specific work queues/timeouts and
+query/analysis tooling remain subsequent work. No gomecsolver integration or
+OR-Tools integration is part of Phases 1–4.

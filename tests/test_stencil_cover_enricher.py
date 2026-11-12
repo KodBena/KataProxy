@@ -33,16 +33,27 @@ class _MemoryRedis:
         return 1
 
     def eval(self, script: str, numkeys: int, *args: Any) -> int:
-        if "SETNX" in script:
-            assert numkeys == 4
-            hard_key, pending_key, timeout_key, marker_key = args
+        if "SETNX" in script and numkeys == 2:
+            result_key, hard_key, payload, shape_key = args
+            if result_key in self.values:
+                return 0
+            self.values[result_key] = payload
+            migrated = json.loads(payload.decode("utf-8"))
+            if int(migrated["status"]) != 0:
+                self.sets.setdefault(hard_key, set()).add(shape_key)
+            return 1
+
+        if "SETNX" in script and numkeys == 5:
+            hard_key, pending_key, timeout_key, marker_key, legacy_hard_key = args
             if marker_key in self.markers:
                 return 0
             self.markers.add(marker_key)
+            hard = self.sets.setdefault(hard_key, set())
+            hard.update(self.sets.get(legacy_hard_key, set()))
             pending = self.sets.setdefault(pending_key, set())
             timed_out = self.hashes.get(timeout_key, {})
             queued = 0
-            for shape_key in self.sets.get(hard_key, set()):
+            for shape_key in hard:
                 if shape_key not in timed_out and shape_key not in pending:
                     pending.add(shape_key)
                     queued += 1
@@ -61,6 +72,7 @@ class _MemoryRedis:
             result = json.loads(raw.decode("utf-8"))
             if int(result["status"]) == 0:
                 hard.discard(shape_key)
+                pending.discard(shape_key)
                 self.hashes.setdefault(timeout_key, {}).pop(shape_key, None)
                 return 0
             metadata_value = (
@@ -79,22 +91,31 @@ class _MemoryRedis:
         assert numkeys == 4
         (
             result_key, hard_key, pending_key, timeout_key,
-            payload, status, tile_count, _schema_version, shape_key,
+            payload, status, tile_count, _schema_version, shape_key, raw_bound,
         ) = args
         new_status = int(status)
         new_cost = int(tile_count)
+        new_bound = int(raw_bound) if raw_bound not in (None, "") else None
         should_store = True
         old_raw = self.values.get(result_key)
         if old_raw is not None:
             old = json.loads(old_raw.decode("utf-8"))
             old_status = int(old["status"])
             old_cost = int(old["tile_count"])
+            old_bound = old.get("quality_lower_bound")
             if old_status == 0 and new_status == 0 and old_cost != new_cost:
                 return -1
             if new_status > old_status or (
-                new_status == old_status and new_cost >= old_cost
+                new_status == old_status and new_cost > old_cost
             ):
                 should_store = False
+            elif new_status == old_status and new_cost == old_cost:
+                if new_bound is None and old_bound is None:
+                    should_store = False
+                elif new_bound is None:
+                    should_store = False
+                elif old_bound is not None and new_bound <= int(old_bound):
+                    should_store = False
 
         if should_store:
             self.values[result_key] = payload
@@ -807,7 +828,10 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     record = json.loads(next(iter(backend.values.values())).decode("utf-8"))
     assert set(record) == {
         "version", "optimal", "status", "tile_count", "placements",
+        "quality_lower_bound", "provenance",
     }
+    assert record["version"] == 3
+    assert record["provenance"] == {"disposition": "legacy_unknown"}
     assert record["status"] == 1
     assert record["placements"]
 
@@ -1330,3 +1354,116 @@ def test_redis_persistent_cache_warns_and_degrades_to_noop(
     assert decorated(b"shape", 250, ()) == (False, 2, b"fallback")
     assert calls == [1]
     assert "persistent caching disabled" in caplog.text
+
+
+
+def test_v4_reads_v3_rows_as_legacy_unknown_and_ignores_global_timeout() -> None:
+    import base64
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"legacy-v3-shape"
+    old_store = storage.RedisStencilStore(backend, "solver-component-d4-v3")
+    old_result_key = old_store._problem_key(shape_key, family)
+    old_hard_key = old_store._hard_set_key(family)
+    old_timeout_key = old_store._timeout_hash_key(family)
+    encoded = stencil._encode_cached_placements([("dot", (0,))], family)
+    backend.values[old_result_key] = json.dumps({
+        "version": 2,
+        "optimal": False,
+        "status": 1,
+        "tile_count": 1,
+        "placements": base64.b64encode(encoded).decode("ascii"),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    backend.sets[old_hard_key] = {shape_key}
+    backend.hashes[old_timeout_key] = {
+        shape_key: b'{"version":1,"time_limit_ms":10000,"status":1,"tile_count":1}'
+    }
+
+    store = storage.RedisStencilStore(backend, "solver-component-d4-v4")
+    assert store.initialize_pending_queue(family) == 1
+    record = store.get_result_record(shape_key, family)
+
+    assert record is not None
+    assert record.result == (False, 1, encoded)
+    assert record.provenance == {"disposition": "legacy_unknown"}
+    assert record.quality_lower_bound is None
+    assert store.hard_components(family) == frozenset({shape_key})
+    assert store.pending_components(family) == frozenset({shape_key})
+    assert store.timeout_metadata(shape_key, family) is None
+    assert old_result_key in backend.values
+
+
+def _result_provenance(
+    attempt_id: str, lower_bound: int,
+) -> Dict[str, Any]:
+    return {
+        "disposition": "present",
+        "attempt_id": attempt_id,
+        "solver_identity": {
+            "fingerprint": hashlib.sha256(
+                json.dumps({
+                    "adapter_version": "test-v1",
+                    "backend_name": "test-backend",
+                    "backend_version": "1",
+                    "configuration_fingerprint": hashlib.sha256(b"{}").hexdigest(),
+                }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+            ).hexdigest(),
+            "backend_name": "test-backend",
+            "backend_version": "1",
+            "adapter_version": "test-v1",
+            "configuration_json": "{}",
+            "configuration_fingerprint": hashlib.sha256(b"{}").hexdigest(),
+        },
+        "producer_path": "foreground",
+        "budget": {
+            "wall_time_limit_ms": 250,
+            "policy_id": "foreground-250ms",
+            "native_effort_limit": {
+                "disposition": "not_requested",
+                "reason": "not_requested",
+            },
+        },
+        "started_at_utc": "2026-11-12T10:15:30.000000Z",
+        "elapsed_wall_ns": 10,
+        "outcome": {
+            "status": "feasible",
+            "optimality_proven": False,
+            "incumbent": {"disposition": "present", "tile_count": 1},
+            "lower_bound": {"disposition": "reported", "value": lower_bound},
+            "native_effort": {"disposition": "not_reported",
+                              "reason": "backend_did_not_report_effort"},
+            "backend_status": {"disposition": "reported", "value": "TIME_LIMIT"},
+            "error": {"disposition": "none"},
+            "fallback_disposition": "not_needed",
+        },
+    }
+
+
+def test_v3_result_arbitration_uses_certified_bound_for_equal_tile_count() -> None:
+    import transformers.stencil_cache_storage as storage
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "solver-component-d4-v4")
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"same-cost-quality-bound"
+    result = (
+        False, 1,
+        stencil._encode_cached_placements([("dot", (0,))], family),
+    )
+    first = _result_provenance(
+        "12345678-1234-5678-1234-567812345678", 0,
+    )
+    stronger = _result_provenance(
+        "22345678-1234-5678-1234-567812345678", 1,
+    )
+
+    assert store.put_result(shape_key, family, result, provenance=first) is True
+    assert store.put_result(shape_key, family, result, provenance=first) is False
+    assert store.put_result(shape_key, family, result, provenance=stronger) is True
+
+    record = store.get_result_record(shape_key, family)
+    assert record is not None
+    assert record.quality_lower_bound == 1
+    assert record.provenance["attempt_id"] == stronger["attempt_id"]

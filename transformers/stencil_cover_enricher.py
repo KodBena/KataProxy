@@ -35,6 +35,7 @@ from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, KataGoResponse
 from transformers.stencil_cache_storage import (
+    SolverCacheCandidate,
     redis_persistent_cache,
     register_cache_invalidator,
 )
@@ -668,8 +669,8 @@ def _solve_component_uncached(
     time_limit_ms: int,
     family: Tuple[Stencil, ...],
     backend: SolverBackend,
-) -> Tuple[bool, int, bytes]:
-    """Invoke the selected backend through the neutral interface for Redis."""
+) -> SolverCacheCandidate:
+    """Invoke the selected backend and retain its provenance for Redis."""
     if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
         raise ValueError("solver time limit must be a positive number of milliseconds")
     execution = _solve_with_backend(
@@ -691,7 +692,7 @@ def _solve_component_uncached(
             execution.identity.fingerprint,
             message,
         )
-    return execution.cache_result
+    return SolverCacheCandidate(execution.cache_result, execution.result_provenance)
 
 
 class _SolverCacheInfo(NamedTuple):
@@ -820,7 +821,7 @@ class _InvalidatableSolverCache:
 # backend-profile entry for the changed canonical component.
 DEFAULT_SOLVER_BACKEND: SolverBackend = create_solver_backend("highs")
 
-_SOLVER_CACHE_NAMESPACE = "solver-component-d4-v3"
+_SOLVER_CACHE_NAMESPACE = "solver-component-d4-v4"
 _solver_component_persistent = redis_persistent_cache(
     namespace=_SOLVER_CACHE_NAMESPACE,
 )(_solve_component_uncached)
