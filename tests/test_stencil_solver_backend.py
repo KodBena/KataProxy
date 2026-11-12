@@ -90,9 +90,17 @@ def _domino_key() -> bytes:
 def test_fake_backend_substitutes_without_transformer_solver_changes() -> None:
     family = _domino_family()
     backend = _FakeOptimalBackend()
-    candidate = stencil._solve_component_uncached(
-        _domino_key(), 250, family, backend,
+    request = SolverCacheRequest(
+        shape_key=_domino_key(),
+        family=family,
+        backend=backend,
+        budget=SolverBudget(
+            wall_time_limit_ms=250,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="foreground-250ms",
+        ),
     )
+    candidate = stencil._solve_component_uncached(request)
     optimal, status, encoded = candidate
     assert candidate.provenance["disposition"] == "present"
     assert candidate.provenance["producer_path"] == "foreground"

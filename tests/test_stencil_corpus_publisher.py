@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from transformers import stencil_cover_enricher as stencil
+from transformers.stencil_cache_storage import SolverCacheRequest
 from transformers.stencil_corpus_events import (
     make_instance_seen_event,
     serialize_event,
@@ -291,11 +292,9 @@ def test_foreground_sighting_is_emitted_before_the_result_cache_lookup(
         assert producer_path == "foreground"
         events.append("sighting")
 
-    def cache_hit(
-        shape_key: bytes, time_limit_ms: int, cached_family: Any, backend: Any,
-    ) -> tuple[bool, int, bytes]:
-        assert time_limit_ms == 250
-        assert tuple(cached_family) == family
+    def cache_hit(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        assert request.budget.wall_time_limit_ms == 250
+        assert tuple(request.family) == family
         events.append("cache")
         return True, 0, encoded
 

@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 import pytest
 
+import transformers.stencil_cache_storage as storage
 import transformers.stencil_cover_enricher as stencil
 from AbstractProxy.proxy_core import ClientId
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, make_katago_link
@@ -546,9 +547,10 @@ def test_canonical_solution_is_recovered_with_rotated_stencil_name(
     family = stencil.STENCIL_FAMILY
     seen_keys: List[bytes] = []
 
-    def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
-    ) -> tuple[bool, int, bytes]:
+    def fake_cached(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        shape_key = request.shape_key
+        family_key = request.family
+        assert request.budget.wall_time_limit_ms == 250
         seen_keys.append(shape_key)
         local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
         candidates = stencil._candidate_placements(
@@ -591,9 +593,10 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
 
     seen_keys: List[bytes] = []
 
-    def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
-    ) -> tuple[bool, int, bytes]:
+    def fake_cached(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        shape_key = request.shape_key
+        family_key = request.family
+        assert request.budget.wall_time_limit_ms == 250
         seen_keys.append(shape_key)
         local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
         candidates = stencil._candidate_placements(
@@ -644,9 +647,10 @@ def test_disconnected_region_is_solved_as_independent_components(
     family = (("1x1", ((0, 0),)),)
     seen_components: List[tuple[int, ...]] = []
 
-    def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
-    ) -> tuple[bool, int, bytes]:
+    def fake_cached(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        shape_key = request.shape_key
+        family_key = request.family
+        assert request.budget.wall_time_limit_ms == 250
         local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
         # The cache/solver boundary must never receive a disconnected mask.
         assert stencil._connected_components(
@@ -695,9 +699,10 @@ def test_raw_components_retain_the_cells_and_status_of_each_solver_call(
     family = (("1x1", ((0, 0),)),)
     returned_statuses = iter([(False, 1), (False, 2)])
 
-    def fake_cached(
-        shape_key: bytes, time_limit_ms: int, family_key: Any, backend: Any = None,
-    ) -> tuple[bool, int, bytes]:
+    def fake_cached(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        shape_key = request.shape_key
+        family_key = request.family
+        assert request.budget.wall_time_limit_ms == 250
         _optimal, status = next(returned_statuses)
         _width, _height, cells = stencil._decode_component_shape_key(shape_key)
         singleton_cover = [("1x1", (point,)) for point in cells]

@@ -163,7 +163,9 @@ class _FakeRedis:
             for message_id, fields in messages:
                 stream_id = message_id.decode("ascii")
                 event = json.loads(fields[b"event"].decode("utf-8"))
-                self._event_ids[stream_id] = event["event_id"]
+                event_id = event.get("event_id")
+                if isinstance(event_id, str) and event_id:
+                    self._event_ids[stream_id] = event_id
         return "0-0", messages, []
 
     def xreadgroup(self, *args: Any, **kwargs: Any) -> list[Any]:
@@ -175,7 +177,9 @@ class _FakeRedis:
             for message_id, fields in messages:
                 stream_id = message_id.decode("ascii")
                 event = json.loads(fields[b"event"].decode("utf-8"))
-                self._event_ids[stream_id] = event["event_id"]
+                event_id = event.get("event_id")
+                if isinstance(event_id, str) and event_id:
+                    self._event_ids[stream_id] = event_id
         return [(CORPUS_STREAM_KEY.encode("utf-8"), messages)] if messages else []
 
     def xack(self, name: str, groupname: str, *ids: str) -> int:
