@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from transformers.stencil_cache_storage import create_redis_client
 from transformers.stencil_corpus_events import (
@@ -167,35 +167,57 @@ class SQLiteEventSpool:
 
     def append(self, payload: bytes) -> bool:
         """Persist one canonical event; return False for an identical replay."""
-        event = parse_event(payload)
-        if serialize_event(event) != payload:
-            raise ValueError("SQLite spool accepts only canonical serialized event bytes")
-        event_id = event["event_id"]
-        digest = hashlib.sha256(payload).hexdigest()
+        return self.append_many((payload,)) > 0
+
+    def append_many(self, payloads: Sequence[bytes]) -> int:
+        """Persist a batch atomically; return the number of newly inserted events."""
+        prepared: list[tuple[str, bytes, str]] = []
+        seen: dict[str, bytes] = {}
+        for payload in payloads:
+            event = parse_event(payload)
+            if serialize_event(event) != payload:
+                raise ValueError(
+                    "SQLite spool accepts only canonical serialized event bytes"
+                )
+            event_id = event["event_id"]
+            previous = seen.get(event_id)
+            if previous is not None and previous != payload:
+                raise CorpusEventConflict(
+                    f"event_id {event_id} appears with different immutable bytes"
+                )
+            seen[event_id] = payload
+            prepared.append((
+                event_id, payload, hashlib.sha256(payload).hexdigest(),
+            ))
+        if not prepared:
+            return 0
+
         self._initialise()
         connection = self._connect()
+        inserted = 0
         try:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT payload_sha256, event_json FROM stencil_corpus_spool_events "
-                "WHERE event_id = ?",
-                (event_id,),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != digest or bytes(existing[1]) != payload:
-                    raise CorpusEventConflict(
-                        f"event_id {event_id} already exists with different bytes"
-                    )
-                connection.commit()
-                return False
-            connection.execute(
-                "INSERT INTO stencil_corpus_spool_events "
-                "(event_id, event_json, payload_sha256, queued_at_utc) "
-                "VALUES (?, ?, ?, ?)",
-                (event_id, sqlite3.Binary(payload), digest, utc_timestamp()),
-            )
+            for event_id, payload, digest in prepared:
+                existing = connection.execute(
+                    "SELECT payload_sha256, event_json "
+                    "FROM stencil_corpus_spool_events WHERE event_id = ?",
+                    (event_id,),
+                ).fetchone()
+                if existing is not None:
+                    if existing[0] != digest or bytes(existing[1]) != payload:
+                        raise CorpusEventConflict(
+                            f"event_id {event_id} already exists with different bytes"
+                        )
+                    continue
+                connection.execute(
+                    "INSERT INTO stencil_corpus_spool_events "
+                    "(event_id, event_json, payload_sha256, queued_at_utc) "
+                    "VALUES (?, ?, ?, ?)",
+                    (event_id, sqlite3.Binary(payload), digest, utc_timestamp()),
+                )
+                inserted += 1
             connection.commit()
-            return True
+            return inserted
         except Exception:
             connection.rollback()
             raise
@@ -228,14 +250,32 @@ class CorpusEventPublisher:
             return self._redis_client
 
     def publish(self, event: dict[str, Any]) -> str:
-        """Return 'redis_stream', 'sqlite_spool', or 'failed'; never raise I/O errors."""
-        payload = serialize_event(event)
-        event_id = event["event_id"]
+        """Publish one event; see publish_many for transport/fallback semantics."""
+        return self.publish_many((event,))
+
+    def publish_many(self, events: Sequence[dict[str, Any]]) -> str:
+        """Publish a request-local batch in one Redis transaction or spool it."""
+        prepared = tuple(
+            (event["event_id"], serialize_event(event)) for event in events
+        )
+        if not prepared:
+            return "redis_stream"
+
         try:
             client = self._get_redis_client()
-            # No MAXLEN/trimming argument: an unmaterialized event must not be
-            # evicted by the producer.
-            client.xadd(CORPUS_STREAM_KEY, {b"event": payload})
+            # One transactional pipeline makes all XADD commands one network
+            # exchange. Do not trim: every unmaterialized event must be retained.
+            pipeline_factory = getattr(client, "pipeline", None)
+            if callable(pipeline_factory):
+                with pipeline_factory(transaction=True) as pipeline:
+                    for _event_id, payload in prepared:
+                        pipeline.xadd(CORPUS_STREAM_KEY, {b"event": payload})
+                    pipeline.execute()
+            else:
+                # Compatibility for narrow injected/test clients. The real
+                # redis-py client always exposes pipeline().
+                for _event_id, payload in prepared:
+                    client.xadd(CORPUS_STREAM_KEY, {b"event": payload})
             with self._redis_lock:
                 self._warned_redis_failure = False
             return "redis_stream"
@@ -245,18 +285,23 @@ class CorpusEventPublisher:
                 self._warned_redis_failure = True
             if should_warn:
                 logger.warning(
-                    "Stencil corpus Redis Stream unavailable; spooling events "
-                    "to SQLite (%s)",
+                    "Stencil corpus Redis Stream unavailable; spooling event "
+                    "batch to SQLite (%s)",
                     redis_error,
                 )
             try:
-                self._spool.append(payload)
+                self._spool.append_many(tuple(
+                    payload for _event_id, payload in prepared
+                ))
                 return "sqlite_spool"
             except Exception as spool_error:
+                event_ids = ", ".join(
+                    event_id for event_id, _payload in prepared
+                )
                 logger.critical(
-                    "Could not persist stencil corpus event %s; Redis error: %s; "
-                    "SQLite spool error: %s",
-                    event_id,
+                    "Could not persist stencil corpus event batch [%s]; "
+                    "Redis error: %s; SQLite spool error: %s",
+                    event_ids,
                     redis_error,
                     spool_error,
                     exc_info=True,
@@ -301,3 +346,60 @@ def publish_instance_seen(
             shape_key.hex(),
         )
         return "failed"
+
+
+
+def publish_instance_seen_many(
+    shape_keys: Sequence[bytes],
+    family: Any,
+    producer_path: ProducerPath = "foreground",
+    publisher: CorpusEventSink | None = None,
+) -> str | None:
+    """Capture several component sightings with one publisher batch operation."""
+    target = get_default_event_publisher() if publisher is None else publisher
+    if target is None or not shape_keys:
+        return None
+
+    events: list[dict[str, Any]] = []
+    construction_failed = False
+    for shape_key in shape_keys:
+        try:
+            problem = canonical_problem_from_key(shape_key, family)
+            events.append(make_instance_seen_event(
+                problem, shape_key, producer_path,
+            ))
+        except Exception:
+            construction_failed = True
+            logger.exception(
+                "Could not construct stencil instance_seen event for key %s",
+                shape_key.hex(),
+            )
+    if not events:
+        return "failed" if construction_failed else None
+
+    try:
+        batch_publish = getattr(target, "publish_many", None)
+        if callable(batch_publish):
+            result = batch_publish(events)
+        else:
+            # Preserve compatibility with injected sinks that only implement
+            # the original one-event protocol. Production uses publish_many.
+            results: list[str] = []
+            for event in events:
+                try:
+                    results.append(target.publish(event))
+                except Exception:
+                    logger.exception(
+                        "Injected stencil corpus sink failed to publish event %s",
+                        event.get("event_id", "<unknown>"),
+                    )
+                    results.append("failed")
+            result = (
+                "failed" if "failed" in results
+                else "sqlite_spool" if "sqlite_spool" in results
+                else "redis_stream"
+            )
+    except Exception:
+        logger.exception("Could not publish stencil instance_seen event batch")
+        return "failed"
+    return "failed" if construction_failed else result

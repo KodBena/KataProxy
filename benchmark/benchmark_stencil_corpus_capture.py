@@ -47,6 +47,7 @@ from transformers.stencil_corpus_publisher import (
     CorpusEventPublisher,
     SQLiteEventSpool,
     publish_instance_seen,
+    publish_instance_seen_many,
 )
 from transformers.stencil_solver_api import STENCIL_CANONICALIZATION_VERSION
 from transformers.stencil_solver_problem import canonical_problem_from_key
@@ -117,12 +118,39 @@ def _load_workload(database: str | None) -> tuple[tuple[bytes, ...], str]:
     return keys, f"SQLite corpus {path} ({len(keys)} available instances)"
 
 
+class _RedirectedPipeline:
+    def __init__(self, pipeline: Any, stream_key: str) -> None:
+        self.pipeline = pipeline
+        self.stream_key = stream_key
+
+    def __enter__(self) -> "_RedirectedPipeline":
+        self.pipeline.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return self.pipeline.__exit__(*args)
+
+    def xadd(self, name: str, fields: dict[bytes, bytes]) -> "_RedirectedPipeline":
+        if name != CORPUS_STREAM_KEY:
+            raise ValueError(f"unexpected stream name: {name}")
+        self.pipeline.xadd(self.stream_key, fields)
+        return self
+
+    def execute(self) -> Any:
+        return self.pipeline.execute()
+
+
 class _RedirectedRedis:
     """Route the publisher's fixed stream name to a unique benchmark key."""
 
     def __init__(self, client: Any, stream_key: str) -> None:
         self.client = client
         self.stream_key = stream_key
+
+    def pipeline(self, *, transaction: bool = True) -> _RedirectedPipeline:
+        return _RedirectedPipeline(
+            self.client.pipeline(transaction=transaction), self.stream_key,
+        )
 
     def xadd(self, name: str, fields: dict[bytes, bytes]) -> Any:
         if name != CORPUS_STREAM_KEY:
@@ -131,6 +159,9 @@ class _RedirectedRedis:
 
 
 class _FailingRedis:
+    def pipeline(self, *, transaction: bool = True) -> Any:
+        raise ConnectionError("intentional benchmark fallback")
+
     def xadd(self, _name: str, _fields: dict[bytes, bytes]) -> Any:
         raise ConnectionError("intentional benchmark fallback")
 
@@ -200,6 +231,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     capture_disabled = lambda: publish_instance_seen(
         next(disabled_cycle), stencil.STENCIL_FAMILY, "foreground",
     )
+    capture_disabled_batch = lambda: publish_instance_seen_many(
+        keys, stencil.STENCIL_FAMILY, "foreground",
+    )
 
     redis_module = __import__("redis")
     redis_client = redis_module.Redis.from_url(
@@ -261,6 +295,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"expected SQLite fallback, observed {result!r}"
                     )
 
+            def capture_redis_batch() -> None:
+                result = publish_instance_seen_many(
+                    keys, stencil.STENCIL_FAMILY, "foreground",
+                    publisher=redirected_publisher,
+                )
+                if result != "redis_stream":
+                    raise RuntimeError(
+                        f"expected batched Redis publication, observed {result!r}"
+                    )
+
+            def capture_fallback_batch() -> None:
+                result = publish_instance_seen_many(
+                    keys, stencil.STENCIL_FAMILY, "foreground",
+                    publisher=fallback_publisher,
+                )
+                if result != "sqlite_spool":
+                    raise RuntimeError(
+                        f"expected batched SQLite fallback, observed {result!r}"
+                    )
+
             measurements = {
                 "canonicalization_only": _summary(_measure(
                     canonicalization, warmup=args.warmup, iterations=args.iterations,
@@ -286,11 +340,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "capture_enabled_sqlite_fallback_hook": _summary(_measure(
                     capture_fallback, warmup=args.warmup, iterations=args.iterations,
                 )),
+                "capture_disabled_batch_hook": _summary(_measure(
+                    capture_disabled_batch, warmup=args.warmup, iterations=args.iterations,
+                )),
+                "capture_enabled_redis_batch_hook": _summary(_measure(
+                    capture_redis_batch, warmup=args.warmup, iterations=args.iterations,
+                )),
+                "capture_enabled_sqlite_fallback_batch_hook": _summary(_measure(
+                    capture_fallback_batch, warmup=args.warmup, iterations=args.iterations,
+                )),
             }
             disabled = measurements["capture_disabled_hook"]
             for name in (
                 "capture_enabled_redis_hook",
                 "capture_enabled_sqlite_fallback_hook",
+                "capture_enabled_redis_batch_hook",
+                "capture_enabled_sqlite_fallback_batch_hook",
             ):
                 enabled = measurements[name]
                 # Difference of aggregate quantiles, not paired per-request deltas.
@@ -331,6 +396,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             "capture_enabled_p95_ms": enabled["p95_ms"],
             "median_overhead_ms": enabled["median_ms"] - disabled["median_ms"],
             "p95_overhead_ms": enabled["p95_ms"] - disabled["p95_ms"],
+            "batch_component_count": len(keys),
+            "batch_capture_disabled_median_ms": (
+                measurements["capture_disabled_batch_hook"]["median_ms"]
+            ),
+            "batch_capture_enabled_median_ms": (
+                measurements["capture_enabled_redis_batch_hook"]["median_ms"]
+            ),
+            "batch_capture_enabled_p95_ms": (
+                measurements["capture_enabled_redis_batch_hook"]["p95_ms"]
+            ),
+            "batch_median_overhead_ms": (
+                measurements["capture_enabled_redis_batch_hook"]["median_ms"]
+                - measurements["capture_disabled_batch_hook"]["median_ms"]
+            ),
+            "batch_p95_overhead_ms": (
+                measurements["capture_enabled_redis_batch_hook"]["p95_ms"]
+                - measurements["capture_disabled_batch_hook"]["p95_ms"]
+            ),
+            "batch_median_overhead_per_component_ms": (
+                measurements["capture_enabled_redis_batch_hook"]["median_ms"]
+                - measurements["capture_disabled_batch_hook"]["median_ms"]
+            ) / len(keys),
+            "batch_p95_overhead_per_component_ms": (
+                measurements["capture_enabled_redis_batch_hook"]["p95_ms"]
+                - measurements["capture_disabled_batch_hook"]["p95_ms"]
+            ) / len(keys),
         },
         "acceptance": {
             "threshold_status": "pending_engineering_decision",
@@ -339,9 +430,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "interpretation": (
             "These are synchronous corpus-hook measurements, not total KataGo "
             "request latency. Capture-disabled and capture-enabled Redis cases "
-            "use the same deterministic canonical-component workload. "
-            "Overhead is the difference between aggregate quantiles, not paired "
-            "per-request deltas. The enabled SQLite fallback is reported separately."
+            "use the same deterministic canonical-component workload. The batch "
+            "case emits every fixture component through one transactional Redis "
+            "pipeline per call; per-component batch overhead is normalized from "
+            "aggregate quantiles, not separately measured. Overhead is the "
+            "difference between aggregate quantiles, not paired per-request "
+            "deltas. The enabled SQLite fallback is reported separately."
         ),
     }
     encoded_report = json.dumps(report, indent=2, sort_keys=True)

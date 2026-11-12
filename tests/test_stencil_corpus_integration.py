@@ -226,16 +226,31 @@ def _seen_event() -> dict[str, Any]:
     )
 
 
+class _FailingPipeline:
+    def __enter__(self) -> "_FailingPipeline":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def xadd(
+        self, _name: str, _fields: dict[bytes, bytes], **_kwargs: Any,
+    ) -> "_FailingPipeline":
+        return self
+
+    def execute(self) -> list[Any]:
+        raise redis.ConnectionError("controlled integration XADD failure")
+
+
 class _FailingXAdd:
-    """Inject an XADD transport failure while keeping the real Redis server."""
+    """Inject a pipelined XADD transport failure against live Redis."""
 
     def __init__(self, client: redis.Redis) -> None:
         self._client = client
 
-    def xadd(
-        self, _name: str, _fields: dict[bytes, bytes], **_kwargs: Any,
-    ) -> str:
-        raise redis.ConnectionError("controlled integration XADD failure")
+    def pipeline(self, *, transaction: bool = True) -> _FailingPipeline:
+        assert transaction is True
+        return _FailingPipeline()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)

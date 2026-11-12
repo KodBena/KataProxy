@@ -60,9 +60,34 @@ def _event(event_id: str = "12345678-1234-5678-1234-567812345678") -> dict[str, 
     )
 
 
+class _FakePipeline:
+    def __init__(self, client: "_FakeRedis") -> None:
+        self.client = client
+        self.commands: list[tuple[Any, ...]] = []
+
+    def __enter__(self) -> "_FakePipeline":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def xadd(self, *args: Any) -> "_FakePipeline":
+        self.commands.append(args)
+        return self
+
+    def execute(self) -> list[str]:
+        return [self.client.xadd(*args) for args in self.commands]
+
+
 class _FakeRedis:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
+        self.pipeline_calls = 0
+
+    def pipeline(self, *, transaction: bool = True) -> _FakePipeline:
+        assert transaction is True
+        self.pipeline_calls += 1
+        return _FakePipeline(self)
 
     def xadd(self, *args: Any) -> str:
         self.calls.append(args)
@@ -83,6 +108,60 @@ def test_publisher_writes_untrimmed_event_to_redis_first(tmp_path: Path) -> None
     assert client.calls[0][1] == {b"event": serialize_event(event)}
     assert len(client.calls[0]) == 2
     assert not (tmp_path / "spool.sqlite3").exists()
+
+
+def test_publisher_sends_a_batch_through_one_transactional_pipeline(
+    tmp_path: Path,
+) -> None:
+    client = _FakeRedis()
+    publisher = CorpusEventPublisher(
+        redis_client_factory=lambda: client,
+        sqlite_path=tmp_path / "spool.sqlite3",
+    )
+    events = [
+        _event(f"12345678-1234-5678-1234-{index:012d}")
+        for index in range(1, 4)
+    ]
+
+    assert publisher.publish_many(events) == "redis_stream"
+    assert client.pipeline_calls == 1
+    assert len(client.calls) == len(events)
+    assert all(call[0] == CORPUS_STREAM_KEY for call in client.calls)
+    assert [call[1] for call in client.calls] == [
+        {b"event": serialize_event(event)} for event in events
+    ]
+    assert not (tmp_path / "spool.sqlite3").exists()
+
+
+def test_publisher_spools_a_batch_when_redis_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fallback-batch.sqlite3"
+
+    def fail_to_connect() -> Any:
+        raise ConnectionError("Redis is offline")
+
+    publisher = CorpusEventPublisher(
+        redis_client_factory=fail_to_connect,
+        sqlite_path=path,
+    )
+    events = [
+        _event(f"12345678-1234-5678-1234-{index:012d}")
+        for index in range(4, 7)
+    ]
+
+    assert publisher.publish_many(events) == "sqlite_spool"
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT event_id, event_json FROM stencil_corpus_spool_events "
+            "ORDER BY event_id"
+        ).fetchall()
+    assert [row[0] for row in rows] == sorted(
+        event["event_id"] for event in events
+    )
+    assert {bytes(row[1]) for row in rows} == {
+        serialize_event(event) for event in events
+    }
 
 
 def test_sqlite_spool_is_idempotent_and_preserves_exact_event_bytes(tmp_path: Path) -> None:
@@ -285,9 +364,9 @@ def test_foreground_sighting_is_emitted_before_the_result_cache_lookup(
     events: list[str] = []
 
     def record_sighting(
-        shape_key: bytes, seen_family: Any, producer_path: str,
+        shape_keys: tuple[bytes, ...], seen_family: Any, producer_path: str,
     ) -> None:
-        assert shape_key
+        assert shape_keys
         assert tuple(seen_family) == family
         assert producer_path == "foreground"
         events.append("sighting")
@@ -298,12 +377,47 @@ def test_foreground_sighting_is_emitted_before_the_result_cache_lookup(
         events.append("cache")
         return True, 0, encoded
 
-    monkeypatch.setattr(stencil, "publish_instance_seen", record_sighting)
+    monkeypatch.setattr(stencil, "publish_instance_seen_many", record_sighting)
     monkeypatch.setattr(stencil, "_solve_component_cached", cache_hit)
     result = stencil._solve_region([0, 1], 2, 1, family)
 
     assert result["optimal"] is True
     assert events == ["sighting", "cache"]
+
+
+def test_disconnected_components_are_published_in_one_batch_before_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    family = (("1x1", ((0, 0),)),)
+    events: list[str] = []
+    captured_keys: list[bytes] = []
+
+    def record_batch(
+        shape_keys: tuple[bytes, ...], seen_family: Any, producer_path: str,
+    ) -> None:
+        assert tuple(seen_family) == family
+        assert producer_path == "foreground"
+        captured_keys.extend(shape_keys)
+        events.append("batch")
+
+    def cache_hit(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        assert events == ["batch"] or events == ["batch", "cache"]
+        events.append("cache")
+        _width, _height, cells = stencil._decode_component_shape_key(
+            request.shape_key,
+        )
+        encoded = stencil._encode_cached_placements(
+            [("1x1", (point,)) for point in cells], family,
+        )
+        return True, 0, encoded
+
+    monkeypatch.setattr(stencil, "publish_instance_seen_many", record_batch)
+    monkeypatch.setattr(stencil, "_solve_component_cached", cache_hit)
+    result = stencil._solve_region([0, 1, 8], 3, 3, family)
+
+    assert len(captured_keys) == 2
+    assert events == ["batch", "cache", "cache"]
+    assert result["tileCount"] == 3
 
 
 

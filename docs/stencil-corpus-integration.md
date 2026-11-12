@@ -67,18 +67,22 @@ boundaries.
 
 ## Benchmark
 
-The existing benchmark measures the synchronous production capture hook over
-the same deterministic canonical-component workload with capture disabled
-and capture enabled against Redis. It also reports the SQLite fallback path
-separately. Its disabled case runs with the opt-in variable unset and does not
-construct or invoke the default DB 7 publisher. Enabled cases inject an
-explicit publisher that writes only to a unique temporary stream key.
+The benchmark measures the one-event publisher path and a request-sized
+batch over the same deterministic canonical-component workload. The production
+foreground transformer collects sightings from both ownership regions and
+publishes them through one transactional Redis pipeline before performing
+solver result-cache lookups. The SQLite fallback path is also measured; a
+fallback batch is committed in one SQLite transaction. Its disabled case runs
+with the opt-in variable unset and does not construct or invoke the default
+DB 7 publisher. Enabled cases inject an explicit publisher that writes only to
+a unique temporary stream key.
 
 The report records the iteration and warm-up counts, Python/platform and Redis
-metadata, disabled/enabled median and nearest-rank p95, median/p95 overhead,
-and the fallback measurements. These are capture-hook timings, not total
-KataGo request latency. Overhead is the difference between aggregate
-quantiles, not paired per-request deltas.
+metadata, disabled/enabled median and nearest-rank p95 for single-event and
+batch hooks, normalized batch overhead per component, and the fallback
+measurements. These are capture-hook timings, not total KataGo request latency.
+Overhead is the difference between aggregate quantiles, not paired
+per-request deltas.
 
 No performance acceptance limit is defined in the repository. The report
 therefore marks threshold acceptance as pending an explicit engineering
