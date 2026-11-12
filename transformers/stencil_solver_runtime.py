@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Sequence
 
 from transformers.stencil_cache_storage import _stable_digest
@@ -24,10 +25,14 @@ logger = logging.getLogger("kataproxy.stencil_solver_runtime")
 
 @dataclass(frozen=True)
 class SolverExecution:
+    canonical_key: bytes
     problem: CanonicalProblem
     identity: SolverIdentity
     outcome: SolverOutcome
+    reported_outcome: SolverOutcome
+    started_at_utc: str
     elapsed_wall_ns: int
+    placements_disposition: str
     cache_result: tuple[bool, int, bytes]
     fallback_used: bool
 
@@ -73,7 +78,8 @@ def _error_outcome(exc: Exception) -> SolverOutcome:
 
 def _cache_result(
     problem: CanonicalProblem, outcome: SolverOutcome,
-) -> tuple[SolverOutcome, tuple[bool, int, bytes], bool]:
+) -> tuple[SolverOutcome, tuple[bool, int, bytes], bool, str]:
+    placements_disposition = "not_returned"
     if (
         isinstance(outcome.incumbent, Incumbent)
         and isinstance(outcome.incumbent.placement_witness, PlacementWitness)
@@ -90,8 +96,9 @@ def _cache_result(
             ]
             encoded = encode_cached_placements(flat_placements, problem.stencil_family)
             optimal = outcome.status is OutcomeStatus.OPTIMAL
-            return outcome, (optimal, 0 if optimal else 1, encoded), False
+            return outcome, (optimal, 0 if optimal else 1, encoded), False, "validated"
         except Exception as exc:
+            placements_disposition = "rejected_invalid"
             logger.error("Rejected invalid solver cover: %s", exc)
             # A proof paired with a malformed cover is not a validated result.
             # Preserve backend diagnostics while marking the invocation ERROR.
@@ -127,6 +134,7 @@ def _cache_result(
         outcome,
         (False, 2, encode_cached_placements(singleton_cover, problem.stencil_family)),
         True,
+        placements_disposition,
     )
 
 
@@ -139,6 +147,9 @@ def solve_component(
     """Shared foreground/background path; no cache, Redis, SQLite, or request state."""
     problem = canonical_problem_from_key(shape_key, family)
     identity = backend.identity
+    started_at_utc = datetime.now(timezone.utc).isoformat(
+        timespec="microseconds",
+    ).replace("+00:00", "Z")
     started_ns = time.perf_counter_ns()
     try:
         outcome = backend.solve(problem, budget)
@@ -147,9 +158,19 @@ def solve_component(
     except Exception as exc:
         outcome = _error_outcome(exc)
     elapsed_wall_ns = time.perf_counter_ns() - started_ns
-    normalized_outcome, cache_result, fallback_used = _cache_result(problem, outcome)
+    reported_outcome = outcome
+    (
+        normalized_outcome, cache_result, fallback_used, placements_disposition,
+    ) = _cache_result(problem, outcome)
     return SolverExecution(
-        problem=problem, identity=identity, outcome=normalized_outcome,
-        elapsed_wall_ns=elapsed_wall_ns, cache_result=cache_result,
+        canonical_key=shape_key,
+        problem=problem,
+        identity=identity,
+        outcome=normalized_outcome,
+        reported_outcome=reported_outcome,
+        started_at_utc=started_at_utc,
+        elapsed_wall_ns=elapsed_wall_ns,
+        placements_disposition=placements_disposition,
+        cache_result=cache_result,
         fallback_used=fallback_used,
     )

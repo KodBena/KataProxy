@@ -1,9 +1,11 @@
-# Stencil-cover solver and corpus contracts (Phase 0–1)
+# Stencil-cover solver and corpus contracts (Phase 0–2)
 
 **Status:** Phase 0 contracts remain frozen. Phase 1 has extracted the default
 HiGHS adapter, routed foreground/background solving through the shared solver
-port, and added fake-backend substitution coverage. Corpus publishing and
-SQLite materialization remain future phases.
+port, and added fake-backend substitution coverage. Phase 2 now implements the
+strict v1 corpus event envelope, canonical JSON serialization, and validation.
+Producer wiring, Redis Streams transport, and SQLite materialization remain
+subsequent steps.
 
 This document is the design contract for the next stencil-cover iteration.
 The typed solver port lives in `transformers/stencil_solver_api.py`; this
@@ -440,6 +442,17 @@ same instance.
 
 Phase 0 froze these contracts and canonicalization tests. Phase 1 extracted
 the HiGHS adapter, routed foreground and bulk execution through the shared
-solver interface, and added fake-backend substitution tests. No SQLite writer,
-corpus event publisher, Redis schema migration, gomecsolver integration, or
-OR-Tools integration is part of Phase 1.
+solver interface, and added fake-backend substitution tests.
+
+Phase 2 implements the transport-neutral event envelope and strict validator
+in `transformers/stencil_corpus_events.py`. It pins UUID, UTC timestamp,
+canonical instance identity, solver identity, budget units, outcome
+dispositions, placement payload codec, and canonical JSON rules. The shared
+runtime now retains the UTC start time and raw versus normalized outcome
+needed to build an auditable attempt event. This slice intentionally does not
+publish events from foreground/bulk, create the Redis Stream, or install the
+SQLite materializer; those require an explicit transport/storage owner and
+are the next delivery boundary.
+
+No Redis result namespace/schema migration, profile-aware queue migration,
+gomecsolver integration, or OR-Tools integration is part of Phases 1–2.
