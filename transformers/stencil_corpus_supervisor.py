@@ -157,7 +157,6 @@ class StencilCorpusMaterializerSupervisor:
             "--block-ms",
             str(self.block_ms),
             "--supervised-ready",
-            cwd=str(Path(__file__).resolve().parents[1]),
             stdout=asyncio.subprocess.PIPE,
             stderr=None,
         )
