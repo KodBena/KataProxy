@@ -564,14 +564,31 @@ def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
         )
         assert pending
 
-    # A new consumer uses the production XAUTOCLAIM path, replays the already
-    # committed event, observes the receipt as a duplicate, then acknowledges.
-    restarted = StencilCorpusMaterializer(
-        store, _stream_port(redis_client), consumer_name="restarted-worker", claim_idle_ms=1,
+    # Restart through the production CLI in a new process. Its normal
+    # startup constructs a fresh consumer and recovers through XAUTOCLAIM.
+    repository_root = Path(__file__).resolve().parents[1]
+    restarted = subprocess.run(
+        [
+            sys.executable,
+            "-m", "transformers.stencil_corpus_materializer",
+            "--database", str(database),
+            "--once",
+            "--block-ms", "0",
+            "--claim-idle-ms", "1",
+        ],
+        cwd=repository_root,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=10.0,
+        check=False,
     )
-    replay = restarted.run_once(block_ms=0)
-    assert replay["duplicates"] == 1
-    assert replay["acked"] == 1
+    assert restarted.returncode == 0, (
+        "restarted materializer CLI failed: "
+        f"stdout={restarted.stdout!r}, stderr={restarted.stderr!r}"
+    )
+    assert "duplicates': 1" in restarted.stderr
+    assert "acked': 1" in restarted.stderr
     assert store.counts()["receipts"] == 1
     assert store.counts()["instances"] == 1
     assert redis_client.xpending(
