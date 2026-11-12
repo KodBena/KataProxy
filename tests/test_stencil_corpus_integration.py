@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, Literal, cast
 
 import pytest
 import redis
@@ -522,7 +522,10 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         corpus_database_publisher = CorpusEventPublisher(
             redis_client=redis_client, sqlite_path=database,
         )
-        for producer_path in ("foreground", "bulk"):
+        producer_paths: tuple[Literal["foreground", "bulk"], ...] = (
+            "foreground", "bulk",
+        )
+        for producer_path in producer_paths:
             collecting_sink = _CollectingSink()
             budget = SolverBudget(
                 wall_time_limit_ms=10_000,
