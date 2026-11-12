@@ -179,9 +179,12 @@ def create_redis_client() -> Any:
     client.ping()
     return client
 
-_REDIS_HOST = "127.0.0.1"
-_REDIS_PORT = 6379
-_REDIS_DB = 7
+# Production defaults remain loopback DB 7. Explicit environment overrides let
+# isolated integration processes use their own Redis endpoint/database without
+# ever probing or mutating a developer's configured cache.
+_REDIS_HOST = os.environ.get("KATAPROXY_REDIS_HOST", "127.0.0.1")
+_REDIS_PORT = int(os.environ.get("KATAPROXY_REDIS_PORT", "6379"))
+_REDIS_DB = int(os.environ.get("KATAPROXY_REDIS_DB", "7"))
 _CONNECT_TIMEOUT_SECONDS = 0.25
 _SOCKET_TIMEOUT_SECONDS = 0.25
 _VALUE_SCHEMA_VERSION = 3
