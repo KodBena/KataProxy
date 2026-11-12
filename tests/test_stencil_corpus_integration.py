@@ -426,7 +426,7 @@ async def _start_ordinary_service(
 
         return _ObservedServe()
 
-    monkeypatch.setattr(proxy_server.websockets, "serve", observed_serve)
+    monkeypatch.setattr(websockets, "serve", observed_serve)
     task = asyncio.create_task(proxy_server._main())
     await asyncio.wait_for(serving.wait(), timeout=10.0)
     websocket = await websockets.connect(
