@@ -45,8 +45,8 @@ class CorpusEventSink(Protocol):
 
 
 def corpus_events_enabled() -> bool:
-    """Corpus capture is opt-in so existing deployments gain no I/O by default."""
-    return os.environ.get(_ENABLE_ENV, "").strip().lower() in {
+    """Capture is enabled unless an operator explicitly opts out."""
+    return os.environ.get(_ENABLE_ENV, "true").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
