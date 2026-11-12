@@ -473,9 +473,7 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
             supervisors.append(self)
 
     monkeypatch.setattr(
-        stencil_corpus_supervisor,
-        "StencilCorpusMaterializerSupervisor",
-        _TrackingSupervisor,
+        proxy_server, "StencilCorpusMaterializerSupervisor", _TrackingSupervisor,
     )
 
     task, websocket = await _start_ordinary_service(monkeypatch)
@@ -618,9 +616,7 @@ async def test_ordinary_service_explicit_opt_out_keeps_analysis_available(
             supervisors.append(self)
 
     monkeypatch.setattr(
-        stencil_corpus_supervisor,
-        "StencilCorpusMaterializerSupervisor",
-        _TrackingSupervisor,
+        proxy_server, "StencilCorpusMaterializerSupervisor", _TrackingSupervisor,
     )
     task, websocket = await _start_ordinary_service(monkeypatch)
     try:
