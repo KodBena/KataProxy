@@ -545,11 +545,38 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
             sighting = make_instance_seen_event(
                 problem, shape_key, producer_path=producer_path,
             )
-            supervisor.clear_materialization_event()
             assert corpus_database_publisher.publish_many(
                 (sighting, *collecting_sink.events),
             ) == "redis_stream"
-            assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+
+        def has_both_producer_paths() -> bool:
+            with sqlite3.connect(database) as connection:
+                seen_paths = {
+                    str(row[0]) for row in connection.execute(
+                        "SELECT DISTINCT producer_path FROM instance_sighting_paths"
+                    ).fetchall()
+                }
+                attempt_paths = {
+                    str(row[0]) for row in connection.execute(
+                        "SELECT DISTINCT source_path FROM solver_attempts"
+                    ).fetchall()
+                }
+            return (
+                {"foreground", "bulk"} <= seen_paths
+                and {"foreground", "bulk"} <= attempt_paths
+                and store.counts()["attempts"] >= 2
+            )
+
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while True:
+            supervisor.clear_materialization_event()
+            if has_both_producer_paths():
+                break
+            remaining = deadline - asyncio.get_running_loop().time()
+            assert remaining > 0, "materializer did not commit both producer paths"
+            assert await supervisor.wait_for_materialization(
+                timeout_seconds=remaining,
+            )
 
         foreground_counts = store.counts()
         assert foreground_counts["attempts"] >= 2
@@ -598,10 +625,16 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         assert corpus_database_publisher.publish(restart_event) == "redis_stream"
         assert store.counts()["receipts"] == before_restart
 
-        supervisor.clear_materialization_event()
         await supervisor.start()
         assert supervisor.is_running
-        assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+        restart_deadline = asyncio.get_running_loop().time() + 10.0
+        while store.counts()["receipts"] < before_restart + 1:
+            supervisor.clear_materialization_event()
+            remaining = restart_deadline - asyncio.get_running_loop().time()
+            assert remaining > 0, "restarted materializer did not drain new stream event"
+            assert await supervisor.wait_for_materialization(
+                timeout_seconds=remaining,
+            )
         assert store.counts()["receipts"] == before_restart + 1
     finally:
         await _stop_ordinary_service(task, websocket)
