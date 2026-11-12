@@ -43,6 +43,7 @@ from katago import KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
 from transformers import stencil_cover_enricher as stencil
 from transformers import stencil_corpus_publisher as corpus_publisher
+from transformers import stencil_cache_storage
 from transformers.stencil_cache_storage import (
     RedisCacheConflict,
     RedisStencilStore,
@@ -281,8 +282,6 @@ def _install_capture(
     monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "1")
     publisher = CorpusEventPublisher(redis_client=client, sqlite_path=database)
     monkeypatch.setattr(corpus_publisher, "_DEFAULT_PUBLISHER", publisher)
-    from transformers import stencil_cache_storage
-
     monkeypatch.setitem(
         stencil_cache_storage._PERSISTENT_CLIENTS,
         "solver-component-d4-v4",
