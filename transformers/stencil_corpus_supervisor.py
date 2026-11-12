@@ -29,7 +29,7 @@ class StencilCorpusMaterializerSupervisor:
         database_path: str | Path | None = None,
         *,
         poll_interval_seconds: float = 1.0,
-        block_ms: int = 250,
+        block_ms: int = 100,
         startup_timeout_seconds: float = 10.0,
         shutdown_timeout_seconds: float = 5.0,
         restart_initial_delay_seconds: float = 1.0,
