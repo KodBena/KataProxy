@@ -791,7 +791,6 @@ def stencil_cover_enricher(
             if (
                 context is not None
                 and isinstance(response, AnalyzeResponse)
-                and not response.is_during_search
             ):
                 try:
                     board = _board_at_turn(context, response.turn_number)
