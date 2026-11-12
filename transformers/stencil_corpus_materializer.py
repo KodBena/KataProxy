@@ -7,10 +7,12 @@ always precedes XACK, so a crash causes a safe receipt-checked replay.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import signal
 import socket
-import time
+import threading
 import uuid
 from typing import Any, Callable, Protocol, Sequence
 
@@ -314,7 +316,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=60_000,
         help="minimum pending age before XAUTOCLAIM can recover an abandoned event",
     )
+    parser.add_argument(
+        "--supervised-ready",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
+    stop_requested = threading.Event()
+
+    def request_shutdown(_signum: int, _frame: Any) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be positive")
     if args.block_ms < 0:
@@ -336,6 +350,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.exception("Could not initialize the SQLite stencil corpus database")
         return 1
 
+    # SQLite initialization is the startup-critical boundary. The parent
+    # supervisor uses this marker as a readiness handshake; Redis outages
+    # after this point are reported by the CLI and restarted by the parent.
+    if args.supervised_ready:
+        print("KATAPROXY_STENCIL_CORPUS_READY", flush=True)
+
     redis_client: RedisStreamPort | None = None
     if not args.spool_only:
         try:
@@ -354,12 +374,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=args.batch_size,
             claim_idle_ms=args.claim_idle_ms,
         )
-        while True:
+        while not stop_requested.is_set():
             counts = materializer.run_once(
                 block_ms=None if args.once or args.block_ms == 0 else args.block_ms,
             )
             if any(counts.values()):
                 logger.info("Stencil corpus materializer pass: %s", counts)
+            if args.supervised_ready and (
+                counts.get("stream_ingested", 0)
+                + counts.get("spool_ingested", 0)
+                + counts.get("duplicates", 0)
+                > 0
+            ):
+                print(
+                    "KATAPROXY_STENCIL_CORPUS_PROGRESS "
+                    + json.dumps(counts, sort_keys=True),
+                    flush=True,
+                )
             if args.once:
                 return 0
             if (
@@ -367,7 +398,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or counts.get("errors", 0) > 0
                 or counts.get("deferred", 0) > 0
             ):
-                time.sleep(args.poll_interval)
+                stop_requested.wait(args.poll_interval)
+        logger.info("Stencil corpus materializer stopped")
+        return 0
     except KeyboardInterrupt:
         logger.info("Stencil corpus materializer stopped")
         return 0
