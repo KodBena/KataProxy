@@ -93,9 +93,19 @@ def instance_id_for(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _instance_document(problem: Any, canonical_key: bytes) -> _JSON:
+def _validate_problem_key(problem: Any, canonical_key: bytes) -> None:
     if not isinstance(canonical_key, bytes):
         raise TypeError("canonical_key must be bytes")
+    width, height, flat_cells = decode_component_shape_key(canonical_key)
+    occupied = tuple((index // width, index % width) for index in flat_cells)
+    if (width, height, occupied) != (
+        problem.width, problem.height, problem.occupied_cells,
+    ):
+        raise ValueError("canonical_key does not identify the supplied canonical problem")
+
+
+def _instance_document(problem: Any, canonical_key: bytes) -> _JSON:
+    _validate_problem_key(problem, canonical_key)
     return {
         "family_fingerprint": problem.family_fingerprint,
         "canonicalization_version": problem.canonicalization_version,
@@ -127,6 +137,8 @@ def make_instance_seen_event(
         "instance": _instance_document(problem, canonical_key),
     }
     validate_event(event)
+    if serialize_event(event) != decoded.encode("utf-8"):
+        raise CorpusEventError("event payload must use canonical compact JSON")
     return event
 
 
@@ -294,6 +306,8 @@ def make_solver_attempt_event(
         ),
     }
     validate_event(event)
+    if serialize_event(event) != decoded.encode("utf-8"):
+        raise CorpusEventError("event payload must use canonical compact JSON")
     return event
 
 
@@ -331,7 +345,7 @@ def _expect_finite_number(value: Any, field: str, *, positive: bool) -> float:
     return float(value)
 
 
-def _validate_instance(value: Any) -> None:
+def _validate_instance(value: Any) -> tuple[int, int, tuple[tuple[int, int], ...]]:
     instance = _expect_object(value, "instance")
     _expect_exact_keys(
         instance,
@@ -370,6 +384,8 @@ def _validate_instance(value: Any) -> None:
         declared_width, declared_height, declared_count,
     ):
         raise CorpusEventError("instance dimensions or cell_count disagree with canonical key")
+    occupied = tuple((index // width, index % width) for index in cells)
+    return width, height, occupied
 
 
 def _validate_budget(value: Any) -> None:
@@ -421,7 +437,12 @@ def _validate_identity(value: Any) -> None:
         raise CorpusEventError("solver_identity fingerprint does not match its fields")
 
 
-def _validate_outcome(value: Any) -> None:
+def _validate_outcome(
+    value: Any,
+    expected_width: int,
+    expected_height: int,
+    expected_cells: tuple[tuple[int, int], ...],
+) -> None:
     outcome = _expect_object(value, "outcome")
     _expect_exact_keys(
         outcome,
@@ -433,7 +454,9 @@ def _validate_outcome(value: Any) -> None:
         "outcome",
     )
     status = outcome["status"]
-    if status not in {member.value for member in OutcomeStatus}:
+    if not isinstance(status, str) or status not in {
+        member.value for member in OutcomeStatus
+    }:
         raise CorpusEventError("outcome.status is unsupported")
     optimality_proven = outcome["optimality_proven"]
     if not isinstance(optimality_proven, bool) or optimality_proven != (
@@ -527,6 +550,8 @@ def _validate_outcome(value: Any) -> None:
     placements = _expect_object(outcome["placements"], "outcome.placements")
     disposition = placements.get("disposition")
     if disposition == "validated":
+        if status not in (OutcomeStatus.OPTIMAL.value, OutcomeStatus.FEASIBLE.value):
+            raise CorpusEventError("validated placements require an incumbent outcome")
         _expect_exact_keys(
             placements, {"disposition", "payload_b64", "codec_version"},
             set(), "outcome.placements",
@@ -553,6 +578,7 @@ def _validate_outcome(value: Any) -> None:
             raise CorpusEventError("validated placement payload must not be empty")
         if tile_count is None or len(payload["placements"]) != tile_count:
             raise CorpusEventError("placement count disagrees with incumbent tile_count")
+        covered: set[tuple[int, int]] = set()
         for placement in payload["placements"]:
             item = _expect_object(placement, "placement")
             _expect_exact_keys(item, {"stencil", "cells"}, set(), "placement")
@@ -560,6 +586,7 @@ def _validate_outcome(value: Any) -> None:
                 raise CorpusEventError("placement stencil name must be non-empty")
             if not isinstance(item["cells"], list) or not item["cells"]:
                 raise CorpusEventError("placement cells must be a non-empty list")
+            placement_cells: set[tuple[int, int]] = set()
             for cell in item["cells"]:
                 if (
                     not isinstance(cell, list) or len(cell) != 2
@@ -567,8 +594,28 @@ def _validate_outcome(value: Any) -> None:
                            for coord in cell)
                 ):
                     raise CorpusEventError("placement cells must be non-negative [y, x] pairs")
+                y, x = cell
+                if y >= expected_height or x >= expected_width:
+                    raise CorpusEventError("placement cell lies outside the canonical component")
+                coordinate = (y, x)
+                if coordinate in placement_cells or coordinate in covered:
+                    raise CorpusEventError("validated placements must be pairwise disjoint")
+                placement_cells.add(coordinate)
+            covered.update(placement_cells)
+        if covered != set(expected_cells):
+            raise CorpusEventError("validated placements do not cover the canonical component")
+        if status not in (OutcomeStatus.OPTIMAL.value, OutcomeStatus.FEASIBLE.value):
+            raise CorpusEventError("validated placements require an incumbent outcome")
     elif disposition in ("not_returned", "rejected_invalid"):
         _expect_exact_keys(placements, {"disposition"}, set(), "outcome.placements")
+        if disposition == "rejected_invalid" and status != OutcomeStatus.ERROR.value:
+            raise CorpusEventError("rejected placements require an error outcome")
+        if (
+            status == OutcomeStatus.ERROR.value
+            and tile_count is not None
+            and disposition != "rejected_invalid"
+        ):
+            raise CorpusEventError("an invalid incumbent witness must be marked rejected_invalid")
     else:
         raise CorpusEventError("unknown placements disposition")
 
@@ -597,6 +644,8 @@ def validate_event(value: Any) -> None:
     """Validate all fields and status/disposition companion invariants."""
     event = _expect_object(value, "event")
     event_type = event.get("event_type")
+    if not isinstance(event_type, str):
+        raise CorpusEventError("event_type must be a string")
     common = {
         "schema", "event_id", "event_type", "emitted_at_utc",
         "producer_path", "instance",
@@ -619,9 +668,10 @@ def validate_event(value: Any) -> None:
     if canonical_uuid != identifier:
         raise CorpusEventError("event_id must be a canonical lowercase UUID")
     _parse_utc_timestamp(event.get("emitted_at_utc"), "emitted_at_utc")
-    if event.get("producer_path") not in PRODUCER_PATHS:
+    producer_path = event.get("producer_path")
+    if not isinstance(producer_path, str) or producer_path not in PRODUCER_PATHS:
         raise CorpusEventError("producer_path must be foreground or bulk")
-    _validate_instance(event.get("instance"))
+    width, height, occupied = _validate_instance(event.get("instance"))
 
     if event_type == "instance_seen":
         return
@@ -632,9 +682,11 @@ def validate_event(value: Any) -> None:
     _validate_budget(event.get("budget"))
     _parse_utc_timestamp(event.get("started_at_utc"), "started_at_utc")
     _expect_int(event.get("elapsed_wall_ns"), "elapsed_wall_ns")
-    _validate_outcome(event.get("outcome"))
+    _validate_outcome(event.get("outcome"), width, height, occupied)
     fallback = event.get("fallback_disposition")
-    if fallback not in ("not_needed", "singleton_fallback_used"):
+    if not isinstance(fallback, str) or fallback not in (
+        "not_needed", "singleton_fallback_used",
+    ):
         raise CorpusEventError("unsupported fallback disposition")
     placements = event["outcome"]["placements"]["disposition"]
     if fallback == "not_needed" and placements != "validated":

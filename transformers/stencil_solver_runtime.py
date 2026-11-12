@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from typing import Sequence
 
 from transformers.stencil_cache_storage import _stable_digest
+from transformers.stencil_corpus_events import ProducerPath, make_solver_attempt_event
+from transformers.stencil_corpus_publisher import (
+    CorpusEventSink, get_default_event_publisher,
+)
 from transformers.stencil_solver_api import (
     BackendStatusUnavailable, CanonicalProblem, Incumbent, LowerBoundUnavailable,
     NativeEffortUnavailable, NoIncumbent, NoIncumbentReason, NoNativeEffortReason,
@@ -143,6 +147,9 @@ def solve_component(
     shape_key: bytes,
     family: Sequence[Stencil],
     budget: SolverBudget,
+    *,
+    producer_path: ProducerPath = "foreground",
+    event_publisher: CorpusEventSink | None = None,
 ) -> SolverExecution:
     """Shared foreground/background path; no cache, Redis, SQLite, or request state."""
     problem = canonical_problem_from_key(shape_key, family)
@@ -162,7 +169,7 @@ def solve_component(
     (
         normalized_outcome, cache_result, fallback_used, placements_disposition,
     ) = _cache_result(problem, outcome)
-    return SolverExecution(
+    execution = SolverExecution(
         canonical_key=shape_key,
         problem=problem,
         identity=identity,
@@ -174,3 +181,19 @@ def solve_component(
         cache_result=cache_result,
         fallback_used=fallback_used,
     )
+    selected_publisher = (
+        get_default_event_publisher() if event_publisher is None else event_publisher
+    )
+    if selected_publisher is not None:
+        try:
+            event = make_solver_attempt_event(
+                execution, shape_key, budget, producer_path,
+            )
+            selected_publisher.publish(event)
+        except Exception:
+            # Corpus logging must never suppress or alter the solver result.
+            logger.exception(
+                "Could not construct stencil solver_attempt event for key %s",
+                shape_key.hex(),
+            )
+    return execution

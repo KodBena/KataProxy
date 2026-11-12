@@ -221,6 +221,26 @@ The same worker can be launched from a checkout with
 current pending snapshot and exit. At present, run at most one bulk worker
 for this cache namespace.
 
+
+
+Optional corpus capture records canonical component sightings and actual
+solver attempts. It is disabled by default; enable it with:
+
+```sh
+export KATAPROXY_STENCIL_CORPUS_ENABLED=1
+# Optional: choose where Redis-unavailable events are spooled.
+export KATAPROXY_STENCIL_CORPUS_DB=/var/lib/kataproxy/stencil-corpus-spool.sqlite3
+```
+
+When enabled, events are written to the Redis Stream
+`kataproxy:stencil-cover:corpus:events:v1` in DB 7. If Redis is unavailable,
+the exact event bytes are appended to a local SQLite spool (default:
+`$XDG_STATE_HOME/kataproxy/stencil-cover-corpus.sqlite3`, or
+`~/.local/state/kataproxy/stencil-cover-corpus.sqlite3`). Configure Redis
+AOF and persistent storage for stream durability. The SQLite spool is a
+transport fallback; normalized corpus materialization and query tooling are
+not included yet.
+
 ---
 
 ## Logs

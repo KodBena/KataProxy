@@ -4,8 +4,10 @@
 HiGHS adapter, routed foreground/background solving through the shared solver
 port, and added fake-backend substitution coverage. Phase 2 now implements the
 strict v1 corpus event envelope, canonical JSON serialization, and validation.
-Producer wiring, Redis Streams transport, and SQLite materialization remain
-subsequent steps.
+Foreground and bulk producers now emit sightings and actual-attempt events
+through an opt-in Redis Streams publisher with an idempotent SQLite raw-event
+spool fallback. SQLite corpus materialization and analysis/consumer tooling
+remain subsequent steps.
 
 This document is the design contract for the next stencil-cover iteration.
 The typed solver port lives in `transformers/stencil_solver_api.py`; this
@@ -445,14 +447,23 @@ the HiGHS adapter, routed foreground and bulk execution through the shared
 solver interface, and added fake-backend substitution tests.
 
 Phase 2 implements the transport-neutral event envelope and strict validator
-in `transformers/stencil_corpus_events.py`. It pins UUID, UTC timestamp,
+in `transformers/stencil_corpus_events.py`, and the best-effort publisher in
+`transformers/stencil_corpus_publisher.py`. It pins UUID, UTC timestamp,
 canonical instance identity, solver identity, budget units, outcome
-dispositions, placement payload codec, and canonical JSON rules. The shared
-runtime now retains the UTC start time and raw versus normalized outcome
-needed to build an auditable attempt event. This slice intentionally does not
-publish events from foreground/bulk, create the Redis Stream, or install the
-SQLite materializer; those require an explicit transport/storage owner and
-are the next delivery boundary.
+dispositions, placement payload codec, and canonical JSON rules. Foreground
+sightings occur before local-LRU/Redis result-cache lookup; actual foreground
+and bulk solver invocations publish separate attempt events. Redis Stream
+entries have no producer-side trimming policy. When Redis is unavailable, the
+publisher writes the same canonical bytes to an append-only SQLite spool
+(`user_version=1`, WAL, `synchronous=FULL`, event-ID idempotency and
+immutable-payload conflict detection). Corpus capture is opt-in via
+`KATAPROXY_STENCIL_CORPUS_ENABLED=1`; its spool path can be set with
+`KATAPROXY_STENCIL_CORPUS_DB`.
+
+The SQLite spool is a raw transport fallback, not yet the normalized corpus
+database described in §4. This phase intentionally does not create the Redis
+consumer group, materialize events into `instances`/`solver_attempts`, or
+provide the analysis/ingest CLI. Those are the next delivery boundary.
 
 No Redis result namespace/schema migration, profile-aware queue migration,
 gomecsolver integration, or OR-Tools integration is part of Phases 1–2.

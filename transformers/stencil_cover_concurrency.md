@@ -66,6 +66,33 @@ Programmatic composition can inject a backend through
 `StencilBulkSolver(..., solver_backend=...)`. No gomecsolver or OR-Tools
 dependency is added by this phase.
 
+## Corpus event capture (Phase 2)
+
+Corpus capture is opt-in. Set `KATAPROXY_STENCIL_CORPUS_ENABLED=1` to
+publish events; set `KATAPROXY_STENCIL_CORPUS_DB` to choose the SQLite
+fallback path. Without the enable flag, the normal solver path performs no
+corpus transport or filesystem I/O.
+
+For each foreground component, the producer emits `instance_seen` before
+consulting the process-local LRU or shared Redis result cache. A cache hit
+therefore records a sighting but does not fabricate a solver attempt. Bulk
+processing records a bulk sighting before its actual solve. The shared solver
+runtime emits exactly one `solver_attempt` envelope per actual backend
+invocation, preserving the backend-reported outcome separately from the
+normalized result used by KataProxy.
+
+The publisher writes the canonical v1 event bytes to the untrimmed Redis
+Stream `kataproxy:stencil-cover:corpus:events:v1`. If Redis publication fails,
+it appends those exact bytes to a local SQLite spool with event-ID
+idempotency. The spool uses WAL and `synchronous=FULL`; a repeated event ID
+with different bytes is an immutable-event conflict. If both persistence
+paths fail, the publisher logs a CRITICAL diagnostic and continues the
+analysis/worker path. Redis Stream durability still depends on the Redis
+server's persistence and volume configuration.
+
+This is a raw event spool only. A consumer group and materializer that turn
+these events into the normalized SQLite corpus are not part of this phase.
+
 ## Why the queue is in Redis, not a multiprocessing.Queue
 
 A `multiprocessing.Queue` is a reasonable choice when a single parent process

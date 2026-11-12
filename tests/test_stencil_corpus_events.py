@@ -1,34 +1,32 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
-from types import SimpleNamespace
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_corpus_events import (
-    CORPUS_EVENT_SCHEMA,
-    PLACEMENT_PAYLOAD_CODEC,
-    CorpusEventError,
-    instance_id_for,
     make_instance_seen_event,
-    make_solver_attempt_event,
     parse_event,
     serialize_event,
-    validate_event,
+)
+from transformers.stencil_corpus_publisher import (
+    CORPUS_STREAM_KEY,
+    CorpusEventConflict,
+    CorpusEventPublisher,
+    SQLiteEventSpool,
+    corpus_events_enabled,
 )
 from transformers.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
-    LowerBoundUnavailable,
-    NativeEffortReported,
     NativeEffortUnavailable,
-    NoIncumbent,
-    NoIncumbentReason,
     NoNativeEffortLimit,
     NoNativeEffortReason,
     NoSolverFailure,
@@ -36,11 +34,10 @@ from transformers.stencil_solver_api import (
     PlacementWitness,
     ProvenLowerBound,
     SolverBudget,
-    SolverFailure,
     SolverIdentity,
     SolverOutcome,
 )
-from transformers.stencil_solver_runtime import canonical_problem_from_key
+from transformers.stencil_solver_runtime import canonical_problem_from_key, solve_component
 
 
 def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
@@ -50,247 +47,266 @@ def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
     )
 
 
-def _key_and_problem() -> tuple[bytes, Any]:
-    key, _frame = stencil._component_shape_key((0, 1), 2, _family())
-    return key, canonical_problem_from_key(key, _family())
-
-
-def _identity() -> SolverIdentity:
-    config = '{"presolve":true}'
-    return SolverIdentity(
-        backend_name="test-highs-substitute",
-        backend_version="1.0",
-        adapter_version="fake-adapter-v1",
-        configuration_json=config,
-        configuration_fingerprint=hashlib.sha256(config.encode("utf-8")).hexdigest(),
-    )
-
-
-def _budget() -> SolverBudget:
-    return SolverBudget(
-        wall_time_limit_ms=250,
-        native_effort_limit=NoNativeEffortLimit(),
-        policy_id="foreground-250ms",
-    )
-
-
-def _execution(
-    outcome: SolverOutcome,
-    *,
-    normalized: SolverOutcome | None = None,
-    placements_disposition: str = "validated",
-    fallback_used: bool = False,
-) -> Any:
-    _key, problem = _key_and_problem()
-    return SimpleNamespace(
-        problem=problem,
-        identity=_identity(),
-        reported_outcome=outcome,
-        outcome=outcome if normalized is None else normalized,
-        started_at_utc="2026-11-12T10:15:30.000000Z",
-        elapsed_wall_ns=3_400_000,
-        placements_disposition=placements_disposition,
-        fallback_used=fallback_used,
-    )
-
-
-def _optimal_outcome() -> SolverOutcome:
-    return SolverOutcome(
-        status=OutcomeStatus.OPTIMAL,
-        incumbent=Incumbent(
-            1, PlacementWitness((("1x2", ((0, 0), (0, 1))),)),
-        ),
-        lower_bound=ProvenLowerBound(1),
-        native_effort=NativeEffortReported(42, "mip_nodes"),
-        backend_status=BackendStatusReported("OPTIMAL"),
-        backend_metrics_json='{"mip_gap":0.0,"nodes":42}',
-        error=NoSolverFailure(),
-    )
-
-
-def test_instance_seen_event_has_frozen_identity_and_round_trips_canonically() -> None:
-    key, problem = _key_and_problem()
-    event = make_instance_seen_event(
-        problem,
+def _event(event_id: str = "12345678-1234-5678-1234-567812345678") -> dict[str, Any]:
+    family = _family()
+    key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    return make_instance_seen_event(
+        canonical_problem_from_key(key, family),
         key,
-        event_id="12345678-1234-5678-1234-567812345678",
+        event_id=event_id,
+        emitted_at_utc=datetime(2026, 11, 12, 10, 15, 30, tzinfo=timezone.utc),
     )
 
-    assert event["schema"] == CORPUS_EVENT_SCHEMA
-    assert event["event_type"] == "instance_seen"
-    assert event["producer_path"] == "foreground"
-    instance = event["instance"]
-    assert instance["family_fingerprint"] == problem.family_fingerprint
-    assert instance["canonicalization_version"] == problem.canonicalization_version
-    assert instance["cell_count"] == 2
-    assert instance_id_for(
-        problem.family_fingerprint, problem.canonicalization_version, key,
-    ) == instance_id_for(
-        instance["family_fingerprint"],
-        instance["canonicalization_version"],
-        base64.b64decode(instance["canonical_key_b64"]),
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def xadd(self, *args: Any) -> str:
+        self.calls.append(args)
+        return "1-0"
+
+
+def test_publisher_writes_untrimmed_event_to_redis_first(tmp_path: Path) -> None:
+    client = _FakeRedis()
+    publisher = CorpusEventPublisher(
+        redis_client_factory=lambda: client,
+        sqlite_path=tmp_path / "spool.sqlite3",
     )
+    event = _event()
 
-    encoded = serialize_event(event)
-    assert parse_event(encoded) == event
-    assert serialize_event(parse_event(encoded)) == encoded
+    assert publisher.publish(event) == "redis_stream"
+    assert len(client.calls) == 1
+    assert client.calls[0][0] == CORPUS_STREAM_KEY
+    assert client.calls[0][1] == {b"event": serialize_event(event)}
+    assert len(client.calls[0]) == 2
+    assert not (tmp_path / "spool.sqlite3").exists()
 
 
-def test_solver_attempt_event_carries_identity_budget_metrics_and_validated_witness() -> None:
-    key, _problem = _key_and_problem()
-    event = make_solver_attempt_event(
-        _execution(_optimal_outcome()),
+def test_sqlite_spool_is_idempotent_and_preserves_exact_event_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "corpus.sqlite3"
+    spool = SQLiteEventSpool(path)
+    payload = serialize_event(_event())
+
+    assert spool.append(payload) is True
+    assert spool.append(payload) is False
+
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT event_id, event_json, payload_sha256 FROM stencil_corpus_spool_events"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "12345678-1234-5678-1234-567812345678"
+        assert bytes(row[1]) == payload
+        assert row[2] == hashlib.sha256(payload).hexdigest()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+
+
+def test_sqlite_spool_rejects_same_event_id_with_different_immutable_bytes(
+    tmp_path: Path,
+) -> None:
+    spool = SQLiteEventSpool(tmp_path / "corpus.sqlite3")
+    first = _event()
+    second = copy.deepcopy(first)
+    second["emitted_at_utc"] = "2026-11-12T10:15:31.000000Z"
+
+    spool.append(serialize_event(first))
+    with pytest.raises(CorpusEventConflict, match="different bytes"):
+        spool.append(serialize_event(second))
+
+
+def test_publisher_falls_back_to_sqlite_when_redis_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "fallback.sqlite3"
+
+    def fail_to_connect() -> Any:
+        raise ConnectionError("Redis is offline")
+
+    publisher = CorpusEventPublisher(
+        redis_client_factory=fail_to_connect,
+        sqlite_path=path,
+    )
+    event = _event()
+    payload = serialize_event(event)
+
+    assert publisher.publish(event) == "sqlite_spool"
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT event_json FROM stencil_corpus_spool_events WHERE event_id = ?",
+            (event["event_id"],),
+        ).fetchone()
+    assert row is not None
+    assert bytes(row[0]) == payload
+
+
+def test_publisher_logs_critical_but_does_not_raise_when_both_paths_fail(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A regular file cannot be used as the parent directory of the spool path.
+    obstruction = tmp_path / "not-a-directory"
+    obstruction.write_text("occupied", encoding="utf-8")
+
+    def fail_to_connect() -> Any:
+        raise ConnectionError("Redis unavailable")
+
+    publisher = CorpusEventPublisher(
+        redis_client_factory=fail_to_connect,
+        sqlite_path=obstruction / "corpus.sqlite3",
+    )
+    event = _event()
+
+    assert publisher.publish(event) == "failed"
+    assert "Could not persist stencil corpus event" in caplog.text
+    assert event["event_id"] in caplog.text
+
+
+def test_publisher_requires_valid_canonical_event_before_transport(tmp_path: Path) -> None:
+    client = _FakeRedis()
+    publisher = CorpusEventPublisher(
+        redis_client_factory=lambda: client,
+        sqlite_path=tmp_path / "spool.sqlite3",
+    )
+    malformed = _event()
+    malformed["instance"]["cell_count"] = 1
+
+    with pytest.raises(ValueError, match="canonical key"):
+        publisher.publish(malformed)
+    assert client.calls == []
+
+
+def test_spool_backups_existing_unversioned_database_before_initializing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "existing.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE legacy_data (value TEXT)")
+        connection.execute("INSERT INTO legacy_data VALUES ('keep')")
+
+    SQLiteEventSpool(path).append(serialize_event(_event()))
+
+    backups = list(tmp_path.glob("existing.sqlite3.pre-v1-*.bak"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup:
+        assert backup.execute("SELECT value FROM legacy_data").fetchone() == ("keep",)
+
+
+def test_corpus_capture_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KATAPROXY_STENCIL_CORPUS_ENABLED", raising=False)
+    assert corpus_events_enabled() is False
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "true")
+    assert corpus_events_enabled() is True
+
+
+class _CapturingPublisher:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def publish(self, event: dict[str, Any]) -> str:
+        self.events.append(event)
+        return "redis_stream"
+
+
+class _FakeBackend:
+    @property
+    def identity(self) -> SolverIdentity:
+        config = '{"mode":"event-test"}'
+        return SolverIdentity(
+            backend_name="event-test",
+            backend_version="1",
+            adapter_version="event-test-v1",
+            configuration_json=config,
+            configuration_fingerprint=hashlib.sha256(config.encode("utf-8")).hexdigest(),
+        )
+
+    def solve(self, problem: Any, budget: Any) -> SolverOutcome:
+        return SolverOutcome(
+            status=OutcomeStatus.OPTIMAL,
+            incumbent=Incumbent(
+                1, PlacementWitness((("1x2", ((0, 0), (0, 1))),)),
+            ),
+            lower_bound=ProvenLowerBound(1),
+            native_effort=NativeEffortUnavailable(
+                NoNativeEffortReason.BACKEND_DOES_NOT_EXPOSE_EFFORT,
+            ),
+            backend_status=BackendStatusReported("OPTIMAL"),
+            backend_metrics_json="{}",
+            error=NoSolverFailure(),
+        )
+
+
+def test_shared_runtime_publishes_real_attempt_with_the_selected_path() -> None:
+    family = _family()
+    key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    publisher = _CapturingPublisher()
+    execution = solve_component(
+        _FakeBackend(),
         key,
-        _budget(),
-        "foreground",
-        event_id="12345678-1234-5678-1234-567812345678",
-    )
-
-    assert event["event_type"] == "solver_attempt"
-    assert event["attempt_id"] == event["event_id"]
-    assert event["solver_identity"]["fingerprint"] == _identity().fingerprint
-    assert event["budget"]["wall_time_limit_ms"] == 250
-    assert event["budget"]["native_effort_limit"] == {
-        "disposition": "not_requested",
-        "reason": "not_requested",
-    }
-    assert event["outcome"]["status"] == "optimal"
-    assert event["outcome"]["optimality_proven"] is True
-    assert event["outcome"]["incumbent"] == {
-        "disposition": "present", "tile_count": 1,
-    }
-    assert event["outcome"]["lower_bound"] == {
-        "disposition": "reported", "value": 1,
-    }
-    assert event["outcome"]["native_effort"] == {
-        "disposition": "reported", "value": 42, "unit": "mip_nodes",
-    }
-    placements = event["outcome"]["placements"]
-    assert placements["disposition"] == "validated"
-    assert placements["codec_version"] == PLACEMENT_PAYLOAD_CODEC
-    assert event["fallback_disposition"] == "not_needed"
-    validate_event(event)
-
-
-def test_no_incumbent_attempt_is_recorded_separately_from_singleton_fallback() -> None:
-    key, _problem = _key_and_problem()
-    outcome = SolverOutcome(
-        status=OutcomeStatus.NO_INCUMBENT,
-        incumbent=NoIncumbent(NoIncumbentReason.BUDGET_EXHAUSTED),
-        lower_bound=LowerBoundUnavailable(),
-        native_effort=NativeEffortUnavailable(
-            NoNativeEffortReason.BACKEND_DID_NOT_REPORT_EFFORT,
+        family,
+        SolverBudget(
+            wall_time_limit_ms=10_000,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="bulk-10000ms",
         ),
-        backend_status=BackendStatusReported("TIME_LIMIT"),
-        backend_metrics_json="{}",
-        error=NoSolverFailure(),
+        producer_path="bulk",
+        event_publisher=publisher,
     )
-    event = make_solver_attempt_event(
-        _execution(
-            outcome,
-            placements_disposition="not_returned",
-            fallback_used=True,
-        ),
-        key,
-        _budget(),
-        "bulk",
-    )
-    assert event["producer_path"] == "bulk"
-    assert event["outcome"]["status"] == "no_incumbent"
-    assert event["outcome"]["error"] == {"disposition": "none"}
-    assert event["outcome"]["placements"] == {"disposition": "not_returned"}
-    assert event["fallback_disposition"] == "singleton_fallback_used"
-    validate_event(event)
+
+    assert execution.started_at_utc.endswith("Z")
+    assert execution.reported_outcome.status is OutcomeStatus.OPTIMAL
+    assert execution.placements_disposition == "validated"
+    assert len(publisher.events) == 1
+    assert publisher.events[0]["event_type"] == "solver_attempt"
+    assert publisher.events[0]["producer_path"] == "bulk"
+    assert publisher.events[0]["elapsed_wall_ns"] == execution.elapsed_wall_ns
 
 
-def test_invalid_witness_records_rejection_and_preserves_raw_incumbent_objective() -> None:
-    key, _problem = _key_and_problem()
-    raw = _optimal_outcome()
-    normalized = SolverOutcome(
-        status=OutcomeStatus.ERROR,
-        incumbent=NoIncumbent(NoIncumbentReason.INVOCATION_FAILED),
-        lower_bound=raw.lower_bound,
-        native_effort=raw.native_effort,
-        backend_status=raw.backend_status,
-        backend_metrics_json=raw.backend_metrics_json,
-        error=SolverFailure(
-            "InvalidPlacementWitness",
-            "overlapping placement",
-            '{"validation_failure":true}',
-        ),
-    )
-    event = make_solver_attempt_event(
-        _execution(
-            raw,
-            normalized=normalized,
-            placements_disposition="rejected_invalid",
-            fallback_used=True,
-        ),
-        key,
-        _budget(),
-        "foreground",
-    )
-    assert event["outcome"]["status"] == "error"
-    assert event["outcome"]["incumbent"] == {
-        "disposition": "present", "tile_count": 1,
-    }
-    assert event["outcome"]["placements"] == {"disposition": "rejected_invalid"}
-    assert event["outcome"]["error"]["disposition"] == "present"
-    validate_event(event)
+
+def test_foreground_sighting_is_emitted_before_the_result_cache_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    family = _family()
+    encoded = stencil._encode_cached_placements([("1x2", (0, 1))], family)
+    events: list[str] = []
+
+    def record_sighting(
+        shape_key: bytes, seen_family: Any, producer_path: str,
+    ) -> None:
+        assert shape_key
+        assert tuple(seen_family) == family
+        assert producer_path == "foreground"
+        events.append("sighting")
+
+    def cache_hit(
+        shape_key: bytes, time_limit_ms: int, cached_family: Any, backend: Any,
+    ) -> tuple[bool, int, bytes]:
+        assert time_limit_ms == 250
+        assert tuple(cached_family) == family
+        events.append("cache")
+        return True, 0, encoded
+
+    monkeypatch.setattr(stencil, "publish_instance_seen", record_sighting)
+    monkeypatch.setattr(stencil, "_solve_component_cached", cache_hit)
+    result = stencil._solve_region([0, 1], 2, 1, family)
+
+    assert result["optimal"] is True
+    assert events == ["sighting", "cache"]
 
 
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    [
-        (lambda event: event.update(event_id="NOT-A-UUID"), "canonical lowercase UUID"),
-        (lambda event: event["instance"].update(cell_count=1), "disagree with canonical key"),
-        (lambda event: event.update(attempt_id="different"), "attempt_id must equal event_id"),
-        (lambda event: event["outcome"].update(optimality_proven=False), "disagrees with status"),
-        (lambda event: event["outcome"]["lower_bound"].update(value=2),
-         "matching proven bound"),
-        (lambda event: event["outcome"]["native_effort"].update(value=float("nan")),
-         "finite"),
-    ],
-)
-def test_validator_rejects_inconsistent_event_envelopes(mutate: Any, message: str) -> None:
-    key, _problem = _key_and_problem()
-    event = make_solver_attempt_event(
-        _execution(_optimal_outcome()),
-        key,
-        _budget(),
-        "foreground",
-        event_id="12345678-1234-5678-1234-567812345678",
-    )
-    invalid = copy.deepcopy(event)
-    mutate(invalid)
-    with pytest.raises(CorpusEventError, match=message):
-        validate_event(invalid)
+def test_event_parser_rejects_noncanonical_json_whitespace() -> None:
+    event = _event()
+    payload = serialize_event(event).decode("utf-8")
+    with pytest.raises(ValueError, match="canonical compact JSON"):
+        parse_event(" " + payload)
 
 
-def test_event_parser_rejects_non_json_and_noncanonical_instance_keys() -> None:
-    with pytest.raises(CorpusEventError, match="valid UTF-8 JSON"):
-        parse_event(b"not json")
+def test_instance_sighting_builder_rejects_a_mismatched_canonical_key() -> None:
+    family = _family()
+    key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    problem = canonical_problem_from_key(key, family)
+    other_key, _other_frame = stencil._component_shape_key((0,), 2, family)
 
-    key, problem = _key_and_problem()
-    event = make_instance_seen_event(problem, key)
-    event["instance"]["canonical_key_b64"] = base64.b64encode(b"bad").decode("ascii")
-    with pytest.raises(CorpusEventError, match="valid component key"):
-        serialize_event(event)
-
-
-def test_serializer_rejects_nan_in_backend_metrics() -> None:
-    key, _problem = _key_and_problem()
-    outcome = SolverOutcome(
-        status=OutcomeStatus.OPTIMAL,
-        incumbent=Incumbent(1, PlacementWitness((("1x2", ((0, 0), (0, 1))),))),
-        lower_bound=ProvenLowerBound(1),
-        native_effort=NativeEffortUnavailable(
-            NoNativeEffortReason.BACKEND_DOES_NOT_EXPOSE_EFFORT,
-        ),
-        backend_status=BackendStatusReported("OPTIMAL"),
-        backend_metrics_json='{"unsafe":NaN}',
-        error=NoSolverFailure(),
-    )
-    execution = _execution(outcome)
-    with pytest.raises(ValueError):
-        make_solver_attempt_event(execution, key, _budget(), "foreground")
+    with pytest.raises(ValueError, match="does not identify"):
+        make_instance_seen_event(problem, other_key)

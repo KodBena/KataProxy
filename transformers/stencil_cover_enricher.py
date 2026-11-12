@@ -53,6 +53,7 @@ from transformers.stencil_solver_geometry import (
     verify_component_placements as _verify_component_placements,
 )
 from transformers.stencil_solver_runtime import solve_component as _solve_with_backend
+from transformers.stencil_corpus_publisher import publish_instance_seen
 
 logger = logging.getLogger("kataproxy.stencil_cover_enricher")
 
@@ -860,6 +861,9 @@ def _solve_region(
     statuses: List[int] = []
     for component in _connected_components(region, width, height):
         shape_key, frame = _component_shape_key(component, width, family)
+        # A component sighting is recorded before either the local LRU or
+        # shared Redis result cache can return early. A hit is not an attempt.
+        publish_instance_seen(shape_key, family_key, "foreground")
         optimal, status, encoded = _solve_component_cached(
             shape_key, time_limit_ms, family_key, solver_backend,
         )

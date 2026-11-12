@@ -21,6 +21,7 @@ from transformers.stencil_cache_storage import (
     RedisStencilStore,
     create_redis_client,
 )
+from transformers.stencil_corpus_publisher import publish_instance_seen
 from transformers.stencil_cover_enricher import (
     ComponentFrame,
     STENCIL_FAMILY,
@@ -133,6 +134,9 @@ class StencilBulkSolver:
             return "optimal"
 
         attempted_at = self.clock()
+        # Bulk discovery is also a sighting, regardless of whether the result
+        # is improved; an attempt event is emitted by the shared runtime below.
+        publish_instance_seen(shape_key, self.family, "bulk")
         execution = solve_component(
             self.solver_backend,
             shape_key,
