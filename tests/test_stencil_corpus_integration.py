@@ -449,7 +449,6 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
     redis_client: redis.Redis,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     redis_client.delete(CORPUS_STREAM_KEY)
     database = tmp_path / "production-startup.sqlite3"
@@ -474,6 +473,18 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
 
     monkeypatch.setattr(
         proxy_server, "StencilCorpusMaterializerSupervisor", _TrackingSupervisor,
+    )
+    supervisor_errors: list[str] = []
+    original_error = stencil_corpus_supervisor.logger.error
+
+    def record_supervisor_error(
+        message: str, *args: Any, **kwargs: Any,
+    ) -> None:
+        supervisor_errors.append(message)
+        original_error(message, *args, **kwargs)
+
+    monkeypatch.setattr(
+        stencil_corpus_supervisor.logger, "error", record_supervisor_error,
     )
 
     task, websocket = await _start_ordinary_service(monkeypatch)
@@ -569,7 +580,8 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         assert supervisor.is_running
         assert supervisor.worker_pid is not None
         assert supervisor.restart_count >= 1
-        assert "exited unexpectedly" in caplog.text
+        assert any("exited unexpectedly" in message for message in supervisor_errors)
+        assert supervisor.last_exit_code == 0
 
         # Stop the worker independently, publish while stopped, and restart it.
         await supervisor.stop()
