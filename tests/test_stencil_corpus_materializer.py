@@ -415,3 +415,20 @@ def test_concurrent_event_producers_and_materializer_do_not_duplicate_attempts(
         ).fetchall()
         assert len(attempt_ids) == 40
         assert len({row[0] for row in attempt_ids}) == 40
+
+
+def test_malformed_stream_event_is_not_acknowledged(tmp_path: Path) -> None:
+    store = SQLiteCorpusStore(tmp_path / "corpus.sqlite3")
+    redis = _FakeRedis(store)
+    redis.new_messages = [_message("9-0", b'{"not":"a corpus event"}')]
+    materializer = StencilCorpusMaterializer(
+        store, redis, consumer_name="malformed-stream",
+    )
+
+    counts = materializer.run_once(block_ms=0)
+
+    assert counts["errors"] == 1
+    assert counts["acked"] == 0
+    assert redis.acks == []
+    assert redis.has_backlog()
+    assert store.counts()["receipts"] == 0

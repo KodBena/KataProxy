@@ -39,6 +39,7 @@ from transformers.stencil_corpus_publisher import (
     SQLiteEventSpool,
     publish_instance_seen,
 )
+from transformers.stencil_solver_api import STENCIL_CANONICALIZATION_VERSION
 from transformers.stencil_solver_runtime import canonical_problem_from_key
 
 
@@ -93,10 +94,11 @@ def _load_workload(database: str | None) -> tuple[tuple[bytes, ...], str]:
             SELECT canonical_key
             FROM instances
             WHERE family_fingerprint = ?
+              AND canonicalization_version = ?
             ORDER BY sighting_count DESC, last_seen_at_utc DESC
             LIMIT 10000
             """,
-            (family_fingerprint,),
+            (family_fingerprint, STENCIL_CANONICALIZATION_VERSION),
         ).fetchall()
     keys = tuple(bytes(row[0]) for row in rows)
     if not keys:
