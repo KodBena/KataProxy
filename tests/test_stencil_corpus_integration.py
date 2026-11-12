@@ -493,12 +493,11 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         store = SQLiteCorpusStore(database)
         foreground_counts = store.counts()
         assert foreground_counts["instances"] >= 1
-        assert foreground_counts["attempts"] >= 1
         assert foreground_counts["spool_pending"] == 0
 
-        # Exercise the real shared solver-runtime bulk path. Buffer the bulk
-        # sighting before its actual attempt in a single Redis transaction so
-        # instance-before-attempt ordering is deterministic.
+        # Exercise the real shared solver-runtime foreground and bulk paths.
+        # Pair each actual attempt with a sighting in one Redis transaction so
+        # the materializer observes the required instance-before-attempt order.
         family = stencil.STENCIL_FAMILY
         shape_key, _frame = stencil._component_shape_key((0, 1), 2, family)
         problem = canonical_problem_from_key(shape_key, family)
@@ -511,33 +510,38 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
                 self.events.append(event)
                 return "captured"
 
-        collecting_sink = _CollectingSink()
-        budget = SolverBudget(
-            wall_time_limit_ms=10_000,
-            native_effort_limit=NoNativeEffortLimit(),
-            policy_id="bulk-10000ms-integration",
-        )
-        execution = solve_component(
-            create_solver_backend("highs"),
-            shape_key,
-            family,
-            budget,
-            producer_path="bulk",
-            event_publisher=collecting_sink,
-        )
-        assert execution.attempt_id
-        assert len(collecting_sink.events) == 1
-        bulk_sighting = make_instance_seen_event(
-            problem, shape_key, producer_path="bulk",
-        )
-        bulk_publisher = CorpusEventPublisher(
+        corpus_database_publisher = CorpusEventPublisher(
             redis_client=redis_client, sqlite_path=database,
         )
-        supervisor.clear_materialization_event()
-        assert bulk_publisher.publish_many(
-            (bulk_sighting, *collecting_sink.events),
-        ) == "redis_stream"
-        assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+        for producer_path in ("foreground", "bulk"):
+            collecting_sink = _CollectingSink()
+            budget = SolverBudget(
+                wall_time_limit_ms=10_000,
+                native_effort_limit=NoNativeEffortLimit(),
+                policy_id=f"{producer_path}-10000ms-integration",
+            )
+            execution = solve_component(
+                create_solver_backend("highs"),
+                shape_key,
+                family,
+                budget,
+                producer_path=producer_path,
+                event_publisher=collecting_sink,
+            )
+            assert execution.attempt_id
+            assert len(collecting_sink.events) == 1
+            sighting = make_instance_seen_event(
+                problem, shape_key, producer_path=producer_path,
+            )
+            supervisor.clear_materialization_event()
+            assert corpus_database_publisher.publish_many(
+                (sighting, *collecting_sink.events),
+            ) == "redis_stream"
+            assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+
+        foreground_counts = store.counts()
+        assert foreground_counts["attempts"] >= 2
+        assert foreground_counts["spool_pending"] == 0
 
         with sqlite3.connect(database) as connection:
             sighting_paths = {
@@ -556,6 +560,7 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         assert {str(row[0]) for row in attempts} >= {"foreground", "bulk"}
         assert all(str(row[1]).endswith("Z") and int(row[2]) >= 0 for row in attempts)
         assert identities is not None and int(identities[0]) >= 1
+        assert corpus_database_publisher is not None
 
         # Unexpected child exit is logged and followed by a fresh worker.
         old_pid = supervisor.worker_pid
@@ -577,7 +582,7 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
             problem, shape_key, producer_path="bulk",
             event_id=str(uuid.uuid4()),
         )
-        assert bulk_publisher.publish(restart_event) == "redis_stream"
+        assert corpus_database_publisher.publish(restart_event) == "redis_stream"
         assert store.counts()["receipts"] == before_restart
 
         supervisor.clear_materialization_event()
