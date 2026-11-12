@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -52,12 +56,14 @@ def _key() -> bytes:
     return value
 
 
-def _seen_event() -> dict[str, Any]:
+def _seen_event(
+    event_id: str = "12345678-1234-5678-1234-567812345678",
+) -> dict[str, Any]:
     problem = canonical_problem_from_key(_key(), _family())
     return make_instance_seen_event(
         problem,
         _key(),
-        event_id="12345678-1234-5678-1234-567812345678",
+        event_id=event_id,
     )
 
 
@@ -94,7 +100,9 @@ class _Backend:
         )
 
 
-def _attempt_event() -> dict[str, Any]:
+def _attempt_event(
+    event_id: str = "22345678-1234-5678-1234-567812345678",
+) -> dict[str, Any]:
     budget = SolverBudget(
         wall_time_limit_ms=250,
         native_effort_limit=NoNativeEffortLimit(),
@@ -109,7 +117,7 @@ def _attempt_event() -> dict[str, Any]:
         _key(),
         budget,
         "foreground",
-        event_id="22345678-1234-5678-1234-567812345678",
+        event_id=event_id,
     )
 
 
@@ -123,26 +131,46 @@ class _FakeRedis:
         self.new_messages: list[tuple[bytes, dict[bytes, bytes]]] = []
         self.pending_messages: list[tuple[bytes, dict[bytes, bytes]]] = []
         self.raise_on_ack = False
+        self._lock = threading.Lock()
+        self._next_stream_id = 0
+
+    def xadd(self, name: str, fields: dict[bytes, bytes]) -> str:
+        assert name == CORPUS_STREAM_KEY
+        with self._lock:
+            self._next_stream_id += 1
+            message_id = f"{self._next_stream_id}-0"
+            self.new_messages.append(_message(message_id, fields[b"event"]))
+            return message_id
+
+    def has_backlog(self) -> bool:
+        with self._lock:
+            return bool(self.new_messages or self.pending_messages)
 
     def xgroup_create(self, *args: Any, **kwargs: Any) -> str:
-        self.groups.append((args, kwargs))
+        with self._lock:
+            self.groups.append((args, kwargs))
         return "OK"
 
     def xautoclaim(self, *args: Any, **kwargs: Any) -> tuple[str, list[Any], list[Any]]:
-        self.claims.append((args, kwargs))
-        messages = self.pending_messages
-        self.pending_messages = []
+        with self._lock:
+            self.claims.append((args, kwargs))
+            messages = self.pending_messages
+            self.pending_messages = []
         return "0-0", messages, []
 
     def xreadgroup(self, *args: Any, **kwargs: Any) -> list[Any]:
-        self.reads.append((args, kwargs))
-        messages = self.new_messages
-        self.new_messages = []
+        with self._lock:
+            self.reads.append((args, kwargs))
+            messages = self.new_messages
+            self.new_messages = []
+            self.pending_messages.extend(messages)
         return [(CORPUS_STREAM_KEY.encode("utf-8"), messages)] if messages else []
 
     def xack(self, name: str, groupname: str, *ids: str) -> int:
         assert name == CORPUS_STREAM_KEY
         assert groupname == CORPUS_CONSUMER_GROUP
+        if self.raise_on_ack:
+            raise ConnectionError("simulated process failure immediately before XACK")
         for event_id in ids:
             with sqlite3.connect(self.store.path) as connection:
                 found = connection.execute(
@@ -151,9 +179,12 @@ class _FakeRedis:
                 ).fetchone()
             if found is None:
                 raise AssertionError("XACK happened before the SQLite receipt committed")
-            self.acks.append(event_id)
-        if self.raise_on_ack:
-            raise ConnectionError("simulated XACK response loss")
+            with self._lock:
+                self.acks.append(event_id)
+                self.pending_messages = [
+                    message for message in self.pending_messages
+                    if message[0].decode("ascii") != event_id
+                ]
         return len(ids)
 
 
@@ -220,7 +251,7 @@ def test_stream_attempt_without_sighting_is_left_pending(tmp_path: Path) -> None
     assert store.counts()["receipts"] == 0
 
 
-def test_lost_xack_response_is_safe_to_replay_after_sqlite_commit(tmp_path: Path) -> None:
+def test_crash_after_sqlite_commit_before_xack_replays_idempotently(tmp_path: Path) -> None:
     store = SQLiteCorpusStore(tmp_path / "corpus.sqlite3")
     redis = _FakeRedis(store)
     payload = serialize_event(_seen_event())
@@ -231,11 +262,12 @@ def test_lost_xack_response_is_safe_to_replay_after_sqlite_commit(tmp_path: Path
     first = materializer.run_once()
     assert first["stream_ingested"] == 0
     assert first["errors"] == 1
+    assert redis.acks == []
+    assert redis.has_backlog()
     assert store.counts()["instances"] == 1
     assert store.counts()["receipts"] == 1
 
     redis.raise_on_ack = False
-    redis.pending_messages = [_message("1-0", payload)]
     second = materializer.run_once()
     assert second["duplicates"] == 1
     assert second["acked"] == 1
@@ -296,3 +328,89 @@ def test_materializer_rejects_invalid_batch_configuration(tmp_path: Path) -> Non
         StencilCorpusMaterializer(store, batch_size=0)
     with pytest.raises(ValueError, match="claim_idle_ms"):
         StencilCorpusMaterializer(store, claim_idle_ms=0)
+
+
+def test_stream_backlog_accumulates_without_materializer_then_drains(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteCorpusStore(tmp_path / "corpus.sqlite3")
+    redis = _FakeRedis(store)
+    publisher = CorpusEventPublisher(redis_client=redis, sqlite_path=tmp_path / "spool.sqlite3")
+
+    # There is deliberately no materializer running between publication and
+    # the assertions below: the stream retains both immutable events.
+    assert publisher.publish(_seen_event()) == "redis_stream"
+    assert publisher.publish(_attempt_event()) == "redis_stream"
+    assert store.counts()["receipts"] == 0
+    assert len(redis.new_messages) == 2
+
+    materializer = StencilCorpusMaterializer(store, redis, consumer_name="backlog-drain")
+    counts = materializer.run_once(block_ms=0)
+
+    assert counts["stream_ingested"] == 2
+    assert counts["acked"] == 2
+    assert redis.acks == ["1-0", "2-0"]
+    assert store.counts() == {
+        "instances": 1,
+        "attempts": 1,
+        "receipts": 2,
+        "spool_pending": 0,
+    }
+
+
+def test_concurrent_event_producers_and_materializer_do_not_duplicate_attempts(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteCorpusStore(tmp_path / "corpus.sqlite3")
+    redis = _FakeRedis(store)
+    publisher = CorpusEventPublisher(redis_client=redis, sqlite_path=tmp_path / "spool.sqlite3")
+
+    # Publish the sighting before concurrent attempts so the test exercises
+    # producer/consumer races rather than the intentional FK deferral path.
+    assert publisher.publish(_seen_event()) == "redis_stream"
+    materializer = StencilCorpusMaterializer(
+        store, redis, consumer_name="concurrent-materializer", batch_size=64,
+    )
+    producers_done = threading.Event()
+    consumer_errors: list[BaseException] = []
+
+    def consume_until_drained() -> None:
+        try:
+            while not producers_done.is_set() or redis.has_backlog():
+                counts = materializer.run_once(block_ms=0)
+                if not any(counts.values()):
+                    time.sleep(0.001)
+        except BaseException as exc:
+            consumer_errors.append(exc)
+            producers_done.set()
+
+    def produce_attempts(producer_index: int) -> None:
+        for _ in range(10):
+            event_id = str(uuid.uuid4())
+            assert publisher.publish(_attempt_event(event_id)) == "redis_stream"
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        consumer = executor.submit(consume_until_drained)
+        producers = [
+            executor.submit(produce_attempts, index)
+            for index in range(4)
+        ]
+        for future in producers:
+            future.result(timeout=10)
+        producers_done.set()
+        consumer.result(timeout=10)
+
+    assert consumer_errors == []
+    assert not redis.has_backlog()
+    assert store.counts() == {
+        "instances": 1,
+        "attempts": 40,
+        "receipts": 41,
+        "spool_pending": 0,
+    }
+    with sqlite3.connect(store.path) as connection:
+        attempt_ids = connection.execute(
+            "SELECT attempt_id FROM solver_attempts",
+        ).fetchall()
+        assert len(attempt_ids) == 40
+        assert len({row[0] for row in attempt_ids}) == 40
