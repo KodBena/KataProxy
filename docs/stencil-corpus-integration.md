@@ -117,15 +117,115 @@ STENCIL_BENCHMARK_ITERATIONS and STENCIL_BENCHMARK_WARMUP to tune local run
 cost; CI uses 500 iterations and 50 warm-ups and uploads all reports/logs as a
 workflow artifact.
 
-## Runtime lifecycle finding
+## Production startup and supervision
 
-The repository exposes the proxy command and the separate
-kataproxy-stencil-corpus-materializer command, but has no production supervisor
-or deployment unit that owns both process lifecycles. This test harness starts
-and stops the materializer independently only to exercise backlog/recovery; it
-does not add a new production supervisor. Normal deployments must continue to
-supervise the proxy and materializer as separate processes if they want corpus
-events continuously materialized.
+Stencil corpus capture is enabled by default. The ordinary service commands
+start it without a second manual process:
+
+    python proxy_server.py
+    # or, for the standard leaf launch:
+    ./run_leaf.sh
+
+The installed console command `kataproxy` uses the same `proxy_server:main`
+entry point. Set `KATAPROXY_STENCIL_CORPUS_ENABLED=false` (also accepts
+`0`, `no`, or `off`) to disable both capture and automatic materializer
+startup. An unset variable means enabled.
+
+During startup the proxy launches the existing
+`transformers.stencil_corpus_materializer` CLI as a supervised child process.
+The supervisor waits for SQLite initialization before declaring startup ready.
+It monitors the child, reports an unexpected exit, and restarts it with
+exponential backoff from 1 second up to 30 seconds. The child uses a bounded
+Redis blocking read (250 ms) and handles SIGTERM by completing its current
+materialization pass and then exiting. On service shutdown the proxy gives the
+worker up to 5 seconds to stop gracefully, then force-terminates it and emits
+an operational error. Shutdown is bounded; it does not wait indefinitely for
+the corpus to become empty.
+
+The materializer CLI remains independently executable for controlled recovery
+and testing:
+
+    kataproxy-stencil-corpus-materializer
+    python -m transformers.stencil_corpus_materializer --once
+    python -m transformers.stencil_corpus_materializer --spool-only --once
+
+Do not start another long-running materializer unless intentionally operating
+an additional consumer in the same Redis consumer group. The normal service
+already owns one supervised worker.
+
+## Database location and operations
+
+The raw SQLite fallback spool and normalized corpus share one database file.
+Unless overridden, its resolved path is:
+
+- `$XDG_STATE_HOME/kataproxy/stencil-cover-corpus.sqlite3` when
+  `XDG_STATE_HOME` is set.
+- `~/.local/state/kataproxy/stencil-cover-corpus.sqlite3` otherwise.
+
+Override the path with `KATAPROXY_STENCIL_CORPUS_DB=/path/to/corpus.sqlite3`.
+A leading `~` is expanded. Relative overrides are relative to the service
+working directory. The same path is used by the publisher's durable spool and
+the materializer's normalized store.
+
+Stop the proxy before making a filesystem-level backup so SQLite has closed
+its WAL. Alternatively, use SQLite's online backup command while the service
+is running:
+
+    sqlite3 ~/.local/state/kataproxy/stencil-cover-corpus.sqlite3 \
+      ".backup 'stencil-cover-corpus.backup.sqlite3'"
+
+Inspect basic integrity and row counts with:
+
+    sqlite3 ~/.local/state/kataproxy/stencil-cover-corpus.sqlite3 \
+      "PRAGMA integrity_check;"
+    sqlite3 ~/.local/state/kataproxy/stencil-cover-corpus.sqlite3 \
+      "SELECT COUNT(*) FROM instances;"
+    sqlite3 ~/.local/state/kataproxy/stencil-cover-corpus.sqlite3 \
+      "SELECT COUNT(*) FROM solver_attempts;"
+
+Export solver attempts for analysis using the SQLite CLI:
+
+    sqlite3 -header -csv ~/.local/state/kataproxy/stencil-cover-corpus.sqlite3 \
+      "SELECT a.source_path, i.backend_name, i.backend_version, \
+              a.started_at_utc, a.elapsed_wall_ns, a.outcome_status, \
+              a.budget_json, a.backend_metrics_json \
+         FROM solver_attempts AS a \
+         JOIN solver_identities AS i USING (solver_identity_id);" \
+      > solver-attempts.csv
+
+The database contains canonical component sightings and actual solver attempts
+that pass through the shared solver runtime. Attempt records include solver
+backend/adapter identity and configuration provenance, budget, start time,
+elapsed wall-clock nanoseconds, outcome, and reported backend metrics. Sightings
+retain whether they came from the foreground or bulk producer path. These are
+component-level records for solver analysis and tuning.
+
+This is deliberately **not** a general KataGo traffic archive. It does not
+collect full KataGo requests or responses, games, SGFs, or ownership maps.
+
+## Outage and recovery behavior
+
+Redis Streams remain the primary event transport. If Redis publication fails,
+the publisher writes the exact same immutable event bytes to the SQLite spool.
+When Redis recovers, the supervised materializer reconnects and drains the
+spool, then recovers abandoned Redis pending entries with XAUTOCLAIM. If the
+materializer exits unexpectedly, the proxy logs the exit and restarts it. The
+existing commit-before-XACK and idempotent receipt behavior makes replay after
+a crash safe.
+
+If both Redis publication and SQLite spool persistence fail, the publisher
+emits a CRITICAL log containing the affected event IDs and both underlying
+errors. That event was not durably captured; the solver result or analysis
+response continues independently, and operators must treat the log as a data
+capture gap.
+
+To disable collection, set `KATAPROXY_STENCIL_CORPUS_ENABLED=false` before
+starting the proxy. This does not delete an existing corpus. To recover after a
+Redis outage, restore Redis availability and let the service's supervised
+worker reconnect; no schema reset or stream flush is required. To recover a
+local spool manually, use `kataproxy-stencil-corpus-materializer --spool-only
+--once`. For a full stream and pending-entry recovery pass, use
+`kataproxy-stencil-corpus-materializer --once` with Redis available.
 
 Redis and SQLite remain complementary required system components. Redis is
 the shared event stream and solver-cache store; SQLite is the normalized corpus
