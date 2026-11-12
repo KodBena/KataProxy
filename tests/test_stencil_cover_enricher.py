@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -983,7 +984,8 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     wrapped = storage.redis_persistent_cache("approximation-test")(solve)
     shape_key = b"canonical-hard-shape"
 
-    assert wrapped(_cache_request(shape_key, family)) == approximation
+    request = _cache_request(shape_key, family)
+    assert wrapped(request) == approximation
     # The approximate cover is a useful cached answer, even under a later
     # request with a different budget; it is not thrown away.
     assert wrapped(
@@ -994,7 +996,7 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     store = storage.RedisStencilStore(backend, "approximation-test")
     assert store.get_result(shape_key, family) == approximation
     assert store.hard_components(family) == frozenset({shape_key})
-    assert store.pending_components(family) == frozenset({shape_key})
+    assert store.pending_components(family, request.work_profile) == frozenset({shape_key})
 
     # Only the canonical problem key and the current best result are stored;
     # there is no serialized HiGHS model, basis, or checkpoint state.
