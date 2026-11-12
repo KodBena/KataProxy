@@ -15,7 +15,7 @@ There is one required solver path and one optional improvement path:
    LRU; on an LRU miss it consults Redis, and only solves when Redis has no
    result.
 2. **Background improvement path (optional).** A separately managed process
-   reads the Redis pending set and attempts each component with a 10,000 ms
+   reads the pending set for its selected solver work profile and attempts each component with a 10,000 ms
    wall-clock budget through the same configured solver backend. It validates the cover and atomically upgrades the stored
    result when it has found a better one. Not running this process does not
    disable stencil-cover annotations; it only means that foreground incumbents
