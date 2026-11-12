@@ -42,6 +42,9 @@ from transformers.stencil_cache_storage import (
 from transformers.stencil_solver_api import (
     NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
 )
+from transformers.stencil_cache_storage import (
+    SolverWorkProfile, make_solver_work_profile,
+)
 from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_solver_geometry import (
     MAX_COMPONENT_DIMENSION as _MAX_BOARD_SIZE,
@@ -669,19 +672,24 @@ def _solve_component_uncached(
     time_limit_ms: int,
     family: Tuple[Stencil, ...],
     backend: SolverBackend,
+    work_profile: SolverWorkProfile | None = None,
 ) -> SolverCacheCandidate:
     """Invoke the selected backend and retain its provenance for Redis."""
     if isinstance(time_limit_ms, bool) or time_limit_ms <= 0:
         raise ValueError("solver time limit must be a positive number of milliseconds")
+    budget = SolverBudget(
+        wall_time_limit_ms=int(time_limit_ms),
+        native_effort_limit=NoNativeEffortLimit(),
+        policy_id=f"foreground-{int(time_limit_ms)}ms",
+    )
+    expected_profile = make_solver_work_profile(backend.identity, budget)
+    if work_profile is not None and work_profile != expected_profile:
+        raise ValueError("foreground work profile disagrees with backend or solver budget")
     execution = _solve_with_backend(
         backend,
         shape_key,
         family,
-        SolverBudget(
-            wall_time_limit_ms=int(time_limit_ms),
-            native_effort_limit=NoNativeEffortLimit(),
-            policy_id=f"foreground-{int(time_limit_ms)}ms",
-        ),
+        budget,
     )
     # The shared runtime converts adapter exceptions to a typed error outcome.
     if execution.outcome.status is OutcomeStatus.ERROR:
@@ -736,7 +744,13 @@ class _InvalidatableSolverCache:
         backend: SolverBackend | None = None,
     ) -> Tuple[bool, int, bytes]:
         backend = DEFAULT_SOLVER_BACKEND if backend is None else backend
-        cache_key = (shape_key, time_limit_ms, family, backend.identity.fingerprint)
+        budget = SolverBudget(
+            wall_time_limit_ms=int(time_limit_ms),
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id=f"foreground-{int(time_limit_ms)}ms",
+        )
+        work_profile = make_solver_work_profile(backend.identity, budget)
+        cache_key = (shape_key, time_limit_ms, family, work_profile.fingerprint)
         while True:
             with self._lock:
                 cached = self._cache.get(cache_key)
@@ -752,7 +766,9 @@ class _InvalidatableSolverCache:
                 self._inflight[shape_key] = self._inflight.get(shape_key, 0) + 1
 
             try:
-                result = self._function(shape_key, time_limit_ms, family, backend)
+                result = self._function(
+                    shape_key, time_limit_ms, family, backend, work_profile,
+                )
             except Exception:
                 with self._lock:
                     self._leave_inflight(shape_key)

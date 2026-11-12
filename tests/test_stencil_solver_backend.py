@@ -25,6 +25,7 @@ from transformers.stencil_solver_api import (
     SolverOutcome,
 )
 from transformers.stencil_solver_runtime import solve_component
+from transformers.stencil_cache_storage import SolverWorkProfile
 from transformers.stencil_cache_storage import make_solver_work_profile
 from transformers.stencil_solver_factory import (
     create_solver_backend, register_solver_backend,
@@ -147,10 +148,14 @@ class _MemoryStore:
         self.stored: list[tuple[bool, int, bytes]] = []
         self.provenance: Dict[str, Any] | None = None
 
-    def initialize_pending_queue(self, _family: Any) -> int:
+    def initialize_pending_queue(
+        self, _family: Any, _work_profile: SolverWorkProfile,
+    ) -> int:
         return 0
 
-    def timeout_metadata(self, _shape_key: bytes, _family: Any) -> None:
+    def timeout_metadata(
+        self, _shape_key: bytes, _family: Any, _work_profile: SolverWorkProfile,
+    ) -> None:
         return None
 
     def get_result(self, _shape_key: bytes, _family: Any) -> tuple[bool, int, bytes]:
@@ -159,6 +164,7 @@ class _MemoryStore:
     def put_result(
         self, _shape_key: bytes, _family: Any, result: tuple[bool, int, bytes],
         *, provenance: Dict[str, Any] | None = None,
+        work_profile: SolverWorkProfile | None = None,
     ) -> bool:
         self.result = result
         self.stored.append(result)
@@ -173,10 +179,13 @@ class _MemoryStore:
         *,
         time_limit_ms: int,
         attempted_at: float,
+        work_profile: SolverWorkProfile,
     ) -> bool:
         return True
 
-    def pending_components(self, _family: Any) -> frozenset[bytes]:
+    def pending_components(
+        self, _family: Any, _work_profile: SolverWorkProfile,
+    ) -> frozenset[bytes]:
         return frozenset()
 
 
@@ -230,6 +239,7 @@ def test_local_lru_keeps_different_backend_profiles_separate() -> None:
 
     def invoke(
         shape_key: bytes, time_limit_ms: int, fam: Any, backend: _FakeOptimalBackend,
+        work_profile: SolverWorkProfile,
     ) -> tuple[bool, int, bytes]:
         calls.append(backend.identity.fingerprint)
         return (True, 0, b"\x01\x00\x00\x02\x00\x00\x00\x01\x00")

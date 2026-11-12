@@ -183,8 +183,11 @@ class _FakeRedisClient:
     def smembers(self, key: str) -> set[bytes]:
         return self.backend.smembers(key)
 
-    def hget(self, key: str, field: bytes) -> bytes | None:
+    def hget(self, key: str, field: bytes | str) -> bytes | None:
         return self.backend.hget(key, field)
+
+    def hset(self, key: str, field: bytes | str, value: bytes | str) -> int:
+        return self.backend.hset(key, field, value)
 
     def eval(self, *args: Any) -> int:
         return self.backend.eval(*args)

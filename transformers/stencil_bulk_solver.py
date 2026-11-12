@@ -33,6 +33,7 @@ from transformers.stencil_cover_enricher import (
 from transformers.stencil_solver_api import (
     NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
 )
+from transformers.stencil_cache_storage import SolverWorkProfile, make_solver_work_profile
 from transformers.stencil_solver_factory import create_solver_backend
 from transformers.stencil_solver_runtime import solve_component
 
@@ -46,10 +47,13 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 class StencilQueueStore(Protocol):
     """Minimal shared state port needed by the sequential bulk worker."""
 
-    def initialize_pending_queue(self, family: Sequence[Stencil]) -> int: ...
+    def initialize_pending_queue(
+        self, family: Sequence[Stencil], work_profile: SolverWorkProfile,
+    ) -> int: ...
 
     def timeout_metadata(
         self, shape_key: bytes, family: Sequence[Stencil],
+        work_profile: SolverWorkProfile,
     ) -> Dict[str, Any] | None: ...
 
     def get_result(
@@ -60,15 +64,19 @@ class StencilQueueStore(Protocol):
         self, shape_key: bytes, family: Sequence[Stencil],
         result: Tuple[bool, int, bytes], *,
         provenance: Dict[str, Any] | None = None,
+        work_profile: SolverWorkProfile | None = None,
     ) -> bool: ...
 
     def mark_timed_out(
         self, shape_key: bytes, family: Sequence[Stencil],
         result: Tuple[bool, int, bytes], *,
         time_limit_ms: int, attempted_at: float,
+        work_profile: SolverWorkProfile,
     ) -> bool: ...
 
-    def pending_components(self, family: Sequence[Stencil]) -> frozenset[bytes]: ...
+    def pending_components(
+        self, family: Sequence[Stencil], work_profile: SolverWorkProfile,
+    ) -> frozenset[bytes]: ...
 
 
 def _validate_bulk_result(
@@ -116,15 +124,25 @@ class StencilBulkSolver:
     ) -> None:
         self.store = store
         self.family = family
-        self.store.initialize_pending_queue(self.family)
         self.solver_backend = create_solver_backend("highs") if solver_backend is None else solver_backend
+        self.budget = SolverBudget(
+            wall_time_limit_ms=BULK_TIME_LIMIT_MS,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id=f"bulk-{BULK_TIME_LIMIT_MS}ms",
+        )
+        self.work_profile = make_solver_work_profile(
+            self.solver_backend.identity, self.budget,
+        )
+        self.store.initialize_pending_queue(self.family, self.work_profile)
         self.clock = clock
 
     def process_component(self, shape_key: bytes) -> str:
         """Return 'optimal', 'timed_out', or 'already_retired'."""
         # Record every bulk component visit before timeout/result cache returns.
         publish_instance_seen(shape_key, self.family, "bulk")
-        if self.store.timeout_metadata(shape_key, self.family) is not None:
+        if self.store.timeout_metadata(
+            shape_key, self.family, self.work_profile,
+        ) is not None:
             return "already_retired"
 
         previous = self.store.get_result(shape_key, self.family)
@@ -141,11 +159,7 @@ class StencilBulkSolver:
             self.solver_backend,
             shape_key,
             self.family,
-            SolverBudget(
-                wall_time_limit_ms=BULK_TIME_LIMIT_MS,
-                native_effort_limit=NoNativeEffortLimit(),
-                policy_id=f"bulk-{BULK_TIME_LIMIT_MS}ms",
-            ),
+            self.budget,
             producer_path="bulk",
         )
         if execution.outcome.status is OutcomeStatus.ERROR:
@@ -158,6 +172,7 @@ class StencilBulkSolver:
         self.store.put_result(
             shape_key, self.family, result,
             provenance=execution.result_provenance,
+            work_profile=self.work_profile,
         )
         best = self.store.get_result(shape_key, self.family)
         if best is None:
@@ -175,6 +190,7 @@ class StencilBulkSolver:
             best,
             time_limit_ms=BULK_TIME_LIMIT_MS,
             attempted_at=attempted_at,
+            work_profile=self.work_profile,
         ):
             return "timed_out"
         return "optimal" if best[0] and best[1] == 0 else "already_retired"
@@ -182,7 +198,9 @@ class StencilBulkSolver:
     def run_once(self) -> Dict[str, int]:
         """Process the currently pending snapshot and return outcome counts."""
         counts = {"attempted": 0, "optimal": 0, "timed_out": 0, "skipped": 0}
-        for shape_key in sorted(self.store.pending_components(self.family)):
+        for shape_key in sorted(
+            self.store.pending_components(self.family, self.work_profile)
+        ):
             counts["attempted"] += 1
             try:
                 outcome = self.process_component(shape_key)
