@@ -248,7 +248,6 @@ def _result_fields(result: Any) -> tuple[bool, int, bytes, int]:
 
 
 @dataclass(frozen=True)
-@dataclass(frozen=True)
 class SolverCacheCandidate:
     """New solver result plus the invocation provenance that produced it."""
 
