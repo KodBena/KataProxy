@@ -45,6 +45,7 @@ from router import BackendRouter, OnComplete, OnResponse, WireDict
 from transformers import stencil_cover_enricher as stencil
 from transformers import stencil_corpus_publisher as corpus_publisher
 from transformers import stencil_corpus_supervisor
+from transformers.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
 from transformers import stencil_cache_storage
 from transformers.stencil_cache_storage import (
     RedisCacheConflict,
@@ -407,7 +408,7 @@ async def _start_ordinary_service(
     )
 
     serving = asyncio.Event()
-    original_serve = proxy_server.websockets.serve
+    original_serve = websockets.serve
 
     def observed_serve(*args: Any, **kwargs: Any) -> Any:
         context = original_serve(*args, **kwargs)
@@ -463,10 +464,8 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
     stencil._invalidate_component_cache()
     assert corpus_publisher.corpus_events_enabled() is True
 
-    supervisors: list[stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor] = []
-    base_supervisor = stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor
-
-    class _TrackingSupervisor(base_supervisor):
+    supervisors: list[StencilCorpusMaterializerSupervisor] = []
+    class _TrackingSupervisor(StencilCorpusMaterializerSupervisor):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             supervisors.append(self)
@@ -655,10 +654,8 @@ async def test_ordinary_service_explicit_opt_out_keeps_analysis_available(
     monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_DB", str(database))
     monkeypatch.setattr(corpus_publisher, "_DEFAULT_PUBLISHER", None)
 
-    supervisors: list[stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor] = []
-    base_supervisor = stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor
-
-    class _TrackingSupervisor(base_supervisor):
+    supervisors: list[StencilCorpusMaterializerSupervisor] = []
+    class _TrackingSupervisor(StencilCorpusMaterializerSupervisor):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             supervisors.append(self)
