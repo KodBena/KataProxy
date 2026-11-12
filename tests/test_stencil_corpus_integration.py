@@ -387,6 +387,247 @@ async def _capture_one_query(websocket: Any) -> dict[str, Any]:
     return response
 
 
+
+
+async def _start_ordinary_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[asyncio.Task[None], Any]:
+    """Start the real _main entry point with a deterministic synthetic router."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = int(listener.getsockname()[1])
+    listener.close()
+
+    monkeypatch.setattr(cfg, "ROLE", "ECHO")
+    monkeypatch.setattr(cfg, "HOST", "127.0.0.1")
+    monkeypatch.setattr(cfg, "PORT", port)
+    monkeypatch.setattr(
+        proxy_server, "make_router",
+        lambda **_kwargs: _OwnershipRouter(),
+    )
+
+    serving = asyncio.Event()
+    original_serve = proxy_server.websockets.serve
+
+    def observed_serve(*args: Any, **kwargs: Any) -> Any:
+        context = original_serve(*args, **kwargs)
+
+        class _ObservedServe:
+            async def __aenter__(self) -> Any:
+                result = await context.__aenter__()
+                serving.set()
+                return result
+
+            async def __aexit__(
+                self, exc_type: Any, exc_value: Any, traceback: Any,
+            ) -> Any:
+                return await context.__aexit__(exc_type, exc_value, traceback)
+
+        return _ObservedServe()
+
+    monkeypatch.setattr(proxy_server.websockets, "serve", observed_serve)
+    task = asyncio.create_task(proxy_server._main())
+    await asyncio.wait_for(serving.wait(), timeout=10.0)
+    websocket = await websockets.connect(
+        f"ws://127.0.0.1:{port}", open_timeout=5.0,
+    )
+    return task, websocket
+
+
+async def _stop_ordinary_service(
+    task: asyncio.Task[None], websocket: Any,
+) -> None:
+    try:
+        await websocket.close()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_service_startup_enables_and_supervises_continuous_capture(
+    redis_client: redis.Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis_client.delete(CORPUS_STREAM_KEY)
+    database = tmp_path / "production-startup.sqlite3"
+    monkeypatch.delenv("KATAPROXY_STENCIL_CORPUS_ENABLED", raising=False)
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_DB", str(database))
+    monkeypatch.setattr(corpus_publisher, "_DEFAULT_PUBLISHER", None)
+    monkeypatch.setitem(
+        stencil_cache_storage._PERSISTENT_CLIENTS,
+        "solver-component-d4-v4",
+        redis_client,
+    )
+    stencil._invalidate_component_cache()
+    assert corpus_publisher.corpus_events_enabled() is True
+
+    supervisors: list[stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor] = []
+    base_supervisor = stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor
+
+    class _TrackingSupervisor(base_supervisor):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            supervisors.append(self)
+
+    monkeypatch.setattr(
+        stencil_corpus_supervisor,
+        "StencilCorpusMaterializerSupervisor",
+        _TrackingSupervisor,
+    )
+
+    task, websocket = await _start_ordinary_service(monkeypatch)
+    try:
+        assert len(supervisors) == 1
+        supervisor = supervisors[0]
+        assert supervisor.is_running
+        assert supervisor.worker_pid is not None
+        assert database.exists()
+
+        response = await _capture_one_query(websocket)
+        assert "stencilCover" in response
+        assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+
+        store = SQLiteCorpusStore(database)
+        foreground_counts = store.counts()
+        assert foreground_counts["instances"] >= 1
+        assert foreground_counts["attempts"] >= 1
+        assert foreground_counts["spool_pending"] == 0
+
+        # Exercise the real shared solver-runtime bulk path. Buffer the bulk
+        # sighting before its actual attempt in a single Redis transaction so
+        # instance-before-attempt ordering is deterministic.
+        family = stencil.STENCIL_FAMILY
+        shape_key, _frame = stencil._component_shape_key((0, 1), 2, family)
+        problem = canonical_problem_from_key(shape_key, family)
+
+        class _CollectingSink:
+            def __init__(self) -> None:
+                self.events: list[dict[str, Any]] = []
+
+            def publish(self, event: dict[str, Any]) -> str:
+                self.events.append(event)
+                return "captured"
+
+        collecting_sink = _CollectingSink()
+        budget = SolverBudget(
+            wall_time_limit_ms=10_000,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id="bulk-10000ms-integration",
+        )
+        execution = solve_component(
+            create_solver_backend("highs"),
+            shape_key,
+            family,
+            budget,
+            producer_path="bulk",
+            event_publisher=collecting_sink,
+        )
+        assert execution.attempt_id
+        assert len(collecting_sink.events) == 1
+        bulk_sighting = make_instance_seen_event(
+            problem, shape_key, producer_path="bulk",
+        )
+        bulk_publisher = CorpusEventPublisher(
+            redis_client=redis_client, sqlite_path=database,
+        )
+        supervisor.clear_materialization_event()
+        assert bulk_publisher.publish_many(
+            (bulk_sighting, *collecting_sink.events),
+        ) == "redis_stream"
+        assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+
+        with sqlite3.connect(database) as connection:
+            sighting_paths = {
+                str(row[0]) for row in connection.execute(
+                    "SELECT DISTINCT producer_path FROM instance_sighting_paths"
+                ).fetchall()
+            }
+            attempts = connection.execute(
+                "SELECT source_path, started_at_utc, elapsed_wall_ns "
+                "FROM solver_attempts ORDER BY started_at_utc"
+            ).fetchall()
+            identities = connection.execute(
+                "SELECT COUNT(*) FROM solver_identities"
+            ).fetchone()
+        assert {"foreground", "bulk"} <= sighting_paths
+        assert {str(row[0]) for row in attempts} >= {"foreground", "bulk"}
+        assert all(str(row[1]).endswith("Z") and int(row[2]) >= 0 for row in attempts)
+        assert identities is not None and int(identities[0]) >= 1
+
+        # Unexpected child exit is logged and followed by a fresh worker.
+        old_pid = supervisor.worker_pid
+        assert old_pid is not None
+        supervisor.clear_restart_event()
+        os.kill(old_pid, signal.SIGTERM)
+        assert await supervisor.wait_for_restart(timeout_seconds=10.0)
+        assert supervisor.is_running
+        assert supervisor.worker_pid is not None
+        assert supervisor.restart_count >= 1
+        assert "exited unexpectedly" in caplog.text
+
+        # Stop the worker independently, publish while stopped, and restart it.
+        await supervisor.stop()
+        assert not supervisor.is_running
+        assert supervisor.worker_pid is None
+        before_restart = store.counts()["receipts"]
+        restart_event = make_instance_seen_event(
+            problem, shape_key, producer_path="bulk",
+            event_id=str(uuid.uuid4()),
+        )
+        assert bulk_publisher.publish(restart_event) == "redis_stream"
+        assert store.counts()["receipts"] == before_restart
+
+        supervisor.clear_materialization_event()
+        await supervisor.start()
+        assert supervisor.is_running
+        assert await supervisor.wait_for_materialization(timeout_seconds=10.0)
+        assert store.counts()["receipts"] == before_restart + 1
+    finally:
+        await _stop_ordinary_service(task, websocket)
+
+    assert not supervisors[0].is_running
+    assert supervisors[0].worker_pid is None
+
+
+@pytest.mark.asyncio
+async def test_ordinary_service_explicit_opt_out_keeps_analysis_available(
+    redis_client: redis.Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_client.delete(CORPUS_STREAM_KEY)
+    database = tmp_path / "opt-out.sqlite3"
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "false")
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_DB", str(database))
+    monkeypatch.setattr(corpus_publisher, "_DEFAULT_PUBLISHER", None)
+
+    supervisors: list[stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor] = []
+    base_supervisor = stencil_corpus_supervisor.StencilCorpusMaterializerSupervisor
+
+    class _TrackingSupervisor(base_supervisor):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            supervisors.append(self)
+
+    monkeypatch.setattr(
+        stencil_corpus_supervisor,
+        "StencilCorpusMaterializerSupervisor",
+        _TrackingSupervisor,
+    )
+    task, websocket = await _start_ordinary_service(monkeypatch)
+    try:
+        assert supervisors == []
+        response = await _capture_one_query(websocket)
+        assert "stencilCover" in response
+        assert redis_client.xrange(CORPUS_STREAM_KEY) == []
+        assert not database.exists()
+    finally:
+        await _stop_ordinary_service(task, websocket)
+
+
 @pytest.mark.asyncio
 async def test_real_proxy_capture_backlogs_then_materializes_with_materializer_stopped(
     redis_client: redis.Redis,
