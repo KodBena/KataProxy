@@ -285,8 +285,14 @@ def test_spool_backups_existing_unversioned_database_before_initializing(
         assert backup.execute("SELECT value FROM legacy_data").fetchone() == ("keep",)
 
 
-def test_corpus_capture_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_corpus_capture_is_enabled_by_default_with_explicit_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("KATAPROXY_STENCIL_CORPUS_ENABLED", raising=False)
+    assert corpus_events_enabled() is True
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "false")
+    assert corpus_events_enabled() is False
+    monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "0")
     assert corpus_events_enabled() is False
     monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "true")
     assert corpus_events_enabled() is True
