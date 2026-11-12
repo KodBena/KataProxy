@@ -178,7 +178,7 @@ def test_real_redis_executes_result_arbitration_timeout_and_pending_lua_scripts(
     )
     with pytest.raises(RedisCacheConflict):
         store.put_result(
-            shape_key, family, (True, 0, b"\x01\x00conflict"),
+            shape_key, family, (True, 0, b"\x02\x00conflict"),
             provenance={"disposition": "legacy_unknown"},
             work_profile=profile_c,
         )
@@ -250,8 +250,8 @@ class _OwnershipRouter(BackendRouter):
     async def dispatch(
         self,
         canonical_id: CanonicalId,
-        _wire_dict: WireDict,
-        _query: KataGoQuery,
+        wire_dict: WireDict,
+        query: KataGoQuery,
         on_response: OnResponse,
         on_complete: OnComplete,
     ) -> None:
