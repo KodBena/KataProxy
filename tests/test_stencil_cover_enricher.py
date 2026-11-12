@@ -26,40 +26,56 @@ class _MemoryRedis:
     def smembers(self, key: str) -> set[bytes]:
         return set(self.sets.get(key, set()))
 
-    def hget(self, key: str, field: bytes) -> bytes | None:
-        return self.hashes.get(key, {}).get(field)
+    def hget(self, key: str, field: bytes | str) -> bytes | None:
+        encoded_field = field.encode("utf-8") if isinstance(field, str) else field
+        return self.hashes.get(key, {}).get(encoded_field)
+
+    def hset(self, key: str, field: bytes | str, value: bytes | str) -> int:
+        encoded_field = field.encode("utf-8") if isinstance(field, str) else field
+        encoded_value = value.encode("utf-8") if isinstance(value, str) else value
+        values = self.hashes.setdefault(key, {})
+        is_new = encoded_field not in values
+        values[encoded_field] = encoded_value
+        return int(is_new)
 
     def publish(self, _channel: str, _message: bytes) -> int:
         return 1
 
     def eval(self, script: str, numkeys: int, *args: Any) -> int:
-        if "SETNX" in script and numkeys == 2:
-            result_key, hard_key, payload, shape_key = args
+        if "STENCIL_PROFILE_MIGRATE" in script:
+            result_key, hard_key, registry_key, payload, shape_key, family_prefix = args
             if result_key in self.values:
                 return 0
             self.values[result_key] = payload
             migrated = json.loads(payload.decode("utf-8"))
             if int(migrated["status"]) != 0:
                 self.sets.setdefault(hard_key, set()).add(shape_key)
+                for raw_profile in self.hashes.get(registry_key, {}):
+                    profile_id = raw_profile.decode("utf-8")
+                    self.sets.setdefault(
+                        f"{family_prefix}:pending:{profile_id}", set(),
+                    ).add(shape_key)
             return 1
 
-        if "SETNX" in script and numkeys == 5:
-            hard_key, pending_key, timeout_key, marker_key, legacy_hard_key = args
-            if marker_key in self.markers:
+        if "STENCIL_PROFILE_INITIALIZE" in script:
+            hard_key, pending_key, initialized_key, legacy_hard_key, migration_key = args
+            if migration_key not in self.markers:
+                self.markers.add(migration_key)
+                self.sets.setdefault(hard_key, set()).update(
+                    self.sets.get(legacy_hard_key, set())
+                )
+            if initialized_key in self.markers:
                 return 0
-            self.markers.add(marker_key)
-            hard = self.sets.setdefault(hard_key, set())
-            hard.update(self.sets.get(legacy_hard_key, set()))
+            self.markers.add(initialized_key)
             pending = self.sets.setdefault(pending_key, set())
-            timed_out = self.hashes.get(timeout_key, {})
             queued = 0
-            for shape_key in hard:
-                if shape_key not in timed_out and shape_key not in pending:
+            for shape_key in self.sets.get(hard_key, set()):
+                if shape_key not in pending:
                     pending.add(shape_key)
                     queued += 1
             return queued
 
-        if "SISMEMBER" in script:
+        if "STENCIL_PROFILE_TIMEOUT" in script or "SISMEMBER" in script:
             assert numkeys == 4
             hard_key, pending_key, result_key, timeout_key, shape_key, metadata = args
             hard = self.sets.setdefault(hard_key, set())
@@ -88,51 +104,67 @@ class _MemoryRedis:
             pending.discard(shape_key)
             return 1
 
-        assert numkeys == 4
-        (
-            result_key, hard_key, pending_key, timeout_key,
-            payload, status, tile_count, _schema_version, shape_key, raw_bound,
-        ) = args
-        new_status = int(status)
-        new_cost = int(tile_count)
-        new_bound = int(raw_bound) if raw_bound not in (None, "") else None
-        should_store = True
-        old_raw = self.values.get(result_key)
-        if old_raw is not None:
-            old = json.loads(old_raw.decode("utf-8"))
-            old_status = int(old["status"])
-            old_cost = int(old["tile_count"])
-            old_bound = old.get("quality_lower_bound")
-            if old_status == 0 and new_status == 0 and old_cost != new_cost:
-                return -1
-            if new_status > old_status or (
-                new_status == old_status and new_cost > old_cost
-            ):
-                should_store = False
-            elif new_status == old_status and new_cost == old_cost:
-                if new_bound is None and old_bound is None:
+        if "STENCIL_PROFILE_STORE" in script:
+            assert numkeys == 3
+            (
+                result_key, hard_key, registry_key, payload, status, tile_count,
+                _schema_version, shape_key, raw_bound, family_prefix, profile_id,
+            ) = args
+            new_status = int(status)
+            new_cost = int(tile_count)
+            new_bound = int(raw_bound) if raw_bound not in (None, "") else None
+            old_raw = self.values.get(result_key)
+            should_store = True
+            if old_raw is not None:
+                old = json.loads(old_raw.decode("utf-8"))
+                old_status = int(old["status"])
+                old_cost = int(old["tile_count"])
+                old_bound = old.get("quality_lower_bound")
+                if old_status == 0 and new_status == 0 and old_cost != new_cost:
+                    return -1
+                if new_status > old_status or (
+                    new_status == old_status and new_cost > old_cost
+                ):
                     should_store = False
-                elif new_bound is None:
-                    should_store = False
-                elif old_bound is not None and new_bound <= int(old_bound):
-                    should_store = False
+                elif new_status == old_status and new_cost == old_cost:
+                    if new_bound is None and old_bound is None:
+                        should_store = False
+                    elif new_bound is None:
+                        should_store = False
+                    elif old_bound is not None and new_bound <= int(old_bound):
+                        should_store = False
 
-        if should_store:
-            self.values[result_key] = payload
-        final = json.loads(self.values[result_key].decode("utf-8"))
-        hard = self.sets.setdefault(hard_key, set())
-        pending = self.sets.setdefault(pending_key, set())
-        timeouts = self.hashes.setdefault(timeout_key, {})
-        if int(final["status"]) == 0:
-            hard.discard(shape_key)
-            pending.discard(shape_key)
-            timeouts.pop(shape_key, None)
-        else:
-            hard.add(shape_key)
             if should_store:
-                pending.add(shape_key)
-                timeouts.pop(shape_key, None)
-        return int(should_store)
+                self.values[result_key] = payload
+            final = json.loads(self.values[result_key].decode("utf-8"))
+            hard = self.sets.setdefault(hard_key, set())
+            profiles = [
+                field.decode("utf-8")
+                for field in self.hashes.get(registry_key, {})
+            ]
+            if int(final["status"]) == 0:
+                hard.discard(shape_key)
+                for known in profiles:
+                    self.sets.setdefault(
+                        f"{family_prefix}:pending:{known}", set(),
+                    ).discard(shape_key)
+                    self.hashes.setdefault(
+                        f"{family_prefix}:timeouts:{known}", {},
+                    ).pop(shape_key, None)
+            else:
+                hard.add(shape_key)
+                if should_store:
+                    selected = profiles if old_raw is None else [profile_id]
+                    for known in selected:
+                        self.sets.setdefault(
+                            f"{family_prefix}:pending:{known}", set(),
+                        ).add(shape_key)
+                        self.hashes.setdefault(
+                            f"{family_prefix}:timeouts:{known}", {},
+                        ).pop(shape_key, None)
+            return int(should_store)
+
+        raise AssertionError("unknown Redis Lua script contract")
 
 
 class _FakeRedisClient:
@@ -958,14 +990,15 @@ def test_timeout_metadata_retires_pending_work_and_better_results_requeue() -> N
         time_limit_ms=10_000, attempted_at=123.5,
     )
     metadata = store.timeout_metadata(shape_key, family)
-    assert metadata == {
-        "version": 1,
-        "reason": "time_limit_reached_without_proving_optimality",
-        "time_limit_ms": 10_000,
-        "status": 1,
-        "tile_count": 2,
-        "attempted_at": 123.5,
-    }
+    assert metadata is not None
+    assert metadata["version"] == 2
+    assert metadata["reason"] == "time_limit_reached_without_proving_optimality"
+    assert metadata["time_limit_ms"] == 10_000
+    assert metadata["status"] == 1
+    assert metadata["tile_count"] == 2
+    assert metadata["attempted_at"] == 123.5
+    assert metadata["work_profile_fingerprint"] == storage.LEGACY_SOLVER_WORK_PROFILE.fingerprint
+    assert metadata["work_profile"] == storage.LEGACY_SOLVER_WORK_PROFILE.document
     assert store.hard_components(family) == frozenset({shape_key})
     assert store.pending_components(family) == frozenset()
 
@@ -1467,3 +1500,147 @@ def test_v3_result_arbitration_uses_certified_bound_for_equal_tile_count() -> No
     assert record is not None
     assert record.quality_lower_bound == 1
     assert record.provenance["attempt_id"] == stronger["attempt_id"]
+
+
+
+def test_solver_profiles_have_independent_pending_and_timeout_state() -> None:
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import SolverBudget, NoNativeEffortLimit, NativeEffortLimit, SolverIdentity
+
+    def profile(name: str, wall_ms: int = 10_000) -> storage.SolverWorkProfile:
+        config = json.dumps({"variant": name}, sort_keys=True, separators=(",", ":"))
+        identity = SolverIdentity(
+            backend_name="fake",
+            backend_version="1",
+            adapter_version="adapter-v1",
+            configuration_json=config,
+            configuration_fingerprint=storage.hashlib.sha256(config.encode()).hexdigest(),
+        )
+        return storage.make_solver_work_profile(
+            identity,
+            SolverBudget(
+                wall_time_limit_ms=wall_ms,
+                native_effort_limit=NoNativeEffortLimit(),
+                policy_id="bulk-policy-v1",
+            ),
+        )
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "profile-isolation-test")
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"profile-isolated-component"
+    result = (False, 1, stencil._encode_cached_placements([("dot", (0,))], family))
+    profile_a, profile_b = profile("A"), profile("B")
+
+    store.initialize_pending_queue(family, profile_a)
+    store.initialize_pending_queue(family, profile_b)
+    assert store.put_result(shape_key, family, result, work_profile=profile_a)
+    assert store.pending_components(family, profile_a) == frozenset({shape_key})
+    assert store.pending_components(family, profile_b) == frozenset({shape_key})
+
+    assert store.mark_timed_out(
+        shape_key, family, result, time_limit_ms=10_000,
+        attempted_at=100.0, work_profile=profile_a,
+    )
+    assert store.pending_components(family, profile_a) == frozenset()
+    assert store.pending_components(family, profile_b) == frozenset({shape_key})
+    timeout_a = store.timeout_metadata(shape_key, family, profile_a)
+    assert timeout_a is not None
+    assert timeout_a["work_profile_fingerprint"] == profile_a.fingerprint
+    assert store.timeout_metadata(shape_key, family, profile_b) is None
+
+    assert store.mark_timed_out(
+        shape_key, family, result, time_limit_ms=10_000,
+        attempted_at=200.0, work_profile=profile_b,
+    )
+    timeout_b = store.timeout_metadata(shape_key, family, profile_b)
+    assert timeout_b is not None
+    assert timeout_b["work_profile_fingerprint"] == profile_b.fingerprint
+    assert store.timeout_metadata(shape_key, family, profile_a) == timeout_a
+
+
+def test_new_profile_is_seeded_from_hard_index_despite_other_profile_timeouts() -> None:
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import SolverBudget, NoNativeEffortLimit, SolverIdentity
+
+    def profile(name: str) -> storage.SolverWorkProfile:
+        config = json.dumps({"variant": name}, sort_keys=True, separators=(",", ":"))
+        identity = SolverIdentity(
+            backend_name="fake", backend_version="1", adapter_version="adapter-v1",
+            configuration_json=config,
+            configuration_fingerprint=storage.hashlib.sha256(config.encode()).hexdigest(),
+        )
+        return storage.make_solver_work_profile(
+            identity,
+            SolverBudget(10_000, NoNativeEffortLimit(), "bulk-policy-v1"),
+        )
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "profile-seed-test")
+    family = (("dot", ((0, 0),)),)
+    shape_key = b"seeded-after-retirement"
+    result = (False, 1, stencil._encode_cached_placements([("dot", (0,))], family))
+    a, b, c = profile("A"), profile("B"), profile("C")
+    store.initialize_pending_queue(family, a)
+    store.initialize_pending_queue(family, b)
+    store.put_result(shape_key, family, result, work_profile=a)
+    for selected in (a, b):
+        assert store.mark_timed_out(
+            shape_key, family, result, time_limit_ms=10_000,
+            attempted_at=1.0, work_profile=selected,
+        )
+    assert store.pending_components(family, a) == frozenset()
+    assert store.pending_components(family, b) == frozenset()
+
+    assert store.initialize_pending_queue(family, c) == 1
+    assert store.pending_components(family, c) == frozenset({shape_key})
+    assert store.timeout_metadata(shape_key, family, c) is None
+
+
+def test_better_result_requeues_only_its_origin_profile_and_optimum_clears_all() -> None:
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import SolverBudget, NoNativeEffortLimit, SolverIdentity
+
+    def profile(name: str) -> storage.SolverWorkProfile:
+        config = json.dumps({"variant": name}, sort_keys=True, separators=(",", ":"))
+        identity = SolverIdentity(
+            backend_name="fake", backend_version="1", adapter_version="adapter-v1",
+            configuration_json=config,
+            configuration_fingerprint=storage.hashlib.sha256(config.encode()).hexdigest(),
+        )
+        return storage.make_solver_work_profile(
+            identity,
+            SolverBudget(10_000, NoNativeEffortLimit(), "bulk-policy-v1"),
+        )
+
+    backend = _MemoryRedis()
+    store = storage.RedisStencilStore(backend, "profile-upgrade-test")
+    family = (
+        ("dot", ((0, 0),)),
+        ("domino", ((0, 0), (0, 1))),
+    )
+    shape_key = b"global-upgrade"
+    two_dots = (False, 2, stencil._encode_cached_placements([("dot", (0,)), ("dot", (1,))], family))
+    one_domino = (False, 1, stencil._encode_cached_placements([("domino", (0, 1))], family))
+    exact = (True, 0, one_domino[2])
+    a, b = profile("A"), profile("B")
+    store.initialize_pending_queue(family, a)
+    store.initialize_pending_queue(family, b)
+    assert store.put_result(shape_key, family, two_dots, work_profile=a)
+    for selected in (a, b):
+        assert store.mark_timed_out(
+            shape_key, family, two_dots, time_limit_ms=10_000,
+            attempted_at=1.0, work_profile=selected,
+        )
+
+    assert store.put_result(shape_key, family, one_domino, work_profile=a)
+    assert store.pending_components(family, a) == frozenset({shape_key})
+    assert store.timeout_metadata(shape_key, family, a) is None
+    assert store.pending_components(family, b) == frozenset()
+    assert store.timeout_metadata(shape_key, family, b) is not None
+
+    assert store.put_result(shape_key, family, exact, work_profile=b)
+    assert store.pending_components(family, a) == frozenset()
+    assert store.pending_components(family, b) == frozenset()
+    assert store.timeout_metadata(shape_key, family, a) is None
+    assert store.timeout_metadata(shape_key, family, b) is None

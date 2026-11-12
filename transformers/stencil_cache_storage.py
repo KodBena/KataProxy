@@ -589,6 +589,7 @@ def _candidate_fields(value: Any) -> tuple[tuple[bool, int, bytes], Dict[str, An
 # Status order is 0 (optimal), 1 (feasible incumbent), 2 (fallback). Within the
 # same non-optimal status, fewer tiles is better.
 _STORE_RESULT_SCRIPT = """
+-- STENCIL_PROFILE_STORE: global best result, profile-scoped work state.
 local old_raw = redis.call('GET', KEYS[1])
 local new_status = tonumber(ARGV[2])
 local new_cost = tonumber(ARGV[3])
@@ -640,15 +641,32 @@ end
 
 local final_raw = redis.call('GET', KEYS[1])
 local final = cjson.decode(final_raw)
+local profile_ids = redis.call('HKEYS', KEYS[3])
+local family_prefix = ARGV[7]
+
 if tonumber(final.status) == 0 then
     redis.call('SREM', KEYS[2], ARGV[5])
-    redis.call('SREM', KEYS[3], ARGV[5])
-    redis.call('HDEL', KEYS[4], ARGV[5])
+    for _, profile_id in ipairs(profile_ids) do
+        redis.call('SREM', family_prefix .. ':pending:' .. profile_id, ARGV[5])
+        redis.call('HDEL', family_prefix .. ':timeouts:' .. profile_id, ARGV[5])
+    end
 else
     redis.call('SADD', KEYS[2], ARGV[5])
     if should_store then
-        redis.call('SADD', KEYS[3], ARGV[5])
-        redis.call('HDEL', KEYS[4], ARGV[5])
+        if not old_raw then
+            -- A newly discovered hard instance is eligible in every profile
+            -- that has already registered with this family.
+            for _, profile_id in ipairs(profile_ids) do
+                redis.call('SADD', family_prefix .. ':pending:' .. profile_id, ARGV[5])
+                redis.call('HDEL', family_prefix .. ':timeouts:' .. profile_id, ARGV[5])
+            end
+        else
+            -- A later improvement reopens only the profile that produced it;
+            -- unrelated profiles retain their retirement state.
+            local profile_id = ARGV[8]
+            redis.call('SADD', family_prefix .. ':pending:' .. profile_id, ARGV[5])
+            redis.call('HDEL', family_prefix .. ':timeouts:' .. profile_id, ARGV[5])
+        end
     end
 end
 
@@ -659,15 +677,20 @@ return 0
 """
 
 _MIGRATE_LEGACY_RESULT_SCRIPT = """
+-- STENCIL_PROFILE_MIGRATE
 if redis.call('SETNX', KEYS[1], ARGV[1]) == 0 then
     return 0
 end
 local value = cjson.decode(ARGV[1])
 if tonumber(value.status) ~= 0 then
     redis.call('SADD', KEYS[2], ARGV[2])
+    local family_prefix = ARGV[3]
+    for _, profile_id in ipairs(redis.call('HKEYS', KEYS[3])) do
+        redis.call('SADD', family_prefix .. ':pending:' .. profile_id, ARGV[2])
+    end
 end
 return 1
-"""
+""
 
 _MARK_TIMED_OUT_SCRIPT = """
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
@@ -703,19 +726,20 @@ return 1
 """
 
 _INITIALIZE_PENDING_SCRIPT = """
-if redis.call('SETNX', KEYS[4], '1') == 0 then
-    return 0
+-- STENCIL_PROFILE_INITIALIZE
+-- Copy the old v3 hard index once. Its old timeout metadata is intentionally
+-- ignored because it did not identify a solver profile.
+if redis.call('SETNX', KEYS[5], '1') == 1 then
+    for _, shape_key in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+        redis.call('SADD', KEYS[1], shape_key)
+    end
 end
--- Preserve the old v3 hard index, but deliberately ignore its timeout hash:
--- v3 retirement metadata was not tied to a solver work profile.
-for _, shape_key in ipairs(redis.call('SMEMBERS', KEYS[5])) do
-    redis.call('SADD', KEYS[1], shape_key)
+if redis.call('SETNX', KEYS[3], '1') == 0 then
+    return 0
 end
 local queued = 0
 for _, shape_key in ipairs(redis.call('SMEMBERS', KEYS[1])) do
-    if redis.call('HEXISTS', KEYS[3], shape_key) == 0 then
-        queued = queued + redis.call('SADD', KEYS[2], shape_key)
-    end
+    queued = queued + redis.call('SADD', KEYS[2], shape_key)
 end
 return queued
 """
@@ -768,21 +792,74 @@ class RedisStencilStore:
     def _hard_set_key(self, family: Any) -> str:
         return self._family_key("hard", family)
 
+    def _work_family_prefix(self, family: Any) -> str:
+        return self._family_key("work", family)
+
+    def _profile_registry_key(self, family: Any) -> str:
+        return self._work_family_prefix(family) + ":profiles"
+
+    @staticmethod
+    def _coerce_work_profile(
+        work_profile: SolverWorkProfile | None,
+    ) -> SolverWorkProfile:
+        return LEGACY_SOLVER_WORK_PROFILE if work_profile is None else work_profile
+
+    def _profile_pending_set_key(
+        self, family: Any, work_profile: SolverWorkProfile | None = None,
+    ) -> str:
+        profile = self._coerce_work_profile(work_profile)
+        return self._work_family_prefix(family) + ":pending:" + profile.fingerprint
+
+    def _profile_timeout_hash_key(
+        self, family: Any, work_profile: SolverWorkProfile | None = None,
+    ) -> str:
+        profile = self._coerce_work_profile(work_profile)
+        return self._work_family_prefix(family) + ":timeouts:" + profile.fingerprint
+
+    def _profile_initialized_key(
+        self, family: Any, work_profile: SolverWorkProfile | None = None,
+    ) -> str:
+        profile = self._coerce_work_profile(work_profile)
+        return self._work_family_prefix(family) + ":initialized:" + profile.fingerprint
+
+    # Backward-compatible private helpers now resolve to the explicit legacy
+    # profile. New production paths pass a SolverWorkProfile.
     def _pending_set_key(self, family: Any) -> str:
-        return self._family_key("pending", family)
+        return self._profile_pending_set_key(family)
 
     def _timeout_hash_key(self, family: Any) -> str:
-        return self._family_key("timeouts", family)
+        return self._profile_timeout_hash_key(family)
 
     def _pending_initialized_key(self, family: Any) -> str:
-        return self._family_key("pending-initialized", family)
+        return self._profile_initialized_key(family)
 
-    def initialize_pending_queue(self, family: Any) -> int:
-        """Seed v4 work from non-optimal results, ignoring old global timeouts.
+    def _register_work_profile(
+        self, family: Any, work_profile: SolverWorkProfile,
+    ) -> None:
+        registry = self._profile_registry_key(family)
+        encoded = json.dumps(
+            work_profile.document, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False,
+        ).encode("utf-8")
+        existing = self._client.hget(registry, work_profile.fingerprint)
+        if existing is not None:
+            if isinstance(existing, str):
+                existing = existing.encode("utf-8")
+            if existing != encoded:
+                raise ValueError("solver work-profile fingerprint collision in Redis")
+            return
+        self._client.hset(registry, work_profile.fingerprint, encoded)
 
-        The old v3 hard index is copied into v4. Its timeout hash is deliberately
-        not consulted because those retirements did not name a solver profile.
+    def initialize_pending_queue(
+        self, family: Any, work_profile: SolverWorkProfile | None = None,
+    ) -> int:
+        """Register and seed one profile from the global non-optimal index.
+
+        Every new profile is seeded independently of timeout metadata belonging
+        to any other profile. The previous v3 global timeout hash is never used.
         """
+        profile = self._coerce_work_profile(work_profile)
+        self._register_work_profile(family, profile)
         legacy_hard = (
             f"kataproxy:stencil-cover:{self._legacy_namespace}:"
             f"hard:{_stable_digest(family)}"
@@ -793,10 +870,10 @@ class RedisStencilStore:
             _INITIALIZE_PENDING_SCRIPT,
             5,
             self._hard_set_key(family),
-            self._pending_set_key(family),
-            self._timeout_hash_key(family),
-            self._pending_initialized_key(family),
+            self._profile_pending_set_key(family, profile),
+            self._profile_initialized_key(family, profile),
             legacy_hard,
+            self._work_family_prefix(family) + ":v3-hard-migrated",
         ))
 
     def _members(self, redis_key: str) -> FrozenSet[bytes]:
@@ -831,11 +908,13 @@ class RedisStencilStore:
                 )
                 self._client.eval(
                     _MIGRATE_LEGACY_RESULT_SCRIPT,
-                    2,
+                    3,
                     current_key,
                     self._hard_set_key(family),
+                    self._profile_registry_key(family),
                     migrated,
                     shape_key,
+                    self._work_family_prefix(family),
                 )
                 raw = self._client.get(current_key)
                 if raw is None:
@@ -857,27 +936,31 @@ class RedisStencilStore:
         result: tuple[bool, int, bytes],
         *,
         provenance: Dict[str, Any] | None = None,
+        work_profile: SolverWorkProfile | None = None,
     ) -> bool:
-        """Persist a best result and the provenance of the attempt that won it."""
+        """Persist the global best result and update only profile work state."""
         _optimal, status, _placements, cost = _result_fields(result)
         provenance_value = _validate_result_provenance(
             {"disposition": "legacy_unknown"} if provenance is None else provenance
         )
         raw = _encode_solver_result(result, provenance_value)
         quality_bound = _quality_lower_bound(provenance_value)
+        profile = self._coerce_work_profile(work_profile)
+        self._register_work_profile(family, profile)
         outcome = self._client.eval(
             _STORE_RESULT_SCRIPT,
-            4,
+            3,
             self._problem_key(shape_key, family),
             self._hard_set_key(family),
-            self._pending_set_key(family),
-            self._timeout_hash_key(family),
+            self._profile_registry_key(family),
             raw,
             str(status),
             str(cost),
             str(_VALUE_SCHEMA_VERSION),
             shape_key,
             "" if quality_bound is None else str(quality_bound),
+            self._work_family_prefix(family),
+            profile.fingerprint,
         )
         if int(outcome) == -1:
             raise RedisCacheConflict(
@@ -900,12 +983,23 @@ class RedisStencilStore:
         """Return every canonical component whose result is not yet optimal."""
         return self._members(self._hard_set_key(family))
 
-    def pending_components(self, family: Any) -> FrozenSet[bytes]:
-        """Return non-optimal components not yet processed at the bulk budget."""
-        return self._members(self._pending_set_key(family))
+    def pending_components(
+        self, family: Any, work_profile: SolverWorkProfile | None = None,
+    ) -> FrozenSet[bytes]:
+        """Return hard components not yet retired for this exact work profile."""
+        profile = self._coerce_work_profile(work_profile)
+        return self._members(self._profile_pending_set_key(family, profile))
 
-    def timeout_metadata(self, shape_key: bytes, family: Any) -> Dict[str, Any] | None:
-        raw = self._client.hget(self._timeout_hash_key(family), shape_key)
+    def timeout_metadata(
+        self,
+        shape_key: bytes,
+        family: Any,
+        work_profile: SolverWorkProfile | None = None,
+    ) -> Dict[str, Any] | None:
+        profile = self._coerce_work_profile(work_profile)
+        raw = self._client.hget(
+            self._profile_timeout_hash_key(family, profile), shape_key,
+        )
         if raw is None:
             return None
         if isinstance(raw, bytes):
@@ -913,8 +1007,13 @@ class RedisStencilStore:
         if not isinstance(raw, str):
             raise ValueError("Redis timeout metadata is not bytes or text")
         value = json.loads(raw)
-        if not isinstance(value, dict) or value.get("version") != 1:
-            raise ValueError("Redis timeout metadata has an unsupported schema")
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != 2
+            or value.get("work_profile_fingerprint") != profile.fingerprint
+            or value.get("work_profile") != profile.document
+        ):
+            raise ValueError("Redis timeout metadata has an unsupported or mismatched profile")
         return value
 
     def mark_timed_out(
@@ -925,28 +1024,41 @@ class RedisStencilStore:
         *,
         time_limit_ms: int,
         attempted_at: float,
+        work_profile: SolverWorkProfile | None = None,
     ) -> bool:
-        """Persist why a hard component was retired from the pending queue."""
+        """Retire only the pending queue entry for the profile that ran."""
         optimal, status, _placements, _cost = _result_fields(result)
         if optimal or status == 0:
             raise ValueError("an optimal result cannot be marked as timed out")
+        profile = self._coerce_work_profile(work_profile)
+        profile_budget = profile.document.get("budget")
+        if (
+            isinstance(profile_budget, dict)
+            and isinstance(profile_budget.get("wall_time_limit_ms"), int)
+            and profile_budget["wall_time_limit_ms"] != int(time_limit_ms)
+        ):
+            raise ValueError("timeout wall-time limit disagrees with the work profile")
         metadata = json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "reason": "time_limit_reached_without_proving_optimality",
                 "time_limit_ms": int(time_limit_ms),
                 "attempted_at": float(attempted_at),
+                "work_profile_fingerprint": profile.fingerprint,
+                "work_profile": profile.document,
             },
             sort_keys=True,
             separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
         )
         outcome = self._client.eval(
             _MARK_TIMED_OUT_SCRIPT,
             4,
             self._hard_set_key(family),
-            self._pending_set_key(family),
+            self._profile_pending_set_key(family, profile),
             self._problem_key(shape_key, family),
-            self._timeout_hash_key(family),
+            self._profile_timeout_hash_key(family, profile),
             shape_key,
             metadata,
         )
