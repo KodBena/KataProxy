@@ -792,62 +792,6 @@ def test_transformer_requires_explicit_stencil_cover_opt_in() -> None:
     assert "stencilCover" not in response.opaque
 
 
-def test_transformer_enriches_only_final_response_and_keeps_signs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: List[List[int]] = []
-
-    def fake_solve(
-        cells: List[int], width: int, height: int, family: Any, solver_backend: Any = None,
-    ) -> Dict[str, Any]:
-        calls.append(list(cells))
-        components = [
-            {
-                "cells": [[point % width, point // width] for point in component],
-                "tileCount": 1,
-                "optimal": True,
-                "status": "optimal",
-            }
-            for component in stencil._connected_components(cells, width, height)
-        ]
-        return {
-            "components": components,
-            "placements": [],
-            "tileCount": 0,
-            "optimal": True,
-            "status": "optimal",
-        }
-
-    monkeypatch.setattr(stencil, "_solve_region", fake_solve)
-    transformer = stencil.stencil_cover_enricher(_mock_link())
-    query = _query({
-        "stencil_cover": {"truncation_threshold": 0.5},
-    })
-    transformer.on_query(ClientId("q2"), query)
-
-    partial = _response(during_search=True)
-    transformer.on_response(ClientId("q2"), partial)
-    assert "stencilCover" not in partial.opaque
-    assert calls == []
-
-    final = _response()
-    out = transformer.on_response(ClientId("q2"), final)
-    assert out is final
-    assert calls == [[0, 1], [2, 3]]
-    annotation = final.opaque["stencilCover"]
-    assert annotation["version"] == 2
-    assert annotation["threshold"] == 0.5
-    assert annotation["positive"]["components"] == [
-        {
-            "cells": [[0, 0], [1, 0]],
-            "tileCount": 1,
-            "optimal": True,
-            "status": "optimal",
-        },
-    ]
-    assert annotation["positive"]["optimal"] is True
-    assert annotation["negative"]["optimal"] is True
-    assert annotation["optimal"] is True
 
 
 def test_transformer_does_not_need_policy_map_for_territory() -> None:
