@@ -91,12 +91,16 @@ def _junit_summary(path: Path) -> dict[str, Any] | None:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
         return {"parse_error": str(exc)}
+    suites = (
+        [root] if root.tag == "testsuite"
+        else list(root.iter("testsuite"))
+    )
     return {
-        "tests": int(root.attrib.get("tests", "0")),
-        "failures": int(root.attrib.get("failures", "0")),
-        "errors": int(root.attrib.get("errors", "0")),
-        "skipped": int(root.attrib.get("skipped", "0")),
-        "time_seconds": float(root.attrib.get("time", "0")),
+        "tests": len(list(root.iter("testcase"))),
+        "failures": sum(int(suite.attrib.get("failures", "0")) for suite in suites),
+        "errors": sum(int(suite.attrib.get("errors", "0")) for suite in suites),
+        "skipped": sum(int(suite.attrib.get("skipped", "0")) for suite in suites),
+        "time_seconds": sum(float(suite.attrib.get("time", "0")) for suite in suites),
     }
 
 
