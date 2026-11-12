@@ -27,6 +27,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from proxy_logging.adapter import ProxyLogger
@@ -224,8 +225,7 @@ def forward(
     that's only useful at INFO if it isn't drowned by per-partial noise.
     Partials remain available under ``LOG_LEVEL=DEBUG``.
     """
-    import logging as _logging
-    level = _logging.DEBUG if kind == "partial" else _logging.INFO
+    level = logging.DEBUG if kind == "partial" else logging.INFO
     logger.log(
         level,
         Event.FORWARD,

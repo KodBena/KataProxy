@@ -57,6 +57,11 @@ import websockets
 from sortedcontainers import SortedList
 from websockets.exceptions import ConnectionClosed
 
+try:
+    import go_transposition as _go_transposition
+except ImportError:
+    _go_transposition = None
+
 from logging_config import filter_dict, get_logger, log_safe  # noqa: E402
 logger = get_logger("kataproxy")
 
@@ -66,6 +71,8 @@ from proxy_logging import (
     Role,
     get_proxy_logger,
     lifecycle,
+    configure_logging_from_env,
+    set_process_role,
 )
 
 _log = get_proxy_logger(__name__)
@@ -102,6 +109,7 @@ from AbstractProxy.protocol_transformer import TransformedChain, Transformer
 from pubsub_hub import PubSubHub, LRUCacheStore
 from proxy_json import loads_bounded, JsonDepthExceededError
 from router import BackendRouter, InFlightQueryLoad, make_router
+from middleware.learned_value_fn import get_registry
 from middleware.session_middleware import (
     IdentityMiddleware,
     MiddlewareChain,
@@ -232,8 +240,7 @@ class _PerIpRateLimit:
     def allow(self, ip: str) -> bool:
         if not self.enabled:
             return True
-        import time as _time
-        now = _time.monotonic()
+        now = monotonic()
         entry = self._buckets.get(ip)
         if entry is None:
             tokens = float(self._capacity)
@@ -1489,7 +1496,6 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
     # no learned predictors; SPA hides the option. See
     # docs/dispatch/proxy-to-frontend-learned-vf.md for the wire shape.
     try:
-        from middleware.learned_value_fn import get_registry
         versions = get_registry().available_versions()
         if versions:
             advertised["adaptive_reevaluate"]["available_value_bindings"] = versions
@@ -1498,11 +1504,8 @@ def _build_advertised_capabilities() -> Dict[str, Dict[str, Any]]:
         # at startup) should not block server startup. The learned VF
         # is simply unavailable for this run; advertisement omits it.
         pass
-    try:
-        import go_transposition  # noqa: F401
+    if _go_transposition is not None:
         advertised["transposition"] = {}
-    except ImportError:
-        pass
     if cfg.ROLE.upper() == "SELECTOR":
         advertised["selector"] = {}
     # cache (this feature) — advertised iff the Hub replay cache is
@@ -1533,7 +1536,6 @@ async def _main() -> None:
     # tty; logfmt otherwise). Idempotent — calling twice is a no-op.
     # See proxy_logging.formatters.configure_logging_from_env() and
     # proxy/docs/logging-design.md §6 / §8 for the env-var matrix.
-    from proxy_logging import configure_logging_from_env, set_process_role
     configure_logging_from_env()
     # Bind the process role onto every module-level get_proxy_logger
     # call. ClientSession's per-session log refines further; bare

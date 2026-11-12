@@ -31,6 +31,7 @@ License: Public Domain (Unlicense). See UNLICENSE at the project root.
 from __future__ import annotations
 
 import asyncio
+import copy as _copy
 import functools
 import logging
 import uuid
@@ -52,6 +53,10 @@ from middleware.session_middleware import (
     SessionMiddleware,
     SubmitQuery,
 )
+from middleware.orchestration_contract import (
+    MiddlewareChainConfigurationError,
+    OrchestrationMiddlewareMarker,
+)
 from proxy_logging import Event, get_proxy_logger
 
 logger = logging.getLogger("kataproxy." + __name__)
@@ -68,16 +73,6 @@ __all__ = [
     "OrchestrationMiddleware",
     "orchestration_middleware",
 ]
-
-
-class MiddlewareChainConfigurationError(RuntimeError):
-    """Raised at MiddlewareChain construction when more than one
-    OrchestrationMiddleware is present in the chain.
-
-    The single-orchestration-per-chain limit is structural: chained
-    orchestration is implementable but not algebraically composable
-    under the coroutine substrate. See the roadmap for the reasoning.
-    """
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +381,7 @@ class OrchestrationContext:
 # OrchestrationMiddleware
 # ---------------------------------------------------------------------------
 
-class OrchestrationMiddleware(SessionMiddleware):
+class OrchestrationMiddleware(SessionMiddleware, OrchestrationMiddlewareMarker):
     """SessionMiddleware that drives one orchestration coroutine per
     parent query.
 
@@ -480,7 +475,6 @@ class OrchestrationMiddleware(SessionMiddleware):
         # to closure defaults. Discovered 2026-05-18 when the SPA's
         # learned-VF dropdown's `value_binding` / `allocation_algorithm`
         # never reached the substrate.
-        import copy as _copy
         query_for_coro = KataGoQuery(
             action=query.action,
             analyze_turns=query.analyze_turns,

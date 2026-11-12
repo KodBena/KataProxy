@@ -49,6 +49,10 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 from AbstractProxy.proxy_core import ClientId
 from katago import KataGoQuery, KataGoResponse
+from middleware.orchestration_contract import (
+    MiddlewareChainConfigurationError,
+    OrchestrationMiddlewareMarker,
+)
 
 __all__ = [
     "SessionMiddleware",
@@ -271,18 +275,13 @@ class MiddlewareChain(SessionMiddleware):
         recursing into nested MiddlewareChains so the guard is robust
         against multi-level composition.
         """
-        # Lazy import: orchestration imports session_middleware, so a
-        # top-level import here would cycle. Imported on construction
-        # only (cheap; chain construction is rare).
-        from middleware.orchestration import (
-            MiddlewareChainConfigurationError,
-            OrchestrationMiddleware,
-        )
+        # The marker and failure contract live in a dependency-neutral
+        # module, so this boundary has no cycle or deferred import.
 
         def count(m: SessionMiddleware) -> int:
             if isinstance(m, MiddlewareChain):
                 return count(m._inner) + count(m._outer)
-            return 1 if isinstance(m, OrchestrationMiddleware) else 0
+            return 1 if isinstance(m, OrchestrationMiddlewareMarker) else 0
 
         total = count(inner) + count(outer)
         if total > 1:

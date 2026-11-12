@@ -44,6 +44,8 @@ from enum import Enum, auto
 from time import monotonic
 from typing import Any, Awaitable, Callable, Deque, NamedTuple, Optional
 
+import websockets
+
 from AbstractProxy.proxy_core import CanonicalId, WireId
 
 from AbstractProxy.proxy_core import CompletionSignal, CompletionTracker
@@ -421,7 +423,6 @@ class LeafRouter(BackendRouter):
         to the probe, or if the probe doesn't return within
         ``startup_timeout_s``.
         """
-        from time import monotonic
         startup_t0 = monotonic()
         await self._spawn()
         # _running gates the read loop. We set it True before starting the
@@ -1273,7 +1274,6 @@ class RelayRouter(BackendRouter):
         ``gather(return_exceptions=True)`` preserves the initial-
         connect semantics.
         """
-        import websockets
         self._log.info(
             Event.DIAGNOSTIC,
             upstream=url,
@@ -2283,7 +2283,6 @@ class SelectorRouter(BackendRouter):
         count against the restart budget. Only failed reconnect
         attempts decrement the budget.
         """
-        import websockets
         url = self._url_for_label[label]
         self._log.info(
             Event.DIAGNOSTIC,
@@ -2338,7 +2337,6 @@ class SelectorRouter(BackendRouter):
         loop exits. On success the new websocket and reader task
         replace any prior entries.
         """
-        import websockets
         delay = self._RECONNECT_INITIAL_DELAY_S
         url = self._url_for_label[label]
         attempt = 0
