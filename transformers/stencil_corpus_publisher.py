@@ -26,7 +26,7 @@ logger = logging.getLogger("kataproxy.stencil_corpus_publisher")
 
 CORPUS_STREAM_KEY = "kataproxy:stencil-cover:corpus:events:v1"
 CORPUS_CONSUMER_GROUP = "stencil-corpus-materializer-v1"
-_SPOOL_USER_VERSION = 1
+_SPOOL_USER_VERSION = 2
 _ENABLE_ENV = "KATAPROXY_STENCIL_CORPUS_ENABLED"
 _DATABASE_ENV = "KATAPROXY_STENCIL_CORPUS_DB"
 
