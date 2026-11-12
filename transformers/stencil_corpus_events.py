@@ -137,8 +137,6 @@ def make_instance_seen_event(
         "instance": _instance_document(problem, canonical_key),
     }
     validate_event(event)
-    if serialize_event(event) != decoded.encode("utf-8"):
-        raise CorpusEventError("event payload must use canonical compact JSON")
     return event
 
 
