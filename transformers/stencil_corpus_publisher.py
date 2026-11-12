@@ -265,10 +265,17 @@ class CorpusEventPublisher:
             client = self._get_redis_client()
             # One transactional pipeline makes all XADD commands one network
             # exchange. Do not trim: every unmaterialized event must be retained.
-            with client.pipeline(transaction=True) as pipeline:
+            pipeline_factory = getattr(client, "pipeline", None)
+            if callable(pipeline_factory):
+                with pipeline_factory(transaction=True) as pipeline:
+                    for _event_id, payload in prepared:
+                        pipeline.xadd(CORPUS_STREAM_KEY, {b"event": payload})
+                    pipeline.execute()
+            else:
+                # Compatibility for narrow injected/test clients. The real
+                # redis-py client always exposes pipeline().
                 for _event_id, payload in prepared:
-                    pipeline.xadd(CORPUS_STREAM_KEY, {b"event": payload})
-                pipeline.execute()
+                    client.xadd(CORPUS_STREAM_KEY, {b"event": payload})
             with self._redis_lock:
                 self._warned_redis_failure = False
             return "redis_stream"
