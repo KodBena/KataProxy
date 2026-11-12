@@ -469,7 +469,8 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
     assert "KATAPROXY_STENCIL_CORPUS_DB" not in os.environ
     assert "KATAPROXY_STENCIL_CORPUS_ENABLED" not in os.environ
 
-    supervisors: list[StencilCorpusMaterializerSupervisor] =
+    supervisors: list[StencilCorpusMaterializerSupervisor] = []
+
     class _TrackingSupervisor(StencilCorpusMaterializerSupervisor):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
@@ -660,6 +661,7 @@ async def test_ordinary_service_explicit_opt_out_keeps_analysis_available(
     monkeypatch.setattr(corpus_publisher, "_DEFAULT_PUBLISHER", None)
 
     supervisors: list[StencilCorpusMaterializerSupervisor] = []
+
     class _TrackingSupervisor(StencilCorpusMaterializerSupervisor):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
