@@ -52,13 +52,12 @@ import gzip
 import json
 import sys
 from pathlib import Path
-from types import ModuleType
 from typing import Any, Dict, List, Optional, cast
 
 import numpy as np
 from scipy.stats import ks_2samp, norm
 
-diptest: ModuleType | None
+diptest: Any
 try:
     import diptest as _diptest
 except ImportError:
@@ -66,17 +65,25 @@ except ImportError:
 else:
     diptest = _diptest
 
+GaussianMixture: Any
 try:
-    from sklearn.mixture import GaussianMixture
+    from sklearn.mixture import GaussianMixture as _GaussianMixture
 except ImportError:
     GaussianMixture = None
+else:
+    GaussianMixture = _GaussianMixture
 
+plt: Any
+sns: Any
 try:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
+    import matplotlib.pyplot as _plt
+    import seaborn as _sns
 except ImportError:
     plt = None
     sns = None
+else:
+    plt = _plt
+    sns = _sns
 
 
 # ---------------------------------------------------------------------------
