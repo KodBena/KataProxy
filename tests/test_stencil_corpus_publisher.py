@@ -15,6 +15,7 @@ from transformers.stencil_corpus_events import (
     make_instance_seen_event,
     serialize_event,
 )
+from transformers.stencil_corpus_store import SQLiteCorpusStore
 from transformers.stencil_corpus_publisher import (
     CORPUS_STREAM_KEY,
     CorpusEventConflict,
@@ -102,12 +103,16 @@ def test_sqlite_spool_is_idempotent_and_preserves_exact_event_bytes(tmp_path: Pa
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
-    assert spool.pending_events() == ((
-        "12345678-1234-5678-1234-567812345678", payload,
-    ),)
-    assert spool.acknowledge("12345678-1234-5678-1234-567812345678") is True
-    assert spool.acknowledge("12345678-1234-5678-1234-567812345678") is False
-    assert spool.pending_events() == ()
+    store = SQLiteCorpusStore(path)
+    pending = store.pending_spool_events()
+    assert len(pending) == 1
+    assert pending[0].event_id == "12345678-1234-5678-1234-567812345678"
+    assert pending[0].payload == payload
+    assert pending[0].payload_sha256 == hashlib.sha256(payload).hexdigest()
+    assert store.ingest_spool_event(pending[0]).inserted is True
+    assert store.pending_spool_events() == ()
+    assert store.counts()["instances"] == 1
+    assert store.counts()["receipts"] == 1
 
 
 def test_sqlite_spool_rejects_same_event_id_with_different_immutable_bytes(

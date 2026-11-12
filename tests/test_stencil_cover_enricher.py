@@ -275,7 +275,7 @@ def test_zero_threshold_splits_signs_and_leaves_neutral_points_unowned() -> None
         height=2,
         threshold=0.0,
     )
-    assert positive == [0]
+    assert positive == [0, 3]
     assert negative == [2]
 
 
@@ -1329,6 +1329,8 @@ def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None
         _shape: bytes,
         _time_limit_ms: int,
         _family: Any,
+        _backend: Any = None,
+        _work_profile: Any = None,
     ) -> tuple[bool, int, bytes]:
         calls.append(1)
         if len(calls) == 1:

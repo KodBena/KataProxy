@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import threading
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -327,8 +327,8 @@ def _board_at_turn(context: RequestContext, turn_number: int) -> List[Optional[s
 
     # A valid setup position cannot contain a chain without liberties.
     visited: set[int] = set()
-    for point, colour in enumerate(board):
-        if colour is None or point in visited:
+    for point, board_colour in enumerate(board):
+        if board_colour is None or point in visited:
             continue
         chain, liberties = _chain_and_liberties(
             board, point, context.width, context.height,
@@ -414,7 +414,7 @@ def _dead_stone_owners(
 
 
 def _ownership_regions(
-    ownership: Sequence[float],
+    ownership: Any,
     board: Sequence[Optional[str]],
     width: int,
     height: int,
@@ -630,6 +630,7 @@ def _decode_cached_placements(
         if offset + point_count * 2 > len(encoded):
             raise ValueError("cached stencil placement points are truncated")
 
+        stencil_name: Optional[str]
         if stencil_index == 255:
             stencil_name = "1x1"
         elif stencil_index < len(family):
@@ -643,6 +644,8 @@ def _decode_cached_placements(
         else:
             raise ValueError("cached stencil index is outside the active family")
 
+        if stencil_name is None:
+            raise RuntimeError("could not recover the selected stencil family member")
         points: List[List[int]] = []
         for _ in range(point_count):
             local = int.from_bytes(encoded[offset:offset + 2], "little")
@@ -766,8 +769,11 @@ class _InvalidatableSolverCache:
                 self._inflight[shape_key] = self._inflight.get(shape_key, 0) + 1
 
             try:
-                result = self._function(
-                    shape_key, time_limit_ms, family, backend, work_profile,
+                result = cast(
+                    Tuple[bool, int, bytes],
+                    self._function(
+                        shape_key, time_limit_ms, family, backend, work_profile,
+                    ),
                 )
             except Exception:
                 with self._lock:
@@ -1006,6 +1012,7 @@ def stencil_cover_enricher(
             if (
                 context is not None
                 and isinstance(response, AnalyzeResponse)
+                and not response.is_during_search
             ):
                 try:
                     board = _board_at_turn(context, response.turn_number)
@@ -1036,3 +1043,21 @@ def stencil_cover_enricher(
         on_query=on_query,
         on_response=on_response,
     )
+
+
+# Explicit exports preserve the historical helper surface used by geometry
+# tests and the optional bulk worker under strict mypy settings.
+__all__ = [
+    "stencil_cover_enricher", "STENCIL_FAMILY", "RequestContext", "ComponentFrame",
+    "_MAX_BOARD_SIZE", "_D4_INVERSE", "_D4_MATRICES",
+    "_decode_component_shape_key", "_decode_cached_placements",
+    "_encode_cached_placements", "_normalise_shape", "_transform_cell",
+    "_verify_component_placements", "_parse_stencil_family",
+    "_threshold_from_metadata", "_board_dimensions", "_numeric_array",
+    "_extract_maps", "_coordinate_index", "_parse_position_entries",
+    "_neighbours", "_chain_and_liberties", "_board_at_turn",
+    "_dead_stone_owners", "_ownership_regions", "_candidate_placements",
+    "_connected_components", "_family_dihedral_group", "_component_shape_key",
+    "_build_stencil_cover", "_request_context", "_solve_component_uncached",
+    "_solve_component_cached", "_invalidate_component_cache",
+]

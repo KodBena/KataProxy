@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -134,6 +135,7 @@ class _FakeRedis:
         self.raise_on_ack = False
         self._lock = threading.Lock()
         self._next_stream_id = 0
+        self._event_ids: dict[str, str] = {}
 
     def xadd(self, name: str, fields: dict[bytes, bytes]) -> str:
         assert name == CORPUS_STREAM_KEY
@@ -157,6 +159,10 @@ class _FakeRedis:
             self.claims.append((args, kwargs))
             messages = self.pending_messages
             self.pending_messages = []
+            for message_id, fields in messages:
+                stream_id = message_id.decode("ascii")
+                event = json.loads(fields[b"event"].decode("utf-8"))
+                self._event_ids[stream_id] = event["event_id"]
         return "0-0", messages, []
 
     def xreadgroup(self, *args: Any, **kwargs: Any) -> list[Any]:
@@ -165,6 +171,10 @@ class _FakeRedis:
             messages = self.new_messages
             self.new_messages = []
             self.pending_messages.extend(messages)
+            for message_id, fields in messages:
+                stream_id = message_id.decode("ascii")
+                event = json.loads(fields[b"event"].decode("utf-8"))
+                self._event_ids[stream_id] = event["event_id"]
         return [(CORPUS_STREAM_KEY.encode("utf-8"), messages)] if messages else []
 
     def xack(self, name: str, groupname: str, *ids: str) -> int:
@@ -172,7 +182,8 @@ class _FakeRedis:
         assert groupname == CORPUS_CONSUMER_GROUP
         if self.raise_on_ack:
             raise ConnectionError("simulated process failure immediately before XACK")
-        for event_id in ids:
+        for stream_id in ids:
+            event_id = self._event_ids[stream_id]
             with sqlite3.connect(self.store.path) as connection:
                 found = connection.execute(
                     "SELECT 1 FROM corpus_event_receipts WHERE event_id = ?",
@@ -181,10 +192,10 @@ class _FakeRedis:
             if found is None:
                 raise AssertionError("XACK happened before the SQLite receipt committed")
             with self._lock:
-                self.acks.append(event_id)
+                self.acks.append(stream_id)
                 self.pending_messages = [
                     message for message in self.pending_messages
-                    if message[0].decode("ascii") != event_id
+                    if message[0].decode("ascii") != stream_id
                 ]
         return len(ids)
 

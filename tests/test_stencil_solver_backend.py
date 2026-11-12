@@ -113,7 +113,7 @@ def test_solver_factory_registers_and_selects_a_second_backend() -> None:
 
 def test_fake_backend_can_be_injected_at_transformer_component_boundary() -> None:
     family = _domino_family()
-    backend = _FakeOptimalBackend()
+    backend = _FakeOptimalBackend(name="fake-transformer-boundary")
     result = stencil._solve_region(
         [0, 1], width=2, height=1, family=family, solver_backend=backend,
     )

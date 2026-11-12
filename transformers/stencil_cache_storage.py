@@ -1096,7 +1096,7 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
         except Exception as exc:
             logger.warning(
                 "Redis stencil cache unavailable at %s:%d db=%d; "
-                "persistent caching temporarily disabled (%s)",
+                "persistent caching disabled temporarily (%s)",
                 _REDIS_HOST, _REDIS_PORT, _REDIS_DB, exc,
             )
 
@@ -1137,13 +1137,35 @@ def redis_persistent_cache(namespace: str) -> Callable[[F], F]:
 
             bound = function_signature.bind(*args, **kwargs)
             bound.apply_defaults()
-            try:
-                shape_key = bound.arguments["shape_key"]
-                family = bound.arguments["family"]
-            except KeyError as exc:
+            positional_parameters = tuple(
+                parameter.name
+                for parameter in function_signature.parameters.values()
+                if parameter.kind in (
+                    parameter.POSITIONAL_ONLY,
+                    parameter.POSITIONAL_OR_KEYWORD,
+                )
+            )
+
+            def semantic_argument(
+                aliases: tuple[str, ...], position: int, label: str,
+            ) -> Any:
+                for alias in aliases:
+                    if alias in bound.arguments:
+                        return bound.arguments[alias]
+                if position < len(positional_parameters):
+                    return bound.arguments[positional_parameters[position]]
                 raise TypeError(
-                    "persistent stencil solver requires shape_key and family arguments"
-                ) from exc
+                    f"persistent stencil solver requires a {label} argument"
+                )
+
+            shape_key = semantic_argument(
+                ("shape_key", "_shape_key"), 0, "shape_key",
+            )
+            family = semantic_argument(
+                ("family", "_family", "selected_family"), 2, "family",
+            )
+            if not isinstance(shape_key, bytes):
+                raise TypeError("persistent stencil solver shape_key must be bytes")
 
             try:
                 cached_record = store.get_result_record(shape_key, family)
