@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import sqlite3
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -151,7 +152,6 @@ def test_store_migrates_raw_spool_v1_to_normalized_v2_with_backup(
 
 
 def test_instance_sighting_and_solver_attempt_materialize_with_identity() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         store = SQLiteCorpusStore(Path(directory) / "corpus.sqlite3")
@@ -193,7 +193,6 @@ def test_instance_sighting_and_solver_attempt_materialize_with_identity() -> Non
 
 
 def test_duplicate_receipt_is_idempotent_but_conflicting_payload_is_rejected() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         store = SQLiteCorpusStore(Path(directory) / "corpus.sqlite3")
@@ -217,7 +216,6 @@ def test_duplicate_receipt_is_idempotent_but_conflicting_payload_is_rejected() -
 
 
 def test_attempt_before_instance_sighting_is_deferred_without_a_receipt() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         store = SQLiteCorpusStore(Path(directory) / "corpus.sqlite3")
@@ -231,7 +229,6 @@ def test_attempt_before_instance_sighting_is_deferred_without_a_receipt() -> Non
 
 
 def test_spool_ingestion_removes_raw_row_in_the_same_transaction() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "corpus.sqlite3"
@@ -255,7 +252,6 @@ def test_spool_ingestion_removes_raw_row_in_the_same_transaction() -> None:
 
 
 def test_replaying_spooled_event_after_stream_ingest_only_deletes_spool_row() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "corpus.sqlite3"
@@ -282,7 +278,6 @@ def test_store_rejects_a_database_from_a_newer_schema(tmp_path: Path) -> None:
 
 
 def test_each_instance_sighting_updates_global_and_path_aggregates() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         store = SQLiteCorpusStore(Path(directory) / "corpus.sqlite3")
@@ -314,7 +309,6 @@ def test_each_instance_sighting_updates_global_and_path_aggregates() -> None:
 
 
 def test_spool_row_changed_after_read_is_not_deleted_or_materialized() -> None:
-    import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "corpus.sqlite3"

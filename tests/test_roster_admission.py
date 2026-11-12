@@ -30,6 +30,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+
+import websockets
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -221,7 +223,6 @@ class TestConnectAdmission:
     async def _patched_connect(
         self, monkeypatch: Any, router: RelayRouter, ws_for_url: Dict[str, Any],
     ) -> None:
-        import websockets
 
         async def fake_connect(url: str, **_kw: Any) -> Any:
             ws = ws_for_url.get(url)
@@ -292,7 +293,6 @@ class TestConnectAdmission:
         b_attempts: List[int] = []
         ws_a = good()
 
-        import websockets
 
         async def fake_connect(url: str, **_kw: Any) -> Any:
             if url == "ws://a:1":
@@ -327,7 +327,6 @@ class TestConnectAdmission:
             json.loads(sent[-1])["id"], [{"internalName": "m1"}],
         )])
 
-        import websockets
 
         async def flaky_connect(url: str, **_kw: Any) -> Any:
             attempts.append(1)

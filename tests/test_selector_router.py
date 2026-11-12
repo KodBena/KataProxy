@@ -44,6 +44,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+
+import websockets
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -67,6 +69,7 @@ from router import (  # noqa: E402
     SyntheticCallbackOrigin,
 )
 from sproxy_config import _parse_selector_models  # noqa: E402
+from proxy_server import _build_advertised_capabilities  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +811,6 @@ class TestFailureBudget:
         # to be a no-op so the loop iterates immediately. After the
         # budget is consumed the label transitions to unhealthy and
         # the loop exits.
-        import websockets
 
         async def always_fail(*args: Any, **kwargs: Any) -> _MockWebSocket:
             raise ConnectionError("simulated upstream down")
@@ -835,7 +837,6 @@ class TestFailureBudget:
     ) -> None:
         # First attempt fails, second succeeds. Budget should not be
         # exhausted; label should be in _connections.
-        import websockets
 
         attempts = {"n": 0}
 
@@ -876,26 +877,22 @@ class TestSelectorAdvertisement:
     def test_selector_advertised_when_role_is_selector(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # _build_advertised_capabilities reads cfg.ROLE; patch it.
         monkeypatch.setattr(cfg, "ROLE", "SELECTOR")
-        from proxy_server import _build_advertised_capabilities
         advertised = _build_advertised_capabilities()
         assert "selector" in advertised
         assert advertised["selector"] == {}
 
     def test_selector_not_advertised_when_role_is_leaf(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cfg, "ROLE", "LEAF")
-        from proxy_server import _build_advertised_capabilities
         advertised = _build_advertised_capabilities()
         assert "selector" not in advertised
 
     def test_selector_not_advertised_when_role_is_relay(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(cfg, "ROLE", "RELAY")
-        from proxy_server import _build_advertised_capabilities
         advertised = _build_advertised_capabilities()
         assert "selector" not in advertised
 
     def test_role_check_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # cfg.ROLE.upper() in _build_advertised_capabilities.
         monkeypatch.setattr(cfg, "ROLE", "selector")
-        from proxy_server import _build_advertised_capabilities
         advertised = _build_advertised_capabilities()
         assert "selector" in advertised
