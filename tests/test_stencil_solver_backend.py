@@ -122,7 +122,19 @@ def test_solver_factory_registers_and_selects_a_second_backend() -> None:
     assert backend.identity.backend_name == name
 
 
-def test_fake_backend_can_be_injected_at_transformer_component_boundary() -> None:
+def test_fake_backend_can_be_injected_at_transformer_component_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This test covers dependency injection, not Redis cache reuse. A globally
+    # cached optimal cover is reusable across backends and would skip solve().
+    def solve_without_persistent_cache(
+        request: SolverCacheRequest,
+    ) -> tuple[bool, int, bytes]:
+        return stencil._solve_component_uncached(request).result
+
+    monkeypatch.setattr(
+        stencil, "_solve_component_cached", solve_without_persistent_cache,
+    )
     family = _domino_family()
     backend = _FakeOptimalBackend(name="fake-transformer-boundary")
     result = stencil._solve_region(
