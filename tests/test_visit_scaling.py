@@ -34,8 +34,8 @@ if str(_PROXY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROXY_ROOT))
 
 from katago import AnalyzeResponse, TurnIndex  # noqa: E402
+from middleware.adaptive_errors import AdaptiveConfigurationError  # noqa: E402
 from middleware.adaptive_reevaluate import (  # noqa: E402
-    AdaptiveConfigurationError,
     TurnView,
 )
 from middleware.visit_scaling import (  # noqa: E402

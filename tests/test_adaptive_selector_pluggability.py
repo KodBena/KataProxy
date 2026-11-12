@@ -49,8 +49,8 @@ from katago import (  # noqa: E402
     MoveIndex,
     TurnIndex,
 )
+from middleware.adaptive_errors import AdaptiveConfigurationError  # noqa: E402
 from middleware.adaptive_reevaluate import (  # noqa: E402
-    AdaptiveConfigurationError,
     AdaptiveState,
     MoveView,
     TurnView,

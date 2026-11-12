@@ -85,7 +85,7 @@ from katago import (  # noqa: E402
 )
 from middleware.keep_alive import KeepAliveMiddleware  # noqa: E402
 from middleware.session_middleware import SessionCapabilities  # noqa: E402
-from router import SelectorRouter  # noqa: E402
+from router import SelectorModel, SelectorRouter  # noqa: E402
 
 
 logging.basicConfig(
@@ -190,7 +190,8 @@ def _populate_selector(
     router: SelectorRouter, phantoms: dict[str, _PhantomLeaf],
 ) -> None:
     """Bypass SelectorRouter.start() and inject phantom LEAF connections."""
-    for label, _url in router._models:
+    for model in router._models:
+        label = model.label
         router._url_for_label[label] = f"ws://phantom-{label}:0"
         router._failure_budget[label] = router._max_connect_failures
     for label, phantom in phantoms.items():
@@ -235,8 +236,8 @@ async def run_scenario() -> bool:
     # SELECTOR with two named upstreams.
     router = SelectorRouter(
         models=(
-            ("strong", "ws://upstream-strong:0"),
-            ("weak", "ws://upstream-weak:0"),
+            SelectorModel("strong", "ws://upstream-strong:0"),
+            SelectorModel("weak", "ws://upstream-weak:0"),
         ),
         max_connect_failures=3,
     )

@@ -64,6 +64,7 @@ from katago import (  # noqa: E402
 )
 from pubsub_hub import CoalescingPolicy  # noqa: E402
 from router import (  # noqa: E402
+    SelectorModel,
     SelectorRouter,
     SelectorStartupError,
     SyntheticCallbackOrigin,
@@ -111,7 +112,10 @@ class _MockWebSocket:
 
 
 def _make_router(
-    models: tuple[tuple[str, str], ...] = (("strong", "ws://h1:1"), ("weak", "ws://h2:2")),
+    models: tuple[SelectorModel, ...] = (
+        SelectorModel("strong", "ws://h1:1"),
+        SelectorModel("weak", "ws://h2:2"),
+    ),
     max_connect_failures: int = 3,
 ) -> SelectorRouter:
     """Construct a SelectorRouter without starting it."""
@@ -302,8 +306,8 @@ class TestWireModelClassification:
 class TestEngineModelInjection:
     async def test_configured_label_mints_engine_model(self) -> None:
         router = _make_router(models=(
-            ("main", "ws://h1:1", "b6c96-s1-d1"),
-            ("alt", "ws://h1:1", "b6c96-s2-d2"),
+            SelectorModel("main", "ws://h1:1", "b6c96-s1-d1"),
+            SelectorModel("alt", "ws://h1:1", "b6c96-s2-d2"),
         ))
         sockets = _populate_post_start_state(
             router, healthy_labels=["main", "alt"]
@@ -345,8 +349,8 @@ class TestEngineModelInjection:
         # client-supplied model value) has no meaning there and a
         # multi-model engine would hard-refuse it.
         router = _make_router(models=(
-            ("main", "ws://h1:1", "b6c96-s1-d1"),
-            ("alt", "ws://h2:2", "b6c96-s2-d2"),
+            SelectorModel("main", "ws://h1:1", "b6c96-s1-d1"),
+            SelectorModel("alt", "ws://h2:2", "b6c96-s2-d2"),
         ))
         sockets = _populate_post_start_state(
             router, healthy_labels=["main", "alt"]
@@ -382,14 +386,20 @@ class TestSelectorStartupValidation:
 
     async def test_duplicate_labels_raises(self) -> None:
         router = _make_router(
-            models=(("strong", "ws://h1:1"), ("strong", "ws://h2:2")),
+            models=(
+                SelectorModel("strong", "ws://h1:1"),
+                SelectorModel("strong", "ws://h2:2"),
+            ),
         )
         with pytest.raises(SelectorStartupError, match="duplicate label"):
             await router.start()
 
     async def test_duplicate_label_message_names_label(self) -> None:
         router = _make_router(
-            models=(("modelA", "ws://h1:1"), ("modelA", "ws://h2:2")),
+            models=(
+                SelectorModel("modelA", "ws://h1:1"),
+                SelectorModel("modelA", "ws://h2:2"),
+            ),
         )
         with pytest.raises(SelectorStartupError, match="'modelA'"):
             await router.start()

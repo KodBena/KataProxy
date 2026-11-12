@@ -33,7 +33,7 @@ import sys
 
 import websockets
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import pytest
 
@@ -62,7 +62,9 @@ def _models_reply(probe_id: str, entries: List[Dict[str, Any]]) -> str:
 class _ScriptedWs:
     """Replays scripted recv frames; captures sends; records close."""
 
-    def __init__(self, script) -> None:
+    def __init__(
+        self, script: Callable[[list[str]], list[str]] | list[str],
+    ) -> None:
         # script: callable(sent_frames) -> list of frames to serve, or
         # a plain list. Evaluated lazily so replies can echo probe ids.
         self._script = script
@@ -75,8 +77,8 @@ class _ScriptedWs:
 
     async def recv(self) -> str:
         frames = (
-            self._script(self.sent) if callable(self._script)
-            else self._script
+            self._script if isinstance(self._script, list)
+            else self._script(self.sent)
         )
         if self._served >= len(frames):
             # Nothing more scripted: park forever. An Event (never a
@@ -102,7 +104,10 @@ class _ScriptedWs:
 
 
 def _probe_id_of(ws: _ScriptedWs) -> str:
-    return json.loads(ws.sent[0])["id"]
+    message = json.loads(ws.sent[0])
+    if not isinstance(message, dict) or not isinstance(message.get("id"), str):
+        raise AssertionError("scripted websocket frame has no string id")
+    return message["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +292,10 @@ class TestConnectAdmission:
         same reconnect-with-backoff as a disconnected member, not stay
         permanently absent until a proxy restart."""
         router = _relay(["ws://a:1", "ws://b:2"])
-        good = lambda: _ScriptedWs(lambda sent: [_models_reply(  # noqa: E731
-            json.loads(sent[-1])["id"], [{"internalName": "m1"}],
-        )])
+        def good() -> _ScriptedWs:
+            return _ScriptedWs(lambda sent: [_models_reply(
+                json.loads(sent[-1])["id"], [{"internalName": "m1"}],
+            )])
         b_attempts: List[int] = []
         ws_a = good()
 

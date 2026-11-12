@@ -48,8 +48,8 @@ from katago import (  # noqa: E402
     KataGoQuery,
     KataGoResponse,
 )
+from middleware.adaptive_errors import AdaptiveConfigurationError  # noqa: E402
 from middleware.adaptive_reevaluate import (  # noqa: E402
-    AdaptiveConfigurationError,
     _is_phase3_engaged,
     _required_include_flags,
     adaptive_reevaluate,

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, cast
 
 import pytest
 
@@ -87,7 +87,7 @@ def _make_session() -> Tuple[ClientSession, _FakeWs, _RecordingHub]:
 
 def _only_reply(ws: _FakeWs) -> Dict[str, Any]:
     assert len(ws.sent) == 1, f"expected exactly one reply, got {ws.sent!r}"
-    return json.loads(ws.sent[0])
+    return cast(Dict[str, Any], json.loads(ws.sent[0]))
 
 
 # ---------------------------------------------------------------------------
