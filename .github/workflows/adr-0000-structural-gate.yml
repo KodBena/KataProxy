@@ -1,0 +1,35 @@
+name: ADR-0000 structural and type gate
+
+on:
+  push:
+    branches: [next]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  structural-and-types:
+    name: Import contract, stencil tests, and strict typing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime and development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Check the complete Python import surface
+        run: python -m pytest -q tests/test_import_contract.py
+
+      - name: Run stencil solver, cache, and corpus conformance tests
+        run: python -m pytest -q tests/test_stencil_*.py
+
+      - name: Run strict type checking
+        run: python -m mypy .
