@@ -40,7 +40,7 @@ from transformers.stencil_corpus_publisher import (
     publish_instance_seen,
 )
 from transformers.stencil_solver_api import STENCIL_CANONICALIZATION_VERSION
-from transformers.stencil_solver_runtime import canonical_problem_from_key
+from transformers.stencil_solver_problem import canonical_problem_from_key
 
 
 def _fallback_keys() -> tuple[bytes, ...]:

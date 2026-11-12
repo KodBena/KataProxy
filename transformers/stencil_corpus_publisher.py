@@ -19,8 +19,11 @@ from transformers.stencil_cache_storage import create_redis_client
 from transformers.stencil_corpus_events import (
     ProducerPath,
     make_instance_seen_event,
+    parse_event,
     serialize_event,
+    utc_timestamp,
 )
+from transformers.stencil_solver_problem import canonical_problem_from_key
 
 logger = logging.getLogger("kataproxy.stencil_corpus_publisher")
 
@@ -164,8 +167,6 @@ class SQLiteEventSpool:
 
     def append(self, payload: bytes) -> bool:
         """Persist one canonical event; return False for an identical replay."""
-        from transformers.stencil_corpus_events import parse_event
-
         event = parse_event(payload)
         if serialize_event(event) != payload:
             raise ValueError("SQLite spool accepts only canonical serialized event bytes")
@@ -187,8 +188,6 @@ class SQLiteEventSpool:
                     )
                 connection.commit()
                 return False
-            from transformers.stencil_corpus_events import utc_timestamp
-
             connection.execute(
                 "INSERT INTO stencil_corpus_spool_events "
                 "(event_id, event_json, payload_sha256, queued_at_utc) "
@@ -291,8 +290,6 @@ def publish_instance_seen(
     if target is None:
         return None
     try:
-        from transformers.stencil_solver_runtime import canonical_problem_from_key
-
         problem = canonical_problem_from_key(shape_key, family)
         event = make_instance_seen_event(problem, shape_key, producer_path)
         return target.publish(event)
