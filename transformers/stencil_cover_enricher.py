@@ -65,7 +65,7 @@ from transformers.stencil_solver_geometry import (
     verify_component_placements as _verify_component_placements,
 )
 from transformers.stencil_solver_runtime import solve_component as _solve_with_backend
-from transformers.stencil_corpus_publisher import publish_instance_seen
+from transformers.stencil_corpus_publisher import publish_instance_seen_many
 
 logger = logging.getLogger("kataproxy.stencil_cover_enricher")
 
@@ -633,14 +633,32 @@ register_cache_invalidator(
 )
 
 
-def _solve_region(
-    region: Sequence[int], width: int, height: int,
+# (original component cells, canonical key, frame in board coordinates)
+_PreparedComponent = Tuple[Tuple[int, ...], bytes, ComponentFrame]
+
+
+def _prepare_region_components(
+    region: Sequence[int],
+    width: int,
+    height: int,
+    family: Sequence[Stencil],
+) -> List[_PreparedComponent]:
+    """Canonicalize a region's components before any solver-cache lookups."""
+    return [
+        (tuple(component), *_component_shape_key(component, width, family))
+        for component in _connected_components(region, width, height)
+    ]
+
+
+def _solve_prepared_region(
+    prepared_components: Sequence[_PreparedComponent],
+    width: int,
     family: Sequence[Stencil],
     time_limit_ms: int = _SOLVER_TIME_LIMIT_MS,
     solver_backend: SolverBackend = DEFAULT_SOLVER_BACKEND,
 ) -> Dict[str, Any]:
-    """Decompose, expose, and solve components through the selected solver port."""
-    if not region:
+    """Solve prepared components; corpus capture has already happened."""
+    if not prepared_components:
         return {
             "components": [],
             "placements": [],
@@ -657,11 +675,7 @@ def _solve_region(
     components: List[Dict[str, Any]] = []
     placements: List[Dict[str, Any]] = []
     statuses: List[int] = []
-    for component in _connected_components(region, width, height):
-        shape_key, frame = _component_shape_key(component, width, family)
-        # A component sighting is recorded before either the local LRU or
-        # shared Redis result cache can return early. A hit is not an attempt.
-        publish_instance_seen(shape_key, family_key, "foreground")
+    for component, shape_key, frame in prepared_components:
         request = SolverCacheRequest(
             shape_key=shape_key,
             family=family_key,
@@ -709,6 +723,29 @@ def _solve_region(
         "status": "fallback" if fallback else ("feasible" if feasible else "optimal"),
     }
 
+
+def _solve_region(
+    region: Sequence[int], width: int, height: int,
+    family: Sequence[Stencil],
+    time_limit_ms: int = _SOLVER_TIME_LIMIT_MS,
+    solver_backend: SolverBackend = DEFAULT_SOLVER_BACKEND,
+) -> Dict[str, Any]:
+    """Capture this region's component sightings together before solving."""
+    if not region:
+        return _solve_prepared_region(
+            (), width, family, time_limit_ms, solver_backend,
+        )
+    family_key = tuple(family)
+    prepared = _prepare_region_components(region, width, height, family_key)
+    publish_instance_seen_many(
+        tuple(shape_key for _component, shape_key, _frame in prepared),
+        family_key,
+        "foreground",
+    )
+    return _solve_prepared_region(
+        prepared, width, family_key, time_limit_ms, solver_backend,
+    )
+
 def _build_stencil_cover(
     opaque: Dict[str, Any],
     board: Sequence[Optional[str]],
@@ -721,8 +758,24 @@ def _build_stencil_cover(
     positive_cells, negative_cells = _ownership_regions(
         ownership, board, width, height, threshold,
     )
-    positive = _solve_region(positive_cells, width, height, STENCIL_FAMILY, solver_backend=solver_backend)
-    negative = _solve_region(negative_cells, width, height, STENCIL_FAMILY, solver_backend=solver_backend)
+    family_key = tuple(STENCIL_FAMILY)
+    positive_components = _prepare_region_components(
+        positive_cells, width, height, family_key,
+    )
+    negative_components = _prepare_region_components(
+        negative_cells, width, height, family_key,
+    )
+    sighting_keys = tuple(
+        shape_key for _component, shape_key, _frame
+        in (*positive_components, *negative_components)
+    )
+    publish_instance_seen_many(sighting_keys, family_key, "foreground")
+    positive = _solve_prepared_region(
+        positive_components, width, family_key, solver_backend=solver_backend,
+    )
+    negative = _solve_prepared_region(
+        negative_components, width, family_key, solver_backend=solver_backend,
+    )
     return {
         "version": 2,
         "threshold": threshold,
