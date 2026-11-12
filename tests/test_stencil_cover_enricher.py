@@ -3,43 +3,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import threading
+import sys
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
 
 import transformers.stencil_cover_enricher as stencil
-from AbstractProxy.proxy_core import ClientId
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, make_katago_link
-from transformers.stencil_bulk_solver import (
-    BULK_TIME_LIMIT_MS,
-    StencilBulkSolver,
-    _validate_bulk_result,
-)
-from transformers.stencil_cache_storage import (
-    SolverCacheCandidate,
-    SolverCacheRequest,
-    SolverWorkProfile,
-)
-from transformers.stencil_solver_api import (
-    BackendStatusReported,
-    Incumbent,
-    LowerBoundUnavailable,
-    NativeEffortUnavailable,
-    NativeEffortLimit,
-    NoNativeEffortLimit,
-    NoNativeEffortReason,
-    NoSolverFailure,
-    OutcomeStatus,
-    PlacementWitness,
-    ProvenLowerBound,
-    SolverBudget,
-    SolverIdentity,
-    SolverOutcome,
-)
-from transformers.stencil_solver_geometry import ComponentFrame, Stencil
+from AbstractProxy.proxy_core import ClientId
 
 
 class _MemoryRedis:
@@ -239,62 +211,6 @@ class _FakeRedisClient:
     def publish(self, _channel: str, _message: bytes) -> int:
         return 1
 
-
-def _fake_redis_client(backend: _MemoryRedis) -> _FakeRedisClient:
-    return _FakeRedisClient(
-        backend,
-        host="127.0.0.1",
-        port=6379,
-        db=7,
-        socket_connect_timeout=0.25,
-        socket_timeout=0.25,
-        decode_responses=False,
-    )
-
-
-class _CacheRequestBackend:
-    """Identity-bearing fake port used to exercise the typed cache boundary."""
-
-    def __init__(self, identity: SolverIdentity | None = None) -> None:
-        if identity is None:
-            configuration = '{"purpose":"cache-test"}'
-            identity = SolverIdentity(
-                backend_name="cache-test",
-                backend_version="1",
-                adapter_version="cache-test-v1",
-                configuration_json=configuration,
-                configuration_fingerprint=hashlib.sha256(
-                    configuration.encode("utf-8"),
-                ).hexdigest(),
-            )
-        self._identity = identity
-
-    @property
-    def identity(self) -> SolverIdentity:
-        return self._identity
-
-    def solve(self, problem: Any, budget: Any) -> SolverOutcome:
-        raise AssertionError("the cache test port must not solve a problem")
-
-
-def _cache_request(
-    shape_key: bytes,
-    family: tuple[Stencil, ...],
-    *,
-    wall_ms: int = 250,
-    backend: _CacheRequestBackend | None = None,
-) -> SolverCacheRequest:
-    selected = _CacheRequestBackend() if backend is None else backend
-    return SolverCacheRequest(
-        shape_key=shape_key,
-        family=family,
-        backend=selected,
-        budget=SolverBudget(
-            wall_time_limit_ms=wall_ms,
-            native_effort_limit=NoNativeEffortLimit(),
-            policy_id=f"cache-test-{wall_ms}ms",
-        ),
-    )
 
 
 def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
@@ -879,37 +795,55 @@ def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None
 def test_redis_persistent_cache_round_trips_best_result_across_budgets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
-    monkeypatch.setattr(
-        storage, "create_redis_client", lambda: _fake_redis_client(backend),
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(
+            Redis=lambda **kwargs: _FakeRedisClient(backend, **kwargs),
+        ),
     )
     calls: List[int] = []
-    family: tuple[Stencil, ...] = (("dot", ((0, 0),)),)
-    result = (True, 0, b"\x01\x00\x00\x01\x00\x00")
 
-    def solve(request: SolverCacheRequest) -> SolverCacheCandidate:
-        calls.append(request.budget.wall_time_limit_ms)
-        return SolverCacheCandidate(result, {"disposition": "legacy_unknown"})
+    def solve(
+        shape_key: bytes,
+        time_limit_ms: int,
+        family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(time_limit_ms)
+        return True, 0, b"\x01\x00\x00\x01\x00\x00"
 
     first_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
     second_wrapper = storage.redis_persistent_cache("round-trip-test")(solve)
+    family = (("dot", ((0, 0),)),)
 
-    assert first_wrapper(_cache_request(b"canonical-shape", family)) == result
+    assert first_wrapper(b"canonical-shape", 250, family) == (
+        True, 0, b"\x01\x00\x00\x01\x00\x00",
+    )
     # Budget is intentionally not part of the persistent problem key.
-    assert second_wrapper(
-        _cache_request(b"canonical-shape", family, wall_ms=10_000),
-    ) == result
+    assert second_wrapper(b"canonical-shape", 10_000, family) == (
+        True, 0, b"\x01\x00\x00\x01\x00\x00",
+    )
     assert calls == [250]
 
 
 def test_foreground_persistent_write_registers_selected_work_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import (
+        NoNativeEffortLimit, SolverBudget, SolverIdentity,
+    )
 
     backend = _MemoryRedis()
-    monkeypatch.setattr(
-        storage, "create_redis_client", lambda: _fake_redis_client(backend),
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(
+            Redis=lambda **kwargs: _FakeRedisClient(backend, **kwargs),
+        ),
     )
     family = (("dot", ((0, 0),)),)
     configuration = '{"strategy":"foreground-profile-test"}'
@@ -928,22 +862,24 @@ def test_foreground_persistent_write_registers_selected_work_profile(
     profile = storage.make_solver_work_profile(identity, budget)
     encoded = stencil._encode_cached_placements([("dot", (0,))], family)
     calls: list[bytes] = []
-    selected_backend = _CacheRequestBackend(identity)
 
-    def solve(request: SolverCacheRequest) -> SolverCacheCandidate:
-        assert request.budget == budget
-        assert request.family == family
-        assert request.backend is selected_backend
-        assert request.work_profile == profile
-        calls.append(request.shape_key)
-        return SolverCacheCandidate(
-            (True, 0, encoded), {"disposition": "legacy_unknown"},
-        )
+    def solve(
+        shape_key: bytes,
+        time_limit_ms: int,
+        selected_family: Any,
+        selected_backend: Any,
+        work_profile: storage.SolverWorkProfile,
+    ) -> tuple[bool, int, bytes]:
+        assert time_limit_ms == 250
+        assert selected_family == family
+        assert selected_backend is None
+        assert work_profile == profile
+        calls.append(shape_key)
+        return True, 0, encoded
 
     wrapped = storage.redis_persistent_cache("foreground-profile-test")(solve)
     shape_key = b"foreground-profile-shape"
-    request = SolverCacheRequest(shape_key, family, selected_backend, budget)
-    assert wrapped(request) == (True, 0, encoded)
+    assert wrapped(shape_key, 250, family, None, profile) == (True, 0, encoded)
     assert calls == [shape_key]
 
     store = storage.RedisStencilStore(backend, "foreground-profile-test")
@@ -957,13 +893,18 @@ def test_foreground_persistent_write_registers_selected_work_profile(
 def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
-    monkeypatch.setattr(
-        storage, "create_redis_client", lambda: _fake_redis_client(backend),
+    monkeypatch.setitem(
+        sys.modules,
+        "redis",
+        SimpleNamespace(
+            Redis=lambda **kwargs: _FakeRedisClient(backend, **kwargs),
+        ),
     )
     calls: List[int] = []
-    family: tuple[Stencil, ...] = (
+    family = (
         ("dot", ((0, 0),)),
         ("domino", ((0, 0), (0, 1))),
     )
@@ -972,21 +913,21 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
         stencil._encode_cached_placements([("domino", (0, 1))], family),
     )
 
-    def solve(request: SolverCacheRequest) -> SolverCacheCandidate:
-        calls.append(request.budget.wall_time_limit_ms)
-        return SolverCacheCandidate(
-            approximation, {"disposition": "legacy_unknown"},
-        )
+    def solve(
+        shape_key: bytes,
+        time_limit_ms: int,
+        family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(time_limit_ms)
+        return approximation
 
     wrapped = storage.redis_persistent_cache("approximation-test")(solve)
     shape_key = b"canonical-hard-shape"
 
-    assert wrapped(_cache_request(shape_key, family)) == approximation
+    assert wrapped(shape_key, 250, family) == approximation
     # The approximate cover is a useful cached answer, even under a later
     # request with a different budget; it is not thrown away.
-    assert wrapped(
-        _cache_request(shape_key, family, wall_ms=10_000),
-    ) == approximation
+    assert wrapped(shape_key, 10_000, family) == approximation
     assert calls == [250]
 
     store = storage.RedisStencilStore(backend, "approximation-test")
@@ -1008,6 +949,7 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
 
 
 def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "upgrade-test")
@@ -1058,6 +1000,7 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
 
 
 def test_redis_stencil_store_isolates_hard_keys_by_family() -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "family-isolation-test")
@@ -1078,6 +1021,7 @@ def test_redis_stencil_store_isolates_hard_keys_by_family() -> None:
 
 
 def test_pending_queue_migrates_existing_hard_components_once() -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "queue-migration-test")
@@ -1099,6 +1043,7 @@ def test_pending_queue_migrates_existing_hard_components_once() -> None:
 
 
 def test_timeout_metadata_retires_pending_work_and_better_results_requeue() -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "timeout-lifecycle-test")
@@ -1145,6 +1090,7 @@ def test_timeout_metadata_retires_pending_work_and_better_results_requeue() -> N
 
 
 def test_timeout_metadata_uses_result_current_at_atomic_retirement() -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "timeout-race-test")
@@ -1196,7 +1142,8 @@ class _StaticSolverBackend:
     """Small test backend that exposes a legacy compact fixture as a typed outcome."""
 
     def __init__(self, family: Any, encoded: bytes, *, optimal: bool) -> None:
-
+        import hashlib
+        from transformers.stencil_solver_api import SolverIdentity
         config = '{"fixture":"static"}'
         self.identity = SolverIdentity(
             backend_name="test-static",
@@ -1211,7 +1158,12 @@ class _StaticSolverBackend:
         self.calls: List[int] = []
 
     def solve(self, problem: Any, budget: Any) -> Any:
-
+        from transformers.stencil_solver_api import (
+            BackendStatusReported, Incumbent, LowerBoundUnavailable,
+            NativeEffortUnavailable, NoNativeEffortReason, NoSolverFailure,
+            OutcomeStatus, PlacementWitness, ProvenLowerBound, SolverOutcome,
+        )
+        from transformers.stencil_cover_enricher import ComponentFrame
         self.calls.append(budget.wall_time_limit_ms)
         frame = ComponentFrame(
             board_width=problem.width, transform=0, offset_y=0, offset_x=0,
@@ -1237,6 +1189,11 @@ class _StaticSolverBackend:
 
 
 def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
+    from transformers.stencil_bulk_solver import (
+        BULK_TIME_LIMIT_MS,
+        StencilBulkSolver,
+    )
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "bulk-optimal-test")
@@ -1266,6 +1223,11 @@ def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
 
 
 def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
+    from transformers.stencil_bulk_solver import (
+        BULK_TIME_LIMIT_MS,
+        StencilBulkSolver,
+    )
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "bulk-timeout-test")
@@ -1304,6 +1266,7 @@ def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
 
 
 def test_bulk_worker_rejects_a_malformed_or_non_covering_solution() -> None:
+    from transformers.stencil_bulk_solver import _validate_bulk_result
 
     family = (("domino", ((0, 0), (0, 1))),)
     shape_key, _frame = stencil._component_shape_key(
@@ -1320,7 +1283,7 @@ def test_local_solver_cache_invalidation_clears_request_lru() -> None:
         (0,), board_width=1, family=family,
     )
     stencil._solve_component_cached.cache_clear()
-    stencil._solve_component_cached(_cache_request(shape_key, family, wall_ms=100))
+    stencil._solve_component_cached(shape_key, 100, family)
     assert stencil._solve_component_cached.cache_info().currsize == 1
 
     stencil._invalidate_component_cache()
@@ -1339,19 +1302,20 @@ def test_component_specific_invalidation_preserves_other_lru_entries() -> None:
         (0, 1), board_width=2, family=family,
     )
     stencil._solve_component_cached.cache_clear()
-    stencil._solve_component_cached(_cache_request(singleton_key, family, wall_ms=1_000))
-    stencil._solve_component_cached(_cache_request(domino_key, family, wall_ms=1_000))
+    stencil._solve_component_cached(singleton_key, 1_000, family)
+    stencil._solve_component_cached(domino_key, 1_000, family)
     assert stencil._solve_component_cached.cache_info().currsize == 2
 
     stencil._invalidate_component_cache(singleton_key)
     assert stencil._solve_component_cached.cache_info().currsize == 1
     before_hits = stencil._solve_component_cached.cache_info().hits
-    stencil._solve_component_cached(_cache_request(domino_key, family, wall_ms=1_000))
+    stencil._solve_component_cached(domino_key, 1_000, family)
     assert stencil._solve_component_cached.cache_info().hits == before_hits + 1
     stencil._solve_component_cached.cache_clear()
 
 
 def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None:
+    import threading
 
     family = (("dot", ((0, 0),)),)
     shape_key = b"component-under-solve"
@@ -1361,7 +1325,13 @@ def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None
     release = threading.Event()
     calls: List[int] = []
 
-    def solve(_request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+    def solve(
+        _shape: bytes,
+        _time_limit_ms: int,
+        _family: Any,
+        _backend: Any = None,
+        _work_profile: Any = None,
+    ) -> tuple[bool, int, bytes]:
         calls.append(1)
         if len(calls) == 1:
             started.set()
@@ -1370,10 +1340,9 @@ def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None
         return improved
 
     cache = stencil._InvalidatableSolverCache(solve, maxsize=4)
-    request = _cache_request(shape_key, family)
     results: List[tuple[bool, int, bytes]] = []
     thread = threading.Thread(
-        target=lambda: results.append(cache(request)),
+        target=lambda: results.append(cache(shape_key, 250, family)),
     )
     thread.start()
     assert started.wait(timeout=3.0)
@@ -1384,11 +1353,12 @@ def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None
     assert not thread.is_alive()
     assert results == [improved]
     assert calls == [1, 1]
-    assert cache(request) == improved
+    assert cache(shape_key, 250, family) == improved
     assert calls == [1, 1]
 
 
 def test_cache_invalidation_dispatch_passes_the_changed_shape_key() -> None:
+    import transformers.stencil_cache_storage as storage
 
     namespace = "invalidation-dispatch-test"
     seen: List[bytes] = []
@@ -1401,11 +1371,14 @@ def test_cache_invalidation_dispatch_passes_the_changed_shape_key() -> None:
 
 
 def test_invalidation_payload_skips_self_and_decodes_other_processes() -> None:
+    import transformers.stencil_cache_storage as storage
 
     shape_key = b"canonical-component"
     own_message = storage._invalidation_payload(shape_key)
     assert storage._decode_invalidation_payload(own_message) is None
 
+    import base64
+    import os
 
     # A forked child inherits the module nonce but has a different runtime PID.
     other_process = (
@@ -1423,6 +1396,7 @@ def test_invalidation_payload_skips_self_and_decodes_other_processes() -> None:
 def test_redis_persistent_cache_recovers_after_startup_outage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import transformers.stencil_cache_storage as storage
 
     namespace = "startup-recovery-test"
     backend = _MemoryRedis()
@@ -1450,19 +1424,23 @@ def test_redis_persistent_cache_recovers_after_startup_outage(
         stencil._encode_cached_placements([("dot", (0,))], family),
     )
 
-    def solve(request: SolverCacheRequest) -> SolverCacheCandidate:
-        calls.append(request.budget.wall_time_limit_ms)
-        return SolverCacheCandidate(result, {"disposition": "legacy_unknown"})
+    def solve(
+        _shape_key: bytes,
+        time_limit_ms: int,
+        _family: Any,
+    ) -> tuple[bool, int, bytes]:
+        calls.append(time_limit_ms)
+        return result
 
     wrapped = storage.redis_persistent_cache(namespace)(solve)
-    assert wrapped(_cache_request(shape_key, family)) == result
+    assert wrapped(shape_key, 250, family) == result
     assert calls == [250]
 
     # The reconnecting invalidation listener publishes its client into this
     # registry; a later LRU miss can adopt it without restarting the proxy.
     storage._PERSISTENT_CLIENTS[namespace] = fake_client
-    assert wrapped(_cache_request(shape_key, family, wall_ms=10_000)) == result
-    assert wrapped(_cache_request(shape_key, family, wall_ms=20_000)) == result
+    assert wrapped(shape_key, 10_000, family) == result
+    assert wrapped(shape_key, 20_000, family) == result
     assert calls == [250, 10_000]
 
 
@@ -1470,6 +1448,7 @@ def test_redis_persistent_cache_warns_and_degrades_to_noop(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    import transformers.stencil_cache_storage as storage
 
     class OfflineRedis:
         def __init__(self, **kwargs: Any) -> None:
@@ -1478,28 +1457,25 @@ def test_redis_persistent_cache_warns_and_degrades_to_noop(
         def ping(self) -> None:
             raise ConnectionError("Redis is offline")
 
-    monkeypatch.setattr(
-        storage, "create_redis_client", lambda: OfflineRedis().ping(),
-    )
+    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(Redis=OfflineRedis))
     calls: List[int] = []
 
-    def solve(_request: SolverCacheRequest) -> SolverCacheCandidate:
+    def solve(shape_key: bytes, time_limit_ms: int, family: Any) -> tuple[bool, int, bytes]:
         calls.append(1)
-        return SolverCacheCandidate(
-            (False, 2, b"fallback"), {"disposition": "legacy_unknown"},
-        )
+        return False, 2, b"fallback"
 
     with caplog.at_level("WARNING"):
         decorated = storage.redis_persistent_cache("offline-test")(solve)
 
-    family: tuple[Stencil, ...] = (("dot", ((0, 0),)),)
-    assert decorated(_cache_request(b"shape", family)) == (False, 2, b"fallback")
+    assert decorated(b"shape", 250, ()) == (False, 2, b"fallback")
     assert calls == [1]
     assert "persistent caching disabled" in caplog.text
 
 
 
 def test_v4_reads_v3_rows_as_legacy_unknown_and_ignores_global_timeout() -> None:
+    import base64
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     family = (("dot", ((0, 0),)),)
@@ -1582,6 +1558,7 @@ def _result_provenance(
 
 
 def test_v3_result_arbitration_uses_certified_bound_for_equal_tile_count() -> None:
+    import transformers.stencil_cache_storage as storage
 
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "solver-component-d4-v4")
@@ -1610,7 +1587,8 @@ def test_v3_result_arbitration_uses_certified_bound_for_equal_tile_count() -> No
 
 
 def test_solver_profiles_have_independent_pending_and_timeout_state() -> None:
-
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import SolverBudget, NoNativeEffortLimit, NativeEffortLimit, SolverIdentity
 
     def profile(name: str, wall_ms: int = 10_000) -> storage.SolverWorkProfile:
         config = json.dumps({"variant": name}, sort_keys=True, separators=(",", ":"))
@@ -1665,7 +1643,8 @@ def test_solver_profiles_have_independent_pending_and_timeout_state() -> None:
 
 
 def test_new_profile_is_seeded_from_hard_index_despite_other_profile_timeouts() -> None:
-
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import SolverBudget, NoNativeEffortLimit, SolverIdentity
 
     def profile(name: str) -> storage.SolverWorkProfile:
         config = json.dumps({"variant": name}, sort_keys=True, separators=(",", ":"))
@@ -1702,7 +1681,8 @@ def test_new_profile_is_seeded_from_hard_index_despite_other_profile_timeouts() 
 
 
 def test_better_result_requeues_only_its_origin_profile_and_optimum_clears_all() -> None:
-
+    import transformers.stencil_cache_storage as storage
+    from transformers.stencil_solver_api import SolverBudget, NoNativeEffortLimit, SolverIdentity
 
     def profile(name: str) -> storage.SolverWorkProfile:
         config = json.dumps({"variant": name}, sort_keys=True, separators=(",", ":"))

@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import pytest
+
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_bulk_solver import StencilBulkSolver
 from transformers import stencil_bulk_solver as bulk_module
@@ -27,6 +29,7 @@ from transformers.stencil_solver_api import (
 )
 from transformers.stencil_solver_runtime import solve_component
 from transformers.stencil_cache_storage import (
+    SolverCacheRequest,
     SolverWorkProfile,
     make_solver_work_profile,
 )
@@ -214,7 +217,6 @@ def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
 
 
 def test_feasible_outcome_rejects_a_lower_bound_above_its_incumbent() -> None:
-    import pytest
     incumbent = Incumbent(
         tile_count=2,
         placement_witness=PlacementWitness((
@@ -240,19 +242,29 @@ def test_local_lru_keeps_different_backend_profiles_separate() -> None:
     family = _domino_family()
     calls: list[str] = []
 
-    def invoke(
-        shape_key: bytes, time_limit_ms: int, fam: Any, backend: _FakeOptimalBackend,
-        work_profile: SolverWorkProfile,
-    ) -> tuple[bool, int, bytes]:
-        calls.append(backend.identity.fingerprint)
+    def invoke(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
+        calls.append(request.backend.identity.fingerprint)
         return (True, 0, b"\x01\x00\x00\x02\x00\x00\x00\x01\x00")
 
     cache = stencil._InvalidatableSolverCache(invoke, maxsize=8)
     first = _FakeOptimalBackend(name="same", mode="first")
     second = _FakeOptimalBackend(name="same", mode="second")
-    cache(_domino_key(), 250, family, first)
-    cache(_domino_key(), 250, family, second)
-    cache(_domino_key(), 250, family, first)
+
+    def request(backend: _FakeOptimalBackend) -> SolverCacheRequest:
+        return SolverCacheRequest(
+            shape_key=_domino_key(),
+            family=family,
+            backend=backend,
+            budget=SolverBudget(
+                wall_time_limit_ms=250,
+                native_effort_limit=NoNativeEffortLimit(),
+                policy_id="foreground-250ms",
+            ),
+        )
+
+    cache(request(first))
+    cache(request(second))
+    cache(request(first))
     assert calls == [first.identity.fingerprint, second.identity.fingerprint]
 
 
