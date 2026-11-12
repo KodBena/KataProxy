@@ -105,9 +105,12 @@ class _ScriptedWs:
 
 def _probe_id_of(ws: _ScriptedWs) -> str:
     message = json.loads(ws.sent[0])
-    if not isinstance(message, dict) or not isinstance(message.get("id"), str):
+    if not isinstance(message, dict):
+        raise AssertionError("scripted websocket frame is not an object")
+    probe_id = message.get("id")
+    if not isinstance(probe_id, str):
         raise AssertionError("scripted websocket frame has no string id")
-    return message["id"]
+    return probe_id
 
 
 # ---------------------------------------------------------------------------

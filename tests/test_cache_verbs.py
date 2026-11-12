@@ -48,6 +48,7 @@ from pubsub_hub import LRUCacheStore, PubSubHub  # noqa: E402
 from router import (  # noqa: E402
     InFlightQueryLoad,
     RelayRouter,
+    SelectorModel,
     SelectorRouter,
     SyntheticCallbackOrigin,
 )
@@ -111,8 +112,8 @@ def test_cache_verb_wire_round_trip_keeps_payload() -> None:
 class TestSelectorCacheVerbs:
     def _router(self) -> Tuple[SelectorRouter, Dict[str, _MockWebSocket]]:
         router = SelectorRouter(models=(
-            ("main", "ws://h1:1", "b6c96-s1-d1"),
-            ("plain", "ws://h2:2"),
+            SelectorModel("main", "ws://h1:1", "b6c96-s1-d1"),
+            SelectorModel("plain", "ws://h2:2"),
         ))
         sockets: Dict[str, _MockWebSocket] = {}
         for spec in router._models:

@@ -64,6 +64,7 @@ from middleware.session_middleware import IdentityMiddleware, SessionCapabilitie
 from proxy_logging import Event, Role, get_proxy_logger, set_process_role  # noqa: E402
 from pubsub_hub import PubSubHub  # noqa: E402
 from router import (  # noqa: E402
+    SelectorModel,
     EchoRouter,
     InFlightQueryLoad,
     RelayRouter,
@@ -263,8 +264,8 @@ class TestSelectorCoverage:
     ) -> None:
         router = SelectorRouter(
             models=(
-                ("strong", "ws://h1:1"),
-                ("weak", "ws://h2:2"),
+                SelectorModel("strong", "ws://h1:1"),
+                SelectorModel("weak", "ws://h2:2"),
             ),
             max_connect_failures=3,
         )
@@ -292,7 +293,10 @@ class TestSelectorCoverage:
         self, capture: _CaptureHandler,
     ) -> None:
         router = SelectorRouter(
-            models=(("strong", "ws://h1:1"), ("weak", "ws://h2:2")),
+            models=(
+                SelectorModel("strong", "ws://h1:1"),
+                SelectorModel("weak", "ws://h2:2"),
+            ),
         )
         for label, url, _em in router._models:
             router._url_for_label[label] = url
@@ -316,7 +320,7 @@ class TestSelectorCoverage:
         self, capture: _CaptureHandler,
     ) -> None:
         router = SelectorRouter(
-            models=(("strong", "ws://h1:1"),),
+            models=(SelectorModel("strong", "ws://h1:1"),),
         )
         router._url_for_label["strong"] = "ws://h1:1"
         router._failure_budget["strong"] = 3

@@ -1491,13 +1491,14 @@ class RelayRouter(BackendRouter):
                     )
                     continue
 
-                canonical_id = wire.get("id")
-                if canonical_id is None:
+                raw_canonical_id = wire.get("id")
+                if not isinstance(raw_canonical_id, str):
                     upstream_log.warning(
                         Event.DIAGNOSTIC,
-                        msg=f"response missing 'id' from {url}",
+                        msg=f"response missing string 'id' from {url}",
                     )
                     continue
+                canonical_id = CanonicalId(raw_canonical_id)
 
                 cb = self._callbacks.get(canonical_id)
                 if cb is None:
@@ -2429,13 +2430,14 @@ class SelectorRouter(BackendRouter):
                     )
                     continue
 
-                canonical_id = wire.get("id")
-                if canonical_id is None:
+                raw_canonical_id = wire.get("id")
+                if not isinstance(raw_canonical_id, str):
                     label_log.warning(
                         Event.DIAGNOSTIC,
-                        msg=f"response missing 'id' from label={label!r}",
+                        msg=f"response missing string 'id' from label={label!r}",
                     )
                     continue
+                canonical_id = CanonicalId(raw_canonical_id)
 
                 cb = self._callbacks.get(canonical_id)
                 if cb is None:
