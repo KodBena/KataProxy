@@ -19,6 +19,7 @@ import itertools
 import json
 import math
 import os
+import platform
 import sqlite3
 import statistics
 import sys
@@ -27,6 +28,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.parse import urlsplit
 
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_corpus_events import (
@@ -163,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--corpus-db", default=None)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=100)
+    parser.add_argument("--output-json", default=None, help="write the machine-readable report to this path")
     args = parser.parse_args(argv)
     if args.iterations <= 0 or args.warmup < 0:
         parser.error("--iterations must be positive and --warmup non-negative")
@@ -218,8 +221,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             redis_client_factory=lambda: _RedirectedRedis(redis_client, publisher_stream),
             sqlite_path=root / "unused-spool.sqlite3",
         )
-        os.environ["KATAPROXY_STENCIL_CORPUS_ENABLED"] = "1"
-
+        # The enabled cases pass an explicit publisher and therefore do not
+        # need the process-wide opt-in flag. Keeping the flag unset is vital:
+        # the disabled baseline must never fall through to the default DB 7
+        # publisher or a developer-local spool.
         try:
             direct_redis = lambda: redis_client.xadd(
                 direct_stream, {b"event": next(redis_payload_cycle)},
@@ -288,10 +293,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             redis_client.delete(direct_stream, publisher_stream)
             redis_client.close()
 
-    print(json.dumps({
+    disabled = measurements["capture_disabled_hook"]
+    enabled = measurements["capture_enabled_redis_hook"]
+    parsed_url = urlsplit(args.redis_url)
+    redis_database = parsed_url.path.lstrip("/") or "0"
+    redis_endpoint = (
+        f"{parsed_url.hostname or 'unknown'}:{parsed_url.port or 6379}"
+        f"/db{redis_database}"
+    )
+    report = {
         "environment": {
             "python": sys.version.split()[0],
+            "platform": platform.platform(),
             "redis_version": server_info.get("redis_version"),
+            "redis_endpoint": redis_endpoint,
             "redis_persistence_config": persistence,
             "iterations": args.iterations,
             "warmup": args.warmup,
@@ -302,12 +317,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             ).family_fingerprint,
         },
         "measurements": measurements,
+        "comparison": {
+            "capture_disabled_median_ms": disabled["median_ms"],
+            "capture_enabled_median_ms": enabled["median_ms"],
+            "capture_disabled_p95_ms": disabled["p95_ms"],
+            "capture_enabled_p95_ms": enabled["p95_ms"],
+            "median_overhead_ms": enabled["median_ms"] - disabled["median_ms"],
+            "p95_overhead_ms": enabled["p95_ms"] - disabled["p95_ms"],
+        },
+        "acceptance": {
+            "threshold_status": "pending_engineering_decision",
+            "thresholds_applied": False,
+        },
         "interpretation": (
             "These are synchronous corpus-hook measurements, not total KataGo "
-            "request latency. Canonicalization is measured separately because "
-            "the foreground emits instance_seen after canonicalization."
+            "request latency. Capture-disabled and capture-enabled Redis cases "
+            "use the same deterministic canonical-component workload. "
+            "Overhead is the difference between aggregate quantiles, not paired "
+            "per-request deltas. The enabled SQLite fallback is reported separately."
         ),
-    }, indent=2, sort_keys=True))
+    }
+    encoded_report = json.dumps(report, indent=2, sort_keys=True)
+    if args.output_json is not None:
+        output_path = Path(args.output_json).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(encoded_report + "\n", encoding="utf-8")
+    print(encoded_report)
     return 0
 
 
