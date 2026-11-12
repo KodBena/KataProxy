@@ -304,8 +304,6 @@ def make_solver_attempt_event(
         ),
     }
     validate_event(event)
-    if serialize_event(event) != decoded.encode("utf-8"):
-        raise CorpusEventError("event payload must use canonical compact JSON")
     return event
 
 
