@@ -13,7 +13,7 @@ import math
 import sqlite3
 import struct
 import uuid
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
