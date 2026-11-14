@@ -28,7 +28,7 @@ from .stencil_solver_api import NoNativeEffortLimit, SolverBudget, SolverIdentit
 
 
 
-_OWNERSHIP_HIGHS_ADAPTER_VERSION = "kataproxy-ownership-highs-adapter-v1"
+_OWNERSHIP_HIGHS_ADAPTER_VERSION = "kataproxy-ownership-highs-adapter-v2"
 _OWNERSHIP_MIP_FORMULATION_VERSION = "ordered-ternary-tv-mip-v1"
 
 try:
@@ -44,7 +44,7 @@ def _ownership_solver_identity() -> SolverIdentity:
             "formulation": _OWNERSHIP_MIP_FORMULATION_VERSION,
             "threads": 1,
             "objective": "unary-plus-total-variation-full-energy",
-            "initial_solution": "spatial-greedy-feasible-v1",
+            "initial_solution": "best-feasible-spatial-greedy-or-imported-incumbent-v2",
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -114,7 +114,20 @@ class CoherentOwnershipPolicy:
         # per-query tuning metadata.
         return None
 
-    def classify(self, evidence: OwnershipEvidence) -> OwnershipRegions:
+    def classify(
+        self,
+        evidence: OwnershipEvidence,
+        *,
+        initial_labeling: OwnershipLabeling | None = None,
+    ) -> OwnershipRegions:
+        """Classify one snapshot, optionally warm-starting from a feasible witness.
+
+        initial_labeling is operational search state, not a model parameter.
+        It must cover exactly this evidence's eligible points and satisfy its
+        fixed dead-chain labels and aggregate interval. The lower-energy
+        labeling of the built-in heuristic and supplied witness is sent to
+        HiGHS as the MIP start.
+        """
         started_at = time.perf_counter()
         started_at_utc = datetime.now(timezone.utc).isoformat(
             timespec="microseconds",
@@ -401,8 +414,9 @@ class CoherentOwnershipPolicy:
         row_lower_array = np.asarray(row_lower, dtype=np.float64)
         row_upper_array = np.asarray(row_upper, dtype=np.float64)
 
-        # Preserve the feasible heuristic as its own evidence item. A HiGHS
-        # incumbent is a second item, never a replacement for the seed record.
+        # Preserve a feasible seed as its own evidence item. A prior incumbent
+        # may be reused only for the exact same eligible graph and aggregate
+        # interval; it is not part of model identity or persistent solver state.
         initial_heuristic = dict(labels)
         energy_edges = tuple(
             (eligible[first], eligible[second]) for first, second in edge_pairs
@@ -411,6 +425,29 @@ class CoherentOwnershipPolicy:
             initial_heuristic, evidence, empty_points, energy_edges,
             self.kappa, self.beta,
         )
+        warm_start_used = False
+        warm_start_objective: float | None = None
+        if initial_labeling is not None:
+            supplied = dict(initial_labeling.point_labels)
+            if tuple(sorted(supplied)) != eligible:
+                raise ValueError(
+                    "warm-start labeling must cover exactly the eligible points"
+                )
+            if any(supplied[point] != 1 for point in fixed_positive):
+                raise ValueError("warm-start labeling disagrees with dead-Black points")
+            if any(supplied[point] != -1 for point in fixed_negative):
+                raise ValueError("warm-start labeling disagrees with dead-White points")
+            warm_net = sum(supplied[point] for point in empty_points)
+            if not minimum_net <= warm_net <= maximum_net:
+                raise ValueError("warm-start labeling violates the aggregate interval")
+            warm_start_objective = ownership_energy(
+                supplied, evidence, empty_points, energy_edges,
+                self.kappa, self.beta,
+            )
+            if warm_start_objective <= initial_objective:
+                initial_heuristic = supplied
+                initial_objective = warm_start_objective
+                warm_start_used = True
 
         optimizer_labels: Dict[int, int] | None = None
         optimizer_objective: float | None = None
@@ -636,7 +673,10 @@ class CoherentOwnershipPolicy:
             "attemptId": attempt_id,
             "solverIdentityFingerprint": solver_identity.fingerprint,
             "optimizerIncumbentAvailable": optimizer_labels is not None,
+            "warmStartUsed": warm_start_used,
         }
+        if warm_start_objective is not None:
+            diagnostics["warmStartObjective"] = float(warm_start_objective)
         if optimizer_objective is not None:
             diagnostics["optimizerObjective"] = float(optimizer_objective)
         if lower_bound is not None:
