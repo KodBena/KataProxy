@@ -1,0 +1,90 @@
+{
+  "attempt_count": 7654,
+  "database_schema_version": 1,
+  "distinct_evidence_count": 7543,
+  "format": "kataproxy.ownership-corpus-summary.v1",
+  "model_count": 1,
+  "models": [
+    {
+      "attempt_count": 7654,
+      "attempt_latency_ms": {
+        "count": 7654,
+        "mean": 125.5096480714659,
+        "p50": 117.844975,
+        "p95": 212.9272166,
+        "p99": 229.47299305
+      },
+      "coherent_aggregate_feasibility_rate": 1.0,
+      "coherent_energy_gap": {
+        "count": 7654,
+        "mean": 7.758426966292165e-05,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "coherent_energy_ratio": {
+        "count": 1116,
+        "mean": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "p99": 1.0
+      },
+      "distinct_evidence_count": 7543,
+      "model_document": {
+        "coordinate_convention": "row-major-y-down-v1",
+        "dead_chain_version": "katago-anticipated-status-ownership-v1",
+        "objective_version": "ternary-unary-tv-aggregate-v1",
+        "policy_class": "transformers.stencil_cover.stencil_ownership_coherent.CoherentOwnershipPolicy",
+        "policy_config": {
+          "beta": 0.25,
+          "kappa": 1.0,
+          "score_tolerance": 0.5
+        },
+        "policy_id": "coherent",
+        "policy_model_version": "coherent-ownership-mip-v2",
+        "request_metadata": {
+          "truncation_threshold": 0
+        },
+        "schema": "kataproxy.ownership-model.v1"
+      },
+      "model_id": "70d9e3bd41e65177567db39143fa39b2849ce95a9ce9a0583875f2d00b654415",
+      "observation_count": 7654,
+      "policy_id": "coherent",
+      "reference_comparison_count": 7654,
+      "solver_status_counts": {
+        "feasible": 1214,
+        "optimal": 6440
+      },
+      "unary_margin_fraction": {
+        "count": 7654,
+        "mean": 0.026258809328460257,
+        "p50": 0.023622047244094488,
+        "p95": 0.05888746803069044,
+        "p99": 0.08132212655459896
+      }
+    }
+  ],
+  "observation_count": 7654,
+  "reference_scope": "best feasible witness recorded for the same evidence and matching coherent objective parameters; optimal_proven is not inferred from a feasible or repaired result",
+  "unique_problem_tally": {
+    "approximate_feasible_count": 1206,
+    "attempt_count": 7654,
+    "best_attempt_status_counts": {
+      "feasible": 1206,
+      "optimal": 6337
+    },
+    "best_reference_source_counts": {
+      "optimizer_incumbent": 7543
+    },
+    "fully_solved_count": 6337,
+    "identity": "distinct evidence_id plus coherent objective identity across coherent policies",
+    "no_feasible_witness_count": 0,
+    "no_optimization_required_count": 0,
+    "observation_count": 7654,
+    "solve_state_counts": {
+      "approximate_feasible": 1206,
+      "optimal_proven": 6337
+    },
+    "unique_problem_count": 7543
+  }
+}
