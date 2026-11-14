@@ -726,6 +726,14 @@ def _apply_outcome(
         raise ValueError("solver lower bound exceeds the retained feasible energy")
 
 
+def _needs_solve_at_level(state: TaskProgress, target_ms: int) -> bool:
+    """Whether an item is eligible for another slice at this cumulative level."""
+    if state.optimal_proven or state.spent_wall_ms >= target_ms:
+        return False
+    last_error_level = state.last_error_level_ms
+    return last_error_level is None or last_error_level < target_ms
+
+
 def _state_counts(
     campaign: Campaign,
     progress: dict[str, TaskProgress],
@@ -807,14 +815,7 @@ def run_campaign(
         while True:
             pending = [
                 item for item in campaign.items
-                if (
-                    not progress[item.task_id].optimal_proven
-                    and progress[item.task_id].spent_wall_ms < target_ms
-                    and (
-                        progress[item.task_id].last_error_level_ms is None
-                        or progress[item.task_id].last_error_level_ms < target_ms
-                    )
-                )
+                if _needs_solve_at_level(progress[item.task_id], target_ms)
             ]
             if not pending:
                 break
