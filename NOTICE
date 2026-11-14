@@ -36,6 +36,8 @@ file-specific exception to the Unlicense scope above:
   - transformers/stencil_cover/stencil_ownership_repair.py
   - transformers/stencil_cover/stencil_ownership_solver_api.py
   - transformers/stencil_cover/stencil_ownership_store.py
+  - transformers/stencil_cover/stencil_ownership_forest.py
+  - tests/test_stencil_ownership_forest.py
   - tests/test_stencil_ownership_store.py
   - transformers/stencil_cover/stencil_ownership_cut.py
   - transformers/stencil_cover/stencil_region_solver.py

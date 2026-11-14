@@ -312,6 +312,20 @@ by default because it adds a durable write for every response packet. A
 storage failure is logged and does not suppress the interactive stencil-cover
 response.
 
+An offline research runner is available for the first forest/MM approximation
+experiment. It reads the ownership archive read-only and writes its results to
+a separate JSON artifact; it is not a foreground policy or a background worker.
+Start with the held-out board-group split:
+
+```sh
+python -m scripts.run_ownership_forest_mm --split test \
+  --output /tmp/ownership-forest-mm.test.json
+```
+
+See [the forest/MM experiment guide](docs/ownership-quantization/forest-mm-experiment.md)
+for the deterministic train/validation/test split, exact-reference handling,
+metrics, and interpretation limits.
+
 ---
 
 ## Logs
