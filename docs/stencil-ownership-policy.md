@@ -321,9 +321,10 @@ explicit linear constraint over empty-point label bits. Fixed dead-chain
 labels are encoded as fixed variable bounds.
 
 Only the \(2n\) label columns are integer. The total-variation auxiliaries
-are continuous; their lower-bound inequalities and positive objective costs
-are sufficient for them to take the required absolute-difference values at
-an optimum.
+are continuous; when \(\beta>0\), their lower-bound inequalities and
+positive objective costs are sufficient for them to take the required
+absolute-difference values at an optimum. When \(\beta=0\), their values do
+not affect the objective, and only the label solution matters.
 
 The unary coefficients in the linear objective are
 
@@ -573,23 +574,38 @@ spool, corpus materializer, work-profile queue, provenance conventions and
 longer-budget re-solve pattern is a separate question from reusing
 placement-specific contracts.
 
-If an ownership corpus / background solver is added, the reproducible problem
-identity needs to include at least:
+If an ownership corpus / background solver is added, keep three identities
+separate rather than putting every concern into one cache key:
 
-- board width and height and a stable board-coordinate convention;
-- the lossless ownership mean and standard-deviation arrays;
-- the replayed board disposition, including empty points and the fixed
-  dead-chain sets (or enough source board and turn data to reconstruct them);
-- the ownership-model/evidence schema version;
-- the effective objective parameters and aggregate tolerance.
+1. **Evidence identity** identifies one observed input, independent of the
+   solver and objective tuning. It needs board width and height, a stable
+   coordinate convention, the lossless ownership mean and standard-deviation
+   arrays, and the replayed board disposition. Store the empty-point and
+   fixed dead-chain sets, or retain enough source board/turn data plus the
+   versioned chain-liveness rule to reconstruct them. Preserve the replayed
+   board itself so later replay-code changes cannot silently rewrite history.
+2. **Ownership-model identity** identifies the exact optimization problem
+   applied to that evidence: the objective and constraint schema/version,
+   effective \(\kappa\), \(\beta\), and \(\epsilon\), the dead-chain
+   interpretation, and any other policy metadata that changes eligibility or
+   labels. A change to these values creates a different mathematical problem,
+   not a different observation.
+3. **Attempt identity** identifies one solver execution: algorithm and
+   implementation version, solver/backend configuration, seed or heuristic
+   version, requested wall/native-effort budget, and execution provenance.
 
-The problem identity should not include a solver time limit. Solver algorithm,
-implementation version, configuration, and requested work budget belong to
-attempt/work-profile provenance, separate from the identity of the evidence
-being solved. Do not round ownership or standard-deviation inputs when
-creating a reusable problem key: rounding can merge distinct optimization
-instances. Preserve the original evidence losslessly in the corpus even when
-an exact-input result-cache hit is unlikely.
+An exact-result cache key is the evidence identity paired with the
+ownership-model identity. It should not include a solver time limit: a later,
+longer attempt against the same evidence and model should be able to improve
+the same best-known result. Solver algorithm and work budget belong to
+attempt/work-profile provenance, not to evidence identity.
+
+Do not round ownership or standard-deviation inputs when creating an evidence
+identity: rounding can merge distinct observations and therefore distinct
+optimization instances. Use a lossless, versioned representation. Preserve
+the original evidence in the corpus even when an exact-input result-cache hit
+is unlikely; one evidence record can then support many model and solver
+attempts without duplicating the raw observation.
 
 A useful experiment record would retain the initial heuristic seed separately
 from each optimizer incumbent, along with the objective in a common
