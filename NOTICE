@@ -31,6 +31,10 @@ file-specific exception to the Unlicense scope above:
   - transformers/stencil_cache_storage.py
   - transformers/stencil_bulk_solver.py
   - tests/test_stencil_cover_enricher.py
+  - transformers/stencil_cover/stencil_ownership.py
+  - transformers/stencil_cover/stencil_ownership_coherent.py
+  - transformers/stencil_cover/stencil_ownership_repair.py
+  - transformers/stencil_cover/stencil_ownership_solver_api.py
 
 Copyright (c) 2026 KataProxy contributors.
 

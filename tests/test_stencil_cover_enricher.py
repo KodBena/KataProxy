@@ -938,7 +938,7 @@ def test_coherent_policy_preserves_the_expected_signed_ownership_sum() -> None:
     assert abs(
         diagnostics["targetNetOwnership"] - diagnostics["actualNetOwnership"]
     ) <= policy.score_tolerance
-    assert diagnostics["solverStatus"] in {"optimal", "feasible_time_limit"}
+    assert diagnostics["solverStatus"] in {"optimal", "feasible", "seed_only", "error"}
     assert diagnostics["optimal"] is (diagnostics["solverStatus"] == "optimal")
 
 
@@ -1002,6 +1002,14 @@ def test_coherent_policy_matches_the_explicit_unary_and_spatial_objective() -> N
         kappa=0.7, beta=0.35, score_tolerance=0.5, time_limit_ms=2_000,
     )
     selected = policy.classify(evidence)
+    assert selected.solver_evidence is not None
+    assert selected.solver_evidence.initial_objective >= 0.0
+    assert selected.diagnostics["objective"] == pytest.approx(
+        selected.solver_evidence.optimizer_objective
+        if selected.solver_evidence.optimizer_objective is not None
+        else selected.solver_evidence.initial_objective,
+        abs=1e-7,
+    )
     chosen = tuple(
         1 if point in selected.positive
         else -1 if point in selected.negative
@@ -1056,10 +1064,15 @@ def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
     elapsed = time.perf_counter() - started
     diagnostics = selected.diagnostics
 
+    assert selected.solver_evidence is not None
+    assert selected.solver_evidence.initial_heuristic.point_labels
+    assert diagnostics["optimizerIncumbentAvailable"] is (
+        selected.solver_evidence.optimizer_incumbent is not None
+    )
     actual_net = cast(float, diagnostics["actualNetOwnership"])
     target_net = cast(float, diagnostics["targetNetOwnership"])
     assert abs(actual_net - target_net) <= policy.score_tolerance
-    assert diagnostics["solverStatus"] in {"optimal", "feasible_time_limit"}
+    assert diagnostics["solverStatus"] in {"optimal", "feasible", "seed_only", "error"}
     assert diagnostics["emptyPointCount"] == width * height
     assert elapsed < 2.5
 

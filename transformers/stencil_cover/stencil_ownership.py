@@ -10,6 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .stencil_board import _chain_and_liberties
+from .stencil_ownership_solver_api import OwnershipOptimizationRecord
 
 
 _OWNERSHIP_EPSILON = 1e-5
@@ -37,6 +38,7 @@ class OwnershipRegions:
     policy_id: str
     threshold: Optional[float] = None
     diagnostics: Dict[str, int | float | str | bool] = field(default_factory=dict)
+    solver_evidence: OwnershipOptimizationRecord | None = None
 
 
 class OwnershipRegionPolicy(Protocol):
