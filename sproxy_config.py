@@ -18,6 +18,7 @@ Logging is intentionally NOT configured here. See logging_config.py.
 
 import os
 import logging
+import math
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -446,11 +447,40 @@ ORCHESTRATION_BUFFER_MAX: int = int(
 # Policy selection is read once at process startup. The policy implementation
 # is composed behind the OwnershipRegionPolicy port under transformers/stencil_cover.
 
-STENCIL_OWNERSHIP_POLICY: str = os.environ.get(
-    "KATAPROXY_STENCIL_OWNERSHIP_POLICY", "threshold"
-).strip().lower()
-if STENCIL_OWNERSHIP_POLICY != "threshold":
+_STENCIL_OWNERSHIP_POLICY_RAW = os.environ.get(
+    "KATAPROXY_STENCIL_OWNERSHIP_POLICY", "coherent"
+).strip()
+STENCIL_OWNERSHIP_POLICY: str = (
+    _STENCIL_OWNERSHIP_POLICY_RAW.lower()
+    if _STENCIL_OWNERSHIP_POLICY_RAW.lower() in {"coherent", "threshold"}
+    else _STENCIL_OWNERSHIP_POLICY_RAW
+)
+if not STENCIL_OWNERSHIP_POLICY:
+    raise ValueError("KATAPROXY_STENCIL_OWNERSHIP_POLICY must not be empty")
+
+STENCIL_OWNERSHIP_CONFIDENCE_KAPPA: float = float(
+    os.environ.get("KATAPROXY_STENCIL_OWNERSHIP_CONFIDENCE_KAPPA", "1.0")
+)
+STENCIL_OWNERSHIP_SPATIAL_BETA: float = float(
+    os.environ.get("KATAPROXY_STENCIL_OWNERSHIP_SPATIAL_BETA", "0.25")
+)
+STENCIL_OWNERSHIP_SCORE_TOLERANCE: float = float(
+    os.environ.get("KATAPROXY_STENCIL_OWNERSHIP_SCORE_TOLERANCE", "0.5")
+)
+STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS: int = int(
+    os.environ.get("KATAPROXY_STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS", "250")
+)
+
+for _config_name, _config_value in (
+    ("KATAPROXY_STENCIL_OWNERSHIP_CONFIDENCE_KAPPA", STENCIL_OWNERSHIP_CONFIDENCE_KAPPA),
+    ("KATAPROXY_STENCIL_OWNERSHIP_SPATIAL_BETA", STENCIL_OWNERSHIP_SPATIAL_BETA),
+    ("KATAPROXY_STENCIL_OWNERSHIP_SCORE_TOLERANCE", STENCIL_OWNERSHIP_SCORE_TOLERANCE),
+):
+    if not math.isfinite(_config_value) or _config_value < 0:
+        raise ValueError(f"{_config_name} must be finite and non-negative")
+
+if STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS <= 0:
     raise ValueError(
-        "KATAPROXY_STENCIL_OWNERSHIP_POLICY must be 'threshold'"
+        "KATAPROXY_STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS must be positive"
     )
 

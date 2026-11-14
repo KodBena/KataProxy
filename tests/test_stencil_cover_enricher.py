@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import hashlib
 import json
 import os
 import threading
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -22,6 +24,7 @@ import transformers.stencil_cover.stencil_component_cache as component_cache
 import transformers.stencil_cover.stencil_solver_factory as solver_factory
 import transformers.stencil_cover.stencil_solver_geometry as geometry
 import transformers.stencil_cover_enricher as enricher
+from transformers.stencil_cover.stencil_ownership_coherent import CoherentOwnershipPolicy
 from transformers.stencil_cover.stencil_ownership_threshold import ThresholdOwnershipPolicy
 import sproxy_config as cfg
 from AbstractProxy.proxy_core import ClientId
@@ -333,7 +336,7 @@ def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
     client_id = ClientId("stencil-cover-test")
     link = make_katago_link()
     transformer = enricher.stencil_cover_enricher(
-        link, ownership_policy=ThresholdOwnershipPolicy(),
+        link, ownership_policy=CoherentOwnershipPolicy(),
     )
     query = KataGoQuery(
         action=KataGoAction.ANALYZE,
@@ -353,6 +356,7 @@ def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
     # Opting in to stencil_cover is sufficient; callers need not separately
     # know that KataGo's ownership map must be requested.
     assert query.opaque["includeOwnership"] is True
+    assert query.opaque["includeOwnershipStdev"] is True
 
     # A missing map can still occur for an upstream error/incomplete response.
     # Optional enrichment must not take down the session send loop.
@@ -847,14 +851,20 @@ def test_legacy_threshold_policy_does_not_require_ownership_stdev() -> None:
 
 
 
-def test_environment_policy_factory_selects_threshold(
+def test_environment_policy_factory_selects_sibling_implementations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_POLICY", "threshold")
-    assert isinstance(
-        ownership_policy_factory.create_ownership_region_policy(),
-        ThresholdOwnershipPolicy,
-    )
+    assert isinstance(ownership_policy_factory.create_ownership_region_policy(),
+                      ThresholdOwnershipPolicy)
+
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_POLICY", "coherent")
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_CONFIDENCE_KAPPA", 1.75)
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_SPATIAL_BETA", 0.4)
+    selected = ownership_policy_factory.create_ownership_region_policy()
+    assert isinstance(selected, CoherentOwnershipPolicy)
+    assert selected.kappa == 1.75
+    assert selected.beta == 0.4
 
 
 def test_legacy_threshold_policy_validates_its_per_query_cutoff() -> None:
@@ -864,6 +874,147 @@ def test_legacy_threshold_policy_validates_its_per_query_cutoff() -> None:
     with pytest.raises(ValueError, match="truncation_threshold"):
         transformer.on_query(ClientId("missing-threshold"), _query({"stencil_cover": {}}))
 
+
+def test_environment_policy_factory_eagerly_loads_a_custom_policy_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = ModuleType("test_stencil_policy_plugin")
+    setattr(plugin, "make_policy", lambda: ThresholdOwnershipPolicy())
+    monkeypatch.setitem(sys.modules, "test_stencil_policy_plugin", plugin)
+    monkeypatch.setattr(
+        cfg,
+        "STENCIL_OWNERSHIP_POLICY",
+        "test_stencil_policy_plugin:make_policy",
+    )
+    importlib.reload(ownership_policy_factory)
+    assert isinstance(
+        ownership_policy_factory.DEFAULT_OWNERSHIP_POLICY,
+        ThresholdOwnershipPolicy,
+    )
+
+    # Restore the real built-in selection for any later test in this module.
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_POLICY", "coherent")
+    importlib.reload(ownership_policy_factory)
+    assert isinstance(
+        ownership_policy_factory.DEFAULT_OWNERSHIP_POLICY,
+        CoherentOwnershipPolicy,
+    )
+
+
+
+def test_coherent_policy_preserves_the_expected_signed_ownership_sum() -> None:
+    policy = CoherentOwnershipPolicy(
+        kappa=0.0, beta=0.25, score_tolerance=0.5, time_limit_ms=2_000,
+    )
+    transformer = enricher.stencil_cover_enricher(
+        _mock_link(), ownership_policy=policy,
+    )
+    query = _query({"stencil_cover": {}})
+    transformer.on_query(ClientId("coherent"), query)
+    assert query.opaque["includeOwnership"] is True
+    assert query.opaque["includeOwnershipStdev"] is True
+
+    response = AnalyzeResponse(
+        is_during_search=False,
+        turn_number=0,
+        opaque={
+            "ownership": [0.8, 0.7, -0.8, -0.7],
+            "ownershipStdev": [0.05, 0.05, 0.05, 0.05],
+        },
+    )
+    transformer.on_response(ClientId("coherent"), response)
+    cover = response.opaque["stencilCover"]
+    diagnostics = cover["ownershipDiagnostics"]
+    assert cover["ownershipPolicy"] == "coherent"
+    assert abs(
+        diagnostics["targetNetOwnership"] - diagnostics["actualNetOwnership"]
+    ) <= policy.score_tolerance
+    assert diagnostics["solverStatus"] == "optimal"
+
+
+def test_coherent_policy_refuses_a_missing_ownership_stdev_map(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    policy = CoherentOwnershipPolicy(time_limit_ms=2_000)
+    transformer = enricher.stencil_cover_enricher(
+        _mock_link(), ownership_policy=policy,
+    )
+    transformer.on_query(ClientId("missing-stdev"), _query({"stencil_cover": {}}))
+    response = AnalyzeResponse(
+        is_during_search=False,
+        turn_number=0,
+        opaque={"ownership": [0.8, 0.7, -0.8, -0.7]},
+    )
+    with caplog.at_level(
+        "ERROR", logger="kataproxy.stencil_cover_enricher",
+    ):
+        transformer.on_response(ClientId("missing-stdev"), response)
+    assert "stencilCover" not in response.opaque
+    assert "ownershipStdev" in caplog.text
+
+
+def test_coherent_policy_uses_ownership_stdev_as_a_confidence_penalty() -> None:
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": [0.7, 0.7, 0.7],
+            "ownershipStdev": [0.5, 0.0, 0.0],
+        },
+        [None, None, None],
+        3,
+        1,
+        {},
+        requires_ownership_stdev=True,
+    )
+    policy = CoherentOwnershipPolicy(
+        kappa=2.0, beta=0.0, score_tolerance=0.5, time_limit_ms=2_000,
+    )
+    selected = policy.classify(evidence)
+    assert selected.positive == (1, 2)
+    assert selected.negative == ()
+
+
+def test_coherent_policy_builds_a_connected_region_for_diffuse_ownership() -> None:
+    ownership_map = [0.2] * 25
+    for point in (6, 7, 8, 11, 12):
+        ownership_map[point] = 0.8
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": ownership_map,
+            "ownershipStdev": [0.05] * 25,
+        },
+        [None] * 25,
+        5,
+        5,
+        {},
+        requires_ownership_stdev=True,
+    )
+    selected = CoherentOwnershipPolicy(
+        kappa=0.0, beta=0.3, score_tolerance=0.5, time_limit_ms=2_000,
+    ).classify(evidence)
+    positive = set(selected.positive)
+    assert len(positive) == 8
+    pending = [min(positive)]
+    reached = set()
+    while pending:
+        point = pending.pop()
+        if point in reached:
+            continue
+        reached.add(point)
+        x = point % 5
+        adjacent = []
+        if x > 0:
+            adjacent.append(point - 1)
+        if x < 4:
+            adjacent.append(point + 1)
+        if point >= 5:
+            adjacent.append(point - 5)
+        if point < 20:
+            adjacent.append(point + 5)
+        pending.extend(
+            neighbour for neighbour in adjacent
+            if neighbour in positive and neighbour not in reached
+        )
+    assert reached == positive
 
 def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None:
     family = (

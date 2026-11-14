@@ -186,28 +186,35 @@ load balancing) works identically with or without it.
 
 ## Stencil-cover enrichment (opt-in)
 
-An analyze query opts in to the signed stencil-cover annotation by including:
+An analyze query opts in to the signed stencil-cover annotation with:
 
 ```json
 {
   "capabilities": {
-    "stencil_cover": {
-      "truncation_threshold": 0.6
-    }
+    "stencil_cover": {}
   }
 }
 ```
 
-The transformer requests KataGo's ownership map for opted-in queries and adds
-`opaque.stencilCover` to final analysis responses. No separate
-`includeOwnership` flag is required from the client.
+The default `coherent` ownership policy requests KataGo's ownership and
+ownership-standard-deviation maps automatically. It quantizes empty points to
+`-1 / 0 / +1`, applies a spatial total-variation cost between orthogonal
+neighbours, and constrains their signed sum to remain within a configured
+tolerance of the aggregate ownership expectation. Dead chains remain assigned
+to the opponent; living stones remain outside the cover. The transformer adds
+`opaque.stencilCover` to final analysis responses; no separate ownership
+flags are required from the client.
 
-Ownership-region selection is behind the `OwnershipRegionPolicy` port. The
-initial `threshold` policy preserves the original per-intersection cutoff.
-The policy is selected at startup with
-`KATAPROXY_STENCIL_OWNERSHIP_POLICY=threshold`; see
-[`docs/stencil-ownership-policy.md`](docs/stencil-ownership-policy.md) for the
-policy contract and extension point.
+The legacy `threshold` policy remains available by setting
+`KATAPROXY_STENCIL_OWNERSHIP_POLICY=threshold`. With that policy, each opting-in
+client must include `truncation_threshold` in its capability metadata, for
+example `{"stencil_cover":{"truncation_threshold":0.6}}`.
+
+A custom implementation can be selected with
+`KATAPROXY_STENCIL_OWNERSHIP_POLICY=python.module:factory_name`. Its module is
+eagerly imported at proxy startup; the factory returns an implementation of
+`OwnershipRegionPolicy`. The policy selection and coherent-model parameters
+are documented in `docs/stencil-ownership-policy.md`.
 
 The foreground solver is the normal operating mode: it attempts each
 component with a 250 ms HiGHS time limit and returns its best valid result,
