@@ -155,6 +155,9 @@ The default database remains
 read-only through `load_archive`. Results are written to a separate JSON file;
 the output path is rejected if it equals the source archive, and an existing
 output is not replaced unless `--overwrite` is specified.
+The runner reports the current problem and forest-DP structural progress to
+stderr (including elapsed time and DP state-entry counts); the final JSON
+artifact is still published only after the selected run completes.
 
 Problems are deduplicated by the existing evidence identity plus exact
 objective identity. Board groups are assigned deterministically using the
