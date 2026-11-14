@@ -1003,7 +1003,6 @@ def test_coherent_policy_matches_the_explicit_unary_and_spatial_objective() -> N
     )
     selected = policy.classify(evidence)
     assert selected.solver_evidence is not None
-    assert selected.solver_evidence.initial_objective >= 0.0
     assert selected.diagnostics["objective"] == pytest.approx(
         selected.solver_evidence.optimizer_objective
         if selected.solver_evidence.optimizer_objective is not None

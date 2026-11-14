@@ -4,15 +4,69 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
+import json
 import math
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Dict, List, Mapping, Tuple, cast
 
 import highspy
 import numpy as np
 
 from .stencil_ownership import OwnershipEvidence, OwnershipRegions
+from .stencil_ownership_repair import ownership_energy
+from .stencil_ownership_solver_api import (
+    OwnershipLabeling,
+    OwnershipOptimizationRecord,
+    OwnershipSolverStatus,
+)
+from .stencil_solver_api import NoNativeEffortLimit, SolverBudget, SolverIdentity
+
+
+
+_OWNERSHIP_HIGHS_ADAPTER_VERSION = "kataproxy-ownership-highs-adapter-v1"
+_OWNERSHIP_MIP_FORMULATION_VERSION = "ordered-ternary-tv-mip-v1"
+
+try:
+    _HIGHS_PACKAGE_VERSION = version("highspy")
+except PackageNotFoundError:
+    _HIGHS_PACKAGE_VERSION = str(getattr(highspy, "__version__", "unknown"))
+
+
+def _ownership_solver_identity() -> SolverIdentity:
+    """Identify the MIP adapter/configuration independently of its time budget."""
+    configuration_json = json.dumps(
+        {
+            "formulation": _OWNERSHIP_MIP_FORMULATION_VERSION,
+            "threads": 1,
+            "objective": "unary-plus-total-variation-full-energy",
+            "initial_solution": "spatial-greedy-feasible-v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    configuration_fingerprint = hashlib.sha256(
+        configuration_json.encode("utf-8")
+    ).hexdigest()
+    return SolverIdentity(
+        backend_name="highs-mip",
+        backend_version=_HIGHS_PACKAGE_VERSION,
+        adapter_version=_OWNERSHIP_HIGHS_ADAPTER_VERSION,
+        configuration_json=configuration_json,
+        configuration_fingerprint=configuration_fingerprint,
+    )
+
+
+def _ownership_labeling(labels: Dict[int, int]) -> OwnershipLabeling:
+    return OwnershipLabeling(tuple(sorted(
+        (int(point), int(label)) for point, label in labels.items()
+    )))
 
 
 @dataclass(frozen=True)
@@ -61,6 +115,17 @@ class CoherentOwnershipPolicy:
 
     def classify(self, evidence: OwnershipEvidence) -> OwnershipRegions:
         started_at = time.perf_counter()
+        started_at_utc = datetime.now(timezone.utc).isoformat(
+            timespec="microseconds",
+        ).replace("+00:00", "Z")
+        attempt_started_ns = time.perf_counter_ns()
+        attempt_id = str(uuid.uuid4())
+        budget = SolverBudget(
+            wall_time_limit_ms=self.time_limit_ms,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id=f"ownership-foreground-{self.time_limit_ms}ms",
+        )
+        solver_identity = _ownership_solver_identity()
         deadline = started_at + self.time_limit_ms / 1000.0
         stdev = evidence.ownership_stdev
         if stdev is None:
