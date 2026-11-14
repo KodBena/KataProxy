@@ -117,7 +117,9 @@ validated HiGHS optimizer incumbent and its objective. It also stores the
 normalized lower bound, absolute gap, backend-reported MIP gap, backend status,
 and any error. The HiGHS bound is shifted by the same label-independent
 constant as its objective formulation before comparison with the full-energy
-evaluator.
+evaluator. Its disposition is stored independently of incumbent presence, so
+a certified dual bound survives even when the backend returns no primal
+witness; an absolute gap is recorded only when both objective and bound exist.
 
 For the coherent-cut policy, the linked observation records the selected
 supported or repaired witness, and its diagnostics retain the Lagrange path,
@@ -167,7 +169,7 @@ Recent model/attempt summaries:
 SELECT o.observed_at_utc, o.turn_number, o.is_during_search,
        m.policy_id, a.status, a.elapsed_wall_ns,
        a.initial_objective, a.optimizer_objective,
-       a.lower_bound, a.absolute_gap
+       a.lower_bound_disposition, a.lower_bound, a.absolute_gap
 FROM observations AS o
 JOIN models AS m USING (model_id)
 LEFT JOIN attempts AS a USING (attempt_id)

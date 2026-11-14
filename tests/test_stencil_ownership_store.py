@@ -288,7 +288,8 @@ def test_attempt_keeps_seed_optimizer_witness_and_selected_output_separate(
             """
             SELECT status, elapsed_wall_ns, initial_labeling_blob,
                    initial_objective, optimizer_labeling_blob,
-                   optimizer_objective, lower_bound, absolute_gap, budget_json
+                   optimizer_objective, lower_bound_disposition,
+                   lower_bound, absolute_gap, budget_json
             FROM ownership.attempts WHERE attempt_id = ?
             """,
             (record.attempt_id,),
@@ -317,8 +318,8 @@ def test_attempt_keeps_seed_optimizer_witness_and_selected_output_separate(
             struct.pack("<Ib", point, label)
             for point, label in record.optimizer_incumbent.point_labels
         )
-        assert attempt[5:8] == (3.25, 3.25, 0.0)
-        assert json.loads(str(attempt[8]))["wall_time_limit_ms"] == 250
+        assert attempt[5:9] == (3.25, "reported", 3.25, 0.0)
+        assert json.loads(str(attempt[9]))["wall_time_limit_ms"] == 250
         assert observation is not None
         assert observation[0] == record.attempt_id
         assert observation[1] == OWNERSHIP_LABEL_CODEC
@@ -349,8 +350,8 @@ def test_region_builder_persists_each_observation_directly_to_the_ownership_db(
         _width: Any,
         _height: Any,
         _family: Any,
-    ) -> tuple[Any, ...]:
-        return ()
+    ) -> list[Any]:
+        return []
 
     def no_sighting_publish(
         _keys: Any,
@@ -422,3 +423,61 @@ def test_region_builder_persists_each_observation_directly_to_the_ownership_db(
         assert bytes(evidence_row[1]) == struct.pack("<4d", 0.1, 0.2, 0.3, 0.4)
     finally:
         connection.close()
+
+
+def test_attempt_retains_a_certified_lower_bound_without_an_incumbent(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ownership.sqlite3"
+    store = SQLiteOwnershipStore(path)
+    evidence = _evidence()
+    base = _optimization_record()
+    assert base.initial_heuristic is not None
+    assert base.initial_objective is not None
+    seed = base.initial_heuristic
+    seed_objective = base.initial_objective
+    no_incumbent = OwnershipOptimizationRecord(
+        attempt_id=str(uuid.uuid4()),
+        started_at_utc="2026-11-14T05:01:00.000000Z",
+        elapsed_wall_ns=7654321,
+        budget=base.budget,
+        solver_identity=base.solver_identity,
+        status=OwnershipSolverStatus.SEED_ONLY,
+        initial_heuristic=seed,
+        initial_objective=seed_objective,
+        optimizer_incumbent=None,
+        optimizer_objective=None,
+        selected_labeling=seed,
+        selected_objective=seed_objective,
+        lower_bound=1.5,
+        absolute_gap=None,
+        backend_reported_gap=None,
+        backend_status="time_limit_no_incumbent",
+        error=None,
+    )
+    regions = OwnershipRegions(
+        positive=(0,),
+        negative=(2,),
+        policy_id="coherent",
+        diagnostics={"solverStatus": "seed_only", "objective": seed_objective},
+        solver_evidence=no_incumbent,
+    )
+    receipt = store.record(
+        evidence,
+        regions,
+        CoherentOwnershipPolicy(),
+        turn_number=4,
+        is_during_search=False,
+    )
+    connection = _connection(path)
+    try:
+        attempt = connection.execute(
+            "SELECT optimizer_disposition, lower_bound_disposition, "
+            "lower_bound, absolute_gap FROM ownership.attempts WHERE attempt_id = ?",
+            (receipt.attempt_id,),
+        ).fetchone()
+        assert attempt == ("not_returned", "reported", 1.5, None)
+    finally:
+        connection.close()
+
+

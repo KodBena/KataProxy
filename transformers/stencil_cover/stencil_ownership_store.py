@@ -439,6 +439,9 @@ class SQLiteOwnershipStore:
                 ),
                 optimizer_labeling_blob BLOB,
                 optimizer_objective REAL,
+                lower_bound_disposition TEXT NOT NULL CHECK(
+                    lower_bound_disposition IN ('reported', 'not_reported')
+                ),
                 lower_bound REAL,
                 absolute_gap REAL,
                 backend_reported_gap REAL,
@@ -462,9 +465,15 @@ class SQLiteOwnershipStore:
                         AND optimizer_labeling_blob IS NULL
                         AND optimizer_objective IS NULL)
                 ),
-                CHECK(lower_bound IS NULL OR optimizer_objective IS NOT NULL),
+                CHECK(
+                    (lower_bound_disposition = 'reported' AND lower_bound IS NOT NULL)
+                    OR
+                    (lower_bound_disposition = 'not_reported' AND lower_bound IS NULL)
+                ),
                 CHECK(absolute_gap IS NULL OR (
-                    optimizer_objective IS NOT NULL AND lower_bound IS NOT NULL
+                    optimizer_objective IS NOT NULL
+                    AND lower_bound_disposition = 'reported'
+                    AND lower_bound IS NOT NULL
                 )),
                 CHECK(
                     (status = 'error' AND error IS NOT NULL AND length(error) > 0)
@@ -758,8 +767,9 @@ class SQLiteOwnershipStore:
                 started_at_utc, elapsed_wall_ns, budget_json,
                 initial_disposition, initial_labeling_blob, initial_objective,
                 optimizer_disposition, optimizer_labeling_blob, optimizer_objective,
-                lower_bound, absolute_gap, backend_reported_gap, backend_status, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                lower_bound_disposition, lower_bound, absolute_gap,
+                backend_reported_gap, backend_status, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.attempt_id,
@@ -776,6 +786,7 @@ class SQLiteOwnershipStore:
                 "present" if optimizer_blob is not None else "not_returned",
                 sqlite3.Binary(optimizer_blob) if optimizer_blob is not None else None,
                 record.optimizer_objective,
+                "reported" if record.lower_bound is not None else "not_reported",
                 record.lower_bound,
                 record.absolute_gap,
                 record.backend_reported_gap,
