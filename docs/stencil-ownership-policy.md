@@ -57,9 +57,15 @@ The input is KataGo's ownership evidence, not a separate Go rules solver. The
 policy does not prove life and death, calculate territory from first principles,
 or optimize KataGo's value head. The existing dead-chain classifier is a
 separate heuristic that fixes dead Black chains as White-owned and dead White
-chains as Black-owned. Living stones are excluded from the ownership cover.
-The coherent objective operates on the remaining empty intersections and
-those fixed dead-chain points.
+chains as Black-owned. It mirrors KataGo's chain-level anticipated-status
+heuristic: a White chain is considered alive only when its average ownership
+is greater than 0.2 and its minimum point ownership is greater than -0.6; a
+Black chain is considered alive only when its average is less than -0.2 and
+its maximum point ownership is less than 0.6. A chain failing the corresponding
+test is treated as dead. This uses the ownership mean, not ownershipStdev, and
+is not a new life-and-death proof. Living stones are excluded from the ownership
+cover. The coherent objective operates on the remaining empty intersections
+and those fixed dead-chain points.
 
 The mathematical model below is a modelling choice over those inputs. Its
 weights are not calibrated probabilities or a claim that the objective is a
@@ -206,19 +212,34 @@ representation. The global integer-sum constraint is the additional coupling
 that makes the general problem a cardinality-constrained graph-labeling
 problem.
 
-A standard special case explains the complexity boundary. Restrict a
-graph-labeling instance to two labels, \(0\) and \(+1\), make the unary
-contribution constant among feasible assignments, and require exactly \(k\)
-vertices to receive \(+1\). Then minimizing
+A special case using the unary formula itself makes the complexity
+boundary explicit. Let the graph have an even number of vertices, set every
+ownership mean to \(\mu_i=0.5\), every standard deviation to zero, and set
+\(\epsilon=0\). Then the expected sum is \(|V|/2\), and the unary costs are
+\(C_i(0)=0\), \(C_i(+1)=0\), and \(C_i(-1)=2\). Choose a positive
+\(\beta\) small enough that \(\beta |A|<2\). A feasible assignment using
+only labels 0 and +1 has exactly \(|V|/2\) positive labels and has energy at
+most \(\beta|A|<2\). Any assignment containing a -1 label pays at least 2
+in unary cost and has non-negative spatial cost, so it cannot be optimal.
+The remaining optimization therefore chooses exactly half the vertices as
++1 and the rest as 0, minimizing
 
 \[
-\sum_{(i,j)\in A}|q_i-q_j|
+\beta\sum_{(i,j)\in A}|q_i-q_j|,
 \]
 
-is exactly the minimum-\(k\)-cut partition problem; for \(k=|V|/2\), it is
-minimum graph bisection. Minimum bisection is NP-hard on general graphs.
-Consequently, the general cardinality-constrained graph-labeling family
-contains an NP-hard special case.
+which is minimum graph bisection on the underlying graph. Minimum bisection is
+NP-hard on general graphs. Thus the general graph-labeling family defined by
+this objective and aggregate constraint contains an NP-hard special case.
+
+This establishes the NP-hardness of the general graph formulation, not a
+hardness result for every restricted adjacency class. The production
+adjacency graph is more specific: it is a four-neighbour board-lattice
+subgraph with holes induced by excluded living stones. The reduction above
+does not prove a matching worst-case lower bound for every such restricted
+board graph, nor does it imply that every ordinary Go position is difficult.
+The operational board-size cap and structure may make many real instances
+tractable.
 
 This is the reason to treat the global ownership quantization problem as an
 NP-hard optimization problem and to design for feasible answers, bounded
