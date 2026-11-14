@@ -93,8 +93,12 @@ labeling, the report includes the omitted-edge contribution
 \Delta_R(q)=\beta\sum_{(i,j)\in A_E\setminus T}|q_i-q_j|.
 \]
 
-This is a computable instance-specific quantity; it is not reported as a
-measured gap to the original optimum.
+For the exact forest-DP optimum, this is also a valid additive upper bound
+on its suboptimality under the original empty-empty graph: the forest objective
+is a lower bound on the original optimum, and the omitted-edge energy is the
+difference at the forest solution. It is not a measured gap or a claim that the
+bound is tight. The report keeps the forest surrogate energy separate from the
+restored fixed-edge constant.
 
 ### Budget-exact forest MM (E2)
 
@@ -177,8 +181,11 @@ For each evaluated problem, the report stores:
 
 - the B2 initializer, E1 forest-DP and E2 forest-MM full-energy results;
 - aggregate interval, objective parameters, reference provenance, and split;
-- empty-point Hamming disagreement and boundary symmetric difference;
-- omitted-edge TV contribution and MM monotonicity trace;
+- per-method empty-point sum, expected sum, residual, and explicit feasibility;
+- full-graph TV energy, unary energy, boundary-edge count, Hamming disagreement,
+  and boundary symmetric difference;
+- E1 omitted-edge TV contribution and its additive upper bound, plus the MM
+  monotonicity trace;
 - per-method wall time, forest DP state-entry count, component count, and
   compact labeling witnesses using the archive's
   `point-u32le-label-i8-v1` codec.

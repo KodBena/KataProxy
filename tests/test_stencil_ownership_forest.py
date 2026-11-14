@@ -22,6 +22,7 @@ from transformers.stencil_cover.stencil_ownership_forest import (
 )
 from transformers.stencil_cover.stencil_ownership_graphcut import ownership_graph
 from transformers.stencil_cover.stencil_ownership_repair import ownership_energy
+from scripts.run_ownership_forest_mm import _method_metrics
 
 
 def _evidence(
@@ -241,3 +242,38 @@ def test_forest_mm_is_feasible_and_non_increasing() -> None:
 def test_aggregate_interval_rejects_unattainable_integer_sum() -> None:
     with pytest.raises(ValueError, match="no attainable integer"):
         aggregate_interval((0.1, 0.1), 0.0)
+
+
+
+def test_runner_metrics_report_aggregate_and_full_graph_tv_explicitly() -> None:
+    candidate = {0: 1, 1: 1, 2: -1, 3: -1}
+    reference = {0: 1, 1: 0, 2: 0, 3: -1}
+    edges = ((0, 1), (0, 2), (1, 3), (2, 3))
+
+    metrics = _method_metrics(
+        candidate,
+        candidate_energy=3.0,
+        reference=reference,
+        reference_energy=2.5,
+        reference_is_optimal=True,
+        reference_lower_bound=2.0,
+        empty_points=(0, 1, 2, 3),
+        all_edges=edges,
+        expected_empty_sum=0.0,
+        aggregate_lower=0,
+        aggregate_upper=0,
+        beta=0.25,
+    )
+
+    assert metrics["aggregate_empty_sum"] == 0
+    assert metrics["aggregate_expected_empty_sum"] == 0.0
+    assert metrics["aggregate_residual"] == 0.0
+    assert metrics["aggregate_feasible"] is True
+    assert metrics["reference_aggregate_feasible"] is True
+    assert metrics["total_variation_energy"] == pytest.approx(1.0)
+    assert metrics["reference_total_variation_energy"] == pytest.approx(1.0)
+    assert metrics["boundary_edge_count"] == 2
+    assert metrics["reference_boundary_edge_count"] == 4
+    assert metrics["boundary_symmetric_difference"] == 2
+    assert metrics["unary_energy"] == pytest.approx(2.0)
+    assert metrics["unary_energy_difference_vs_reference"] == pytest.approx(0.5)

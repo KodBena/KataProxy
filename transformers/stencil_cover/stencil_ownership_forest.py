@@ -361,7 +361,9 @@ def spanning_forest_edges(
     problem: ReducedOwnershipProblem,
 ) -> tuple[Edge, ...]:
     """Build a deterministic breadth-first spanning forest of the empty graph."""
-    adjacency = {point: [] for point in problem.points}
+    adjacency: dict[int, list[int]] = {
+        point: [] for point in problem.points
+    }
     for first, second in problem.edges:
         adjacency[first].append(second)
         adjacency[second].append(first)
@@ -448,7 +450,9 @@ def solve_forest_dp(
             for position, label in enumerate(_LABELS)
         }
 
-    adjacency = {point: [] for point in problem.points}
+    adjacency: dict[int, list[int]] = {
+        point: [] for point in problem.points
+    }
     for first, second in forest:
         adjacency[first].append(second)
         adjacency[second].append(first)

@@ -147,7 +147,21 @@ def _method_metrics(
     reference_lower_bound: float | None,
     empty_points: Sequence[int],
     all_edges: Sequence[tuple[int, int]],
+    expected_empty_sum: float,
+    aggregate_lower: int,
+    aggregate_upper: int,
+    beta: float,
 ) -> dict[str, Any]:
+    candidate_empty_sum = sum(candidate[point] for point in empty_points)
+    reference_empty_sum = sum(reference[point] for point in empty_points)
+    candidate_tv_energy = beta * sum(
+        abs(candidate[first] - candidate[second])
+        for first, second in all_edges
+    )
+    reference_tv_energy = beta * sum(
+        abs(reference[first] - reference[second])
+        for first, second in all_edges
+    )
     empty_changes = sum(
         candidate[point] != reference[point]
         for point in empty_points
@@ -158,6 +172,31 @@ def _method_metrics(
         "full_energy": float(candidate_energy),
         "energy_difference_vs_reference": float(candidate_energy - reference_energy),
         "reference_is_proven_optimal": bool(reference_is_optimal),
+        "aggregate_empty_sum": int(candidate_empty_sum),
+        "aggregate_expected_empty_sum": float(expected_empty_sum),
+        "aggregate_residual": float(abs(candidate_empty_sum - expected_empty_sum)),
+        "aggregate_lower": int(aggregate_lower),
+        "aggregate_upper": int(aggregate_upper),
+        "aggregate_feasible": bool(
+            aggregate_lower <= candidate_empty_sum <= aggregate_upper
+        ),
+        "reference_aggregate_empty_sum": int(reference_empty_sum),
+        "reference_aggregate_feasible": bool(
+            aggregate_lower <= reference_empty_sum <= aggregate_upper
+        ),
+        "total_variation_energy": float(candidate_tv_energy),
+        "reference_total_variation_energy": float(reference_tv_energy),
+        "total_variation_energy_difference_vs_reference": float(
+            candidate_tv_energy - reference_tv_energy
+        ),
+        "unary_energy": float(candidate_energy - candidate_tv_energy),
+        "reference_unary_energy": float(reference_energy - reference_tv_energy),
+        "unary_energy_difference_vs_reference": float(
+            (candidate_energy - candidate_tv_energy)
+            - (reference_energy - reference_tv_energy)
+        ),
+        "boundary_edge_count": len(candidate_boundaries),
+        "reference_boundary_edge_count": len(reference_boundaries),
         "empty_hamming_count": int(empty_changes),
         "empty_hamming_fraction": (
             0.0 if not empty_points else empty_changes / len(empty_points)
@@ -307,6 +346,10 @@ def build_results(
             raise ArithmeticError("marginal candidate failed full-energy cross-check")
 
         forest = spanning_forest_edges(problem)
+        retained_forest = set(forest)
+        omitted_forest_edges = tuple(
+            edge for edge in problem.edges if edge not in retained_forest
+        )
         start = time.perf_counter_ns()
         forest_result = solve_forest_dp(problem, forest)
         forest_ms = (time.perf_counter_ns() - start) / 1_000_000.0
@@ -319,6 +362,10 @@ def build_results(
             all_edges,
             config["kappa"],
             config["beta"],
+        )
+        forest_omitted_edge_tv = problem.beta * sum(
+            abs(forest_empty[first] - forest_empty[second])
+            for first, second in omitted_forest_edges
         )
         if abs(
             forest_energy - full_energy_from_reduction(problem, forest_empty)
@@ -370,6 +417,10 @@ def build_results(
                 lower_bound,
                 representative.empty_points,
                 all_edges,
+                problem.expected_sum,
+                problem.aggregate_lower,
+                problem.aggregate_upper,
+                problem.beta,
             )
             metrics["labeling_codec"] = "point-u32le-label-i8-v1"
             metrics["labeling_base64"] = _encode_labeling(labels)
@@ -424,10 +475,18 @@ def build_results(
                 "forest_mm_total_including_initializer": marginal_ms + mm_ms,
             },
             "forest_dp": {
-                "surrogate_energy": forest_result.surrogate_energy,
+                "surrogate_energy_reduced": forest_result.surrogate_energy,
+                "surrogate_energy_with_fixed_edge_offset": (
+                    forest_result.surrogate_energy + problem.fixed_edge_offset
+                ),
                 "selected_sum": forest_result.selected_sum,
                 "component_count": forest_result.component_count,
                 "dp_state_count": forest_result.dp_state_count,
+                "omitted_edge_count": len(omitted_forest_edges),
+                "omitted_edge_tv_energy": float(forest_omitted_edge_tv),
+                "additive_optimality_gap_upper_bound": float(
+                    forest_omitted_edge_tv
+                ),
             },
             "forest_mm": {
                 "initial_energy": mm_result.initial_energy,
