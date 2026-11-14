@@ -1,0 +1,19 @@
+{
+  "already_proven_count": 6337,
+  "approximate_feasible_count": 1206,
+  "budget_levels_seconds": [
+    10.0,
+    20.0,
+    40.0,
+    80.0,
+    160.0
+  ],
+  "campaign_fingerprint": "a79b2558136f3aa68ccfbb02791d4d1685a78c6ec5763229e99c77f59b65bdb9",
+  "database": "/home/bork/.local/state/kataproxy/ownership-quantization.sqlite3",
+  "no_feasible_witness_count": 0,
+  "no_optimization_required_count": 0,
+  "omitted_by_limit_count": 0,
+  "scheduled_count": 1206,
+  "slice_seconds": 10.0,
+  "unique_problem_count": 7543
+}
