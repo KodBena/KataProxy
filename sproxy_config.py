@@ -452,7 +452,7 @@ _STENCIL_OWNERSHIP_POLICY_RAW = os.environ.get(
 ).strip()
 STENCIL_OWNERSHIP_POLICY: str = (
     _STENCIL_OWNERSHIP_POLICY_RAW.lower()
-    if _STENCIL_OWNERSHIP_POLICY_RAW.lower() in {"coherent", "threshold"}
+    if _STENCIL_OWNERSHIP_POLICY_RAW.lower() in {"coherent", "coherent-cut", "threshold"}
     else _STENCIL_OWNERSHIP_POLICY_RAW
 )
 if not STENCIL_OWNERSHIP_POLICY:

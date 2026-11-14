@@ -197,13 +197,19 @@ An analyze query opts in to the signed stencil-cover annotation with:
 ```
 
 The default `coherent` ownership policy requests KataGo's ownership and
-ownership-standard-deviation maps automatically. It quantizes empty points to
-`-1 / 0 / +1`, applies a spatial total-variation cost between orthogonal
-neighbours, and constrains their signed sum to remain within a configured
-tolerance of the aggregate ownership expectation. Dead chains remain assigned
-to the opponent; living stones remain outside the cover. The transformer adds
-`opaque.stencilCover` to final analysis responses; no separate ownership
-flags are required from the client.
+ownership-standard-deviation maps automatically. It uses the HiGHS MIP model
+with a spatially-aware feasible start and the aggregate ownership constraint.
+The response reports whether the MIP proved optimality or returned a valid
+feasible incumbent before its time budget expired.
+
+An alternative `coherent-cut` policy is available with
+`KATAPROXY_STENCIL_OWNERSHIP_POLICY=coherent-cut`. It solves each fixed
+Lagrange-multiplier subproblem by an s-t graph cut. If the discrete cut path
+skips the permitted integer ownership sum, it uses a deterministic connected
+sum-repair. The result reports `optimal`, `feasible_supported`, or
+`feasible_repaired`; repaired results are feasible but are not claimed to be
+the global constrained optimum. This policy is intended for comparing
+large-board latency and region shape against the MIP model.
 
 The legacy `threshold` policy remains available by setting
 `KATAPROXY_STENCIL_OWNERSHIP_POLICY=threshold`. With that policy, each opting-in
@@ -212,9 +218,9 @@ example `{"stencil_cover":{"truncation_threshold":0.6}}`.
 
 A custom implementation can be selected with
 `KATAPROXY_STENCIL_OWNERSHIP_POLICY=python.module:factory_name`. Its module is
-eagerly imported at proxy startup; the factory returns an implementation of
-`OwnershipRegionPolicy`. The policy selection and coherent-model parameters
-are documented in `docs/stencil-ownership-policy.md`.
+eagerly imported at proxy startup; its factory returns an implementation of
+`OwnershipRegionPolicy`. Parameters and policy semantics are documented in
+`docs/stencil-ownership-policy.md`.
 
 The foreground solver is the normal operating mode: it attempts each
 component with a 250 ms HiGHS time limit and returns its best valid result,

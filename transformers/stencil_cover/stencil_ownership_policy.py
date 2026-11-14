@@ -10,6 +10,7 @@ import sproxy_config as cfg
 
 from .stencil_ownership import OwnershipRegionPolicy
 from .stencil_ownership_coherent import CoherentOwnershipPolicy
+from .stencil_ownership_cut import CoherentCutOwnershipPolicy
 from .stencil_ownership_threshold import ThresholdOwnershipPolicy
 
 
@@ -19,7 +20,7 @@ _CUSTOM_POLICY_FACTORY: _CustomPolicyFactory | None = None
 # A third-party policy is imported at this module's import boundary, not on
 # first request. Its complete dependency footprint is therefore paid at
 # startup and visible to importers, in accordance with ADR-0012 P12.
-if cfg.STENCIL_OWNERSHIP_POLICY not in {"coherent", "threshold"}:
+if cfg.STENCIL_OWNERSHIP_POLICY not in {"coherent", "coherent-cut", "threshold"}:
     _module_name, separator, _factory_name = cfg.STENCIL_OWNERSHIP_POLICY.partition(":")
     if not separator or not _module_name or not _factory_name:
         raise ValueError(
@@ -56,6 +57,13 @@ def create_ownership_region_policy() -> OwnershipRegionPolicy:
         return ThresholdOwnershipPolicy()
     if selected == "coherent":
         return CoherentOwnershipPolicy(
+            kappa=cfg.STENCIL_OWNERSHIP_CONFIDENCE_KAPPA,
+            beta=cfg.STENCIL_OWNERSHIP_SPATIAL_BETA,
+            score_tolerance=cfg.STENCIL_OWNERSHIP_SCORE_TOLERANCE,
+            time_limit_ms=cfg.STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS,
+        )
+    if selected == "coherent-cut":
+        return CoherentCutOwnershipPolicy(
             kappa=cfg.STENCIL_OWNERSHIP_CONFIDENCE_KAPPA,
             beta=cfg.STENCIL_OWNERSHIP_SPATIAL_BETA,
             score_tolerance=cfg.STENCIL_OWNERSHIP_SCORE_TOLERANCE,

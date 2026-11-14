@@ -98,6 +98,68 @@ solver status, and whether optimality was proven. Defaults are initial
 investigation values, not a claim of empirical calibration; they should be
 evaluated against held-out positions and final outcomes.
 
+## Coherent-cut alternative
+
+Select this sibling implementation with
+`KATAPROXY_STENCIL_OWNERSHIP_POLICY=coherent-cut`. It uses the same unary
+ownership costs, uncertainty penalty, four-neighbour total-variation term, and
+aggregate sum interval as the MIP `coherent` policy, but it changes the
+optimization strategy.
+
+For a fixed Lagrange multiplier \(\lambda\), two ordered binary indicators
+represent each ternary label:
+
+\[
+q_i=a_i+b_i-1,\qquad b_i\le a_i.
+\]
+
+The fixed-\(\lambda\) unary coefficients are
+\(-C_i(-1)+\lambda\) for \(a_i\) and \(C_i(+1)+\lambda\) for \(b_i\). The
+identity
+
+\[
+|q_i-q_j|=|a_i-a_j|+|b_i-b_j|
+\]
+
+makes the fixed-multiplier energy submodular, so it is minimized by an s-t
+minimum cut. The implementation uses integer capacities at \(10^{-9}\)
+resolution. It searches a bounded monotone Lagrange path for a cut whose net
+ownership lies in the allowed integer interval.
+
+Because the sum is discrete, the cut path can jump over the permitted
+interval. The policy handles that as an explicit second stage: it takes the
+best path labeling by aggregate residual, then uses deterministic one-cell
+label changes to meet the selected integer sum. The repair uses marginal unary
+plus TV energy and only seeds new same-sign cells next to an existing seed in
+the same eligible connected component. This prevents a row-major stipple and
+keeps each repaired sign region connected within each connected eligible
+subgraph. Dead chains stay fixed to their opponent's territory; living stones
+remain outside the eligible graph.
+
+The response diagnostics deliberately distinguish three outcomes:
+
+- `optimal`: the unconstrained \(\lambda=0\) minimum already satisfies the
+  aggregate, or the allowed interval contains exactly one integer and the
+  cut path reaches it. In either case the constrained optimum is established.
+- `feasible_supported`: a cut-path labeling is within a multi-integer
+  aggregate interval. It is feasible, but is not represented as a global
+  constrained MAP optimum.
+- `feasible_repaired`: no path cut satisfies the interval, so connected
+  one-cell repair supplies a valid labeling. It satisfies the aggregate but
+  is not claimed to be the global constrained optimum.
+
+Diagnostics also report the cut-path net/residual, selected multiplier, cut
+count, repair moves and objective delta, capacity scale, and elapsed time.
+The time budget reserves a portion for repair, although a single native
+maximum-flow call can itself overrun the nominal budget. This is a latency
+alternative, not a claim that the hard global sum constraint has become an
+exact graph-cut problem.
+
+The original `coherent` MIP policy remains available as the exact constrained
+formulation with a bounded feasible start. The two policies should be compared
+on held-out positions for region shape, objective value, aggregate residual,
+latency, and final-outcome agreement before changing which one is the default.
+
 ## Legacy threshold model
 
 When `KATAPROXY_STENCIL_OWNERSHIP_POLICY=threshold`, the former behavior is

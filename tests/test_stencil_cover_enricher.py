@@ -27,6 +27,7 @@ import transformers.stencil_cover.stencil_solver_factory as solver_factory
 import transformers.stencil_cover.stencil_solver_geometry as geometry
 import transformers.stencil_cover_enricher as enricher
 from transformers.stencil_cover.stencil_ownership_coherent import CoherentOwnershipPolicy
+from transformers.stencil_cover.stencil_ownership_cut import CoherentCutOwnershipPolicy
 from transformers.stencil_cover.stencil_ownership_threshold import ThresholdOwnershipPolicy
 import sproxy_config as cfg
 from AbstractProxy.proxy_core import ClientId
@@ -868,6 +869,12 @@ def test_environment_policy_factory_selects_sibling_implementations(
     assert selected.kappa == 1.75
     assert selected.beta == 0.4
 
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_POLICY", "coherent-cut")
+    cut_selected = ownership_policy_factory.create_ownership_region_policy()
+    assert isinstance(cut_selected, CoherentCutOwnershipPolicy)
+    assert cut_selected.kappa == 1.75
+    assert cut_selected.beta == 0.4
+
 
 def test_legacy_threshold_policy_validates_its_per_query_cutoff() -> None:
     transformer = enricher.stencil_cover_enricher(
@@ -1055,6 +1062,166 @@ def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
     assert diagnostics["solverStatus"] in {"optimal", "feasible_time_limit"}
     assert diagnostics["emptyPointCount"] == width * height
     assert elapsed < 2.5
+
+
+def test_coherent_cut_policy_matches_the_explicit_unary_and_spatial_objective() -> None:
+    means = (0.75, -0.15, 0.45, 0.05)
+    deviations = (0.10, 0.20, 0.05, 0.15)
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": list(means),
+            "ownershipStdev": list(deviations),
+        },
+        [None] * 4,
+        2,
+        2,
+        {},
+        requires_ownership_stdev=True,
+    )
+    policy = CoherentCutOwnershipPolicy(
+        kappa=0.7, beta=0.35, score_tolerance=0.5, time_limit_ms=2_000,
+    )
+    selected = policy.classify(evidence)
+    chosen = tuple(
+        1 if point in selected.positive
+        else -1 if point in selected.negative
+        else 0
+        for point in range(4)
+    )
+    neighbours = ((0, 1), (0, 2), (1, 3), (2, 3))
+
+    def energy(labels: tuple[int, ...]) -> float:
+        unary = sum(
+            0.0 if label == 0
+            else 1.0 - 2.0 * label * mean + 2.0 * policy.kappa * deviation
+            for label, mean, deviation in zip(labels, means, deviations)
+        )
+        spatial = policy.beta * sum(
+            abs(labels[first] - labels[second])
+            for first, second in neighbours
+        )
+        return unary + spatial
+
+    expected_net = sum(means)
+    feasible = (
+        labels for labels in itertools.product((-1, 0, 1), repeat=4)
+        if abs(sum(labels) - expected_net) <= policy.score_tolerance
+    )
+    optimum = min(energy(labels) for labels in feasible)
+    assert abs(energy(chosen) - optimum) < 1e-7
+    assert selected.diagnostics["solverStatus"] == "optimal"
+
+
+def test_coherent_cut_policy_keeps_a_25x25_diffuse_region_connected() -> None:
+    width = 25
+    height = 25
+    ownership_map = [0.2] * (width * height)
+    for y in range(10, 15):
+        for x in range(10, 15):
+            ownership_map[y * width + x] = 0.8
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": ownership_map,
+            "ownershipStdev": [0.05] * (width * height),
+        },
+        [None] * (width * height),
+        width,
+        height,
+        {},
+        requires_ownership_stdev=True,
+    )
+    policy = CoherentCutOwnershipPolicy(
+        kappa=0.0, beta=0.3, score_tolerance=0.5, time_limit_ms=250,
+    )
+    started = time.perf_counter()
+    selected = policy.classify(evidence)
+    elapsed = time.perf_counter() - started
+    diagnostics = selected.diagnostics
+
+    # The expected ownership sum is 140: background contributes 120 and
+    # the central 5x5 block contributes 20.
+    assert len(selected.positive) == 140
+    assert selected.negative == ()
+    assert diagnostics["actualNetOwnership"] == diagnostics["targetNetOwnership"]
+    assert diagnostics["solverStatus"] in {
+        "optimal", "feasible_supported", "feasible_repaired",
+    }
+    assert diagnostics["wallTimeMs"] < 1_500
+    assert elapsed < 1.5
+
+    positive = set(selected.positive)
+    pending = [min(positive)]
+    reached: set[int] = set()
+    while pending:
+        point = pending.pop()
+        if point in reached:
+            continue
+        reached.add(point)
+        x = point % width
+        adjacent = []
+        if x > 0:
+            adjacent.append(point - 1)
+        if x + 1 < width:
+            adjacent.append(point + 1)
+        if point >= width:
+            adjacent.append(point - width)
+        if point + width < width * height:
+            adjacent.append(point + width)
+        pending.extend(
+            neighbour for neighbour in adjacent
+            if neighbour in positive and neighbour not in reached
+        )
+    assert reached == positive
+
+
+def test_coherent_cut_policy_repairs_a_skipped_5x5_integer_sum_without_stippling() -> None:
+    ownership_map = [0.2] * 25
+    for point in (6, 7, 8, 11, 12):
+        ownership_map[point] = 0.8
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": ownership_map,
+            "ownershipStdev": [0.05] * 25,
+        },
+        [None] * 25,
+        5,
+        5,
+        {},
+        requires_ownership_stdev=True,
+    )
+    selected = CoherentCutOwnershipPolicy(
+        kappa=0.0, beta=0.3, score_tolerance=0.5, time_limit_ms=2_000,
+    ).classify(evidence)
+    positive = set(selected.positive)
+    assert len(positive) == 8
+    assert selected.negative == ()
+    assert selected.diagnostics["actualNetOwnership"] == 8.0
+    assert selected.diagnostics["solverStatus"] in {
+        "optimal", "feasible_supported", "feasible_repaired",
+    }
+
+    pending = [min(positive)]
+    reached: set[int] = set()
+    while pending:
+        point = pending.pop()
+        if point in reached:
+            continue
+        reached.add(point)
+        x = point % 5
+        adjacent = []
+        if x > 0:
+            adjacent.append(point - 1)
+        if x < 4:
+            adjacent.append(point + 1)
+        if point >= 5:
+            adjacent.append(point - 5)
+        if point < 20:
+            adjacent.append(point + 5)
+        pending.extend(
+            neighbour for neighbour in adjacent
+            if neighbour in positive and neighbour not in reached
+        )
+    assert reached == positive
 
 def test_coherent_policy_builds_a_connected_region_for_diffuse_ownership() -> None:
     ownership_map = [0.2] * 25
