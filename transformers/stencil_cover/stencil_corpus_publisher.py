@@ -15,15 +15,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
-from transformers.stencil_cache_storage import create_redis_client
-from transformers.stencil_corpus_events import (
+from .stencil_cache_storage import create_redis_client
+from .stencil_corpus_events import (
     ProducerPath,
     make_instance_seen_event,
     parse_event,
     serialize_event,
     utc_timestamp,
 )
-from transformers.stencil_solver_problem import canonical_problem_from_key
+from .stencil_solver_problem import canonical_problem_from_key
 
 logger = logging.getLogger("kataproxy.stencil_corpus_publisher")
 

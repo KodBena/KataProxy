@@ -132,7 +132,7 @@ entry point. Set `KATAPROXY_STENCIL_CORPUS_ENABLED=false` (also accepts
 startup. An unset variable means enabled.
 
 During startup the proxy launches the existing
-`transformers.stencil_corpus_materializer` CLI as a supervised child process.
+`transformers.stencil_cover.stencil_corpus_materializer` CLI as a supervised child process.
 The supervisor waits for SQLite initialization before declaring startup ready.
 It monitors the child, reports an unexpected exit, and restarts it with
 exponential backoff from 1 second up to 30 seconds. The child uses a bounded
@@ -146,8 +146,8 @@ The materializer CLI remains independently executable for controlled recovery
 and testing:
 
     kataproxy-stencil-corpus-materializer
-    python -m transformers.stencil_corpus_materializer --once
-    python -m transformers.stencil_corpus_materializer --spool-only --once
+    python -m transformers.stencil_cover.stencil_corpus_materializer --once
+    python -m transformers.stencil_cover.stencil_corpus_materializer --spool-only --once
 
 Do not start another long-running materializer unless intentionally operating
 an additional consumer in the same Redis consumer group. The normal service

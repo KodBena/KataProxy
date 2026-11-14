@@ -217,7 +217,7 @@ kataproxy-stencil-bulk-solver
 ```
 
 The same worker can be launched from a checkout with
-`python -m transformers.stencil_bulk_solver`. Add `--once` to process the
+`python -m transformers.stencil_cover.stencil_bulk_solver`. Add `--once` to process the
 current pending snapshot and exit. At present, run at most one bulk worker
 for this cache namespace.
 

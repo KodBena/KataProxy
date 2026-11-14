@@ -11,21 +11,21 @@ from typing import Any, Dict, List
 
 import pytest
 
-import transformers.stencil_cache_storage as storage
-import transformers.stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_cache_storage as storage
+import transformers.stencil_cover.stencil_cover_enricher as stencil
 from AbstractProxy.proxy_core import ClientId
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, make_katago_link
-from transformers.stencil_bulk_solver import (
+from transformers.stencil_cover.stencil_bulk_solver import (
     BULK_TIME_LIMIT_MS,
     StencilBulkSolver,
     _validate_bulk_result,
 )
-from transformers.stencil_cache_storage import (
+from transformers.stencil_cover.stencil_cache_storage import (
     SolverCacheCandidate,
     SolverCacheRequest,
     SolverWorkProfile,
 )
-from transformers.stencil_solver_api import (
+from transformers.stencil_cover.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
     LowerBoundUnavailable,
@@ -41,7 +41,7 @@ from transformers.stencil_solver_api import (
     SolverIdentity,
     SolverOutcome,
 )
-from transformers.stencil_solver_geometry import ComponentFrame, Stencil
+from transformers.stencil_cover.stencil_solver_geometry import ComponentFrame, Stencil
 
 
 class _MemoryRedis:

@@ -32,13 +32,13 @@ label an incumbent or singleton fallback as proven optimal. Only a backend outco
 ## Solver port and composition (Phase 1)
 
 The transformer depends on `SolverBackend` from
-`transformers/stencil_solver_api.py`. Its canonical input contains only the
+`transformers/stencil_cover/stencil_solver_api.py`. Its canonical input contains only the
 canonical component, dimensions, complete active family, family fingerprint,
 and canonicalization protocol version. The backend does not see KataGo,
 WebSocket, ownership polarity, Redis, or the caller's board frame.
 
 The default adapter is `HiGHSBackend` in
-`transformers/stencil_solver_highs.py`. Its only solver-specific imports are
+`transformers/stencil_cover/stencil_solver_highs.py`. Its only solver-specific imports are
 owned by that module. `stencil_solver_factory.py` is the explicit composition
 root and currently registers HiGHS as the default; optional adapters must be
 registered by importing their own module at composition time. The transformer
@@ -242,7 +242,7 @@ the Redis result row and can be discarded at any time.
 
 ## Background worker
 
-The source module is `transformers/stencil_bulk_solver.py`; there is no
+The source module is `transformers/stencil_cover/stencil_bulk_solver.py`; there is no
 standalone `kataproxy-stencil-bulk-solver.py` source file. The console command
 is generated when the project is installed (for example, by `pip install -e .`).
 Run it from the active environment with:
@@ -254,7 +254,7 @@ kataproxy-stencil-bulk-solver
 Or run it directly from a repository checkout with:
 
 ```sh
-python -m transformers.stencil_bulk_solver
+python -m transformers.stencil_cover.stencil_bulk_solver
 ```
 
 Add `--once` to either command to process the current pending snapshot and
@@ -473,7 +473,7 @@ kataproxy-stencil-corpus-materializer --spool-only
 kataproxy-stencil-corpus-materializer --spool-only --once
 
 # Equivalent module invocation, with an explicit database path.
-python -m transformers.stencil_corpus_materializer \
+python -m transformers.stencil_cover.stencil_corpus_materializer \
   --database /path/to/stencil-cover-corpus.sqlite3 --once
 ~~~
 

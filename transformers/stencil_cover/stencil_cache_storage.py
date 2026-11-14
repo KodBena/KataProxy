@@ -26,15 +26,15 @@ from typing import Any, Callable, Dict, FrozenSet, Iterator, TypeAlias
 
 import redis
 
-from transformers.stencil_solver_api import (
+from .stencil_solver_api import (
     NativeEffortLimit,
     NoNativeEffortLimit,
     SolverBackend,
     SolverBudget,
     SolverIdentity,
 )
-from transformers.stencil_solver_geometry import Stencil
-from transformers.stencil_solver_identity import (
+from .stencil_solver_geometry import Stencil
+from .stencil_solver_identity import (
     canonical_json_value as _json_key_value,
     stable_digest as _stable_digest,
 )

@@ -16,13 +16,13 @@ import threading
 import uuid
 from typing import Any, Callable, Protocol, Sequence
 
-from transformers.stencil_cache_storage import create_redis_client
-from transformers.stencil_corpus_publisher import (
+from .stencil_cache_storage import create_redis_client
+from .stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
     CORPUS_STREAM_KEY,
     default_corpus_database_path,
 )
-from transformers.stencil_corpus_store import (
+from .stencil_corpus_store import (
     IngestResult,
     MissingInstanceSighting,
     SQLiteCorpusStore,

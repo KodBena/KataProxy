@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from transformers.stencil_corpus_supervisor import (
+from transformers.stencil_cover.stencil_corpus_supervisor import (
     StencilCorpusMaterializerSupervisor,
 )
 

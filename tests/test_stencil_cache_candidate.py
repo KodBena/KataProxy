@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
 
-from transformers.stencil_cache_storage import SolverCacheCandidate
+from transformers.stencil_cover.stencil_cache_storage import SolverCacheCandidate
 
 
 def test_solver_cache_candidate_is_a_frozen_dataclass() -> None:

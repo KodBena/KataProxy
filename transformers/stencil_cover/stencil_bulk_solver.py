@@ -4,7 +4,7 @@
 The normal foreground stencil-cover path does not require this process.
 Run the optional worker with `kataproxy-stencil-bulk-solver` after installing
 the project, or from a checkout with
-`python -m transformers.stencil_bulk_solver`. One worker processes the Redis
+`python -m transformers.stencil_cover.stencil_bulk_solver`. One worker processes the Redis
 pending set sequentially. Each canonical component receives one 10-second wall-clock solver budget;
 a non-optimal outcome is retained as the best result and
 accompanied by durable timeout metadata so it is not retried forever.
@@ -17,25 +17,25 @@ import os
 import time
 from typing import Any, Callable, Dict, Protocol, Sequence, Tuple
 
-from transformers.stencil_cache_storage import (
+from .stencil_cache_storage import (
     RedisStencilStore,
     create_redis_client,
 )
-from transformers.stencil_corpus_publisher import publish_instance_seen
-from transformers.stencil_family import STENCIL_FAMILY
-from transformers.stencil_solver_geometry import (
+from .stencil_corpus_publisher import publish_instance_seen
+from .stencil_family import STENCIL_FAMILY
+from .stencil_solver_geometry import (
     ComponentFrame,
     Stencil,
     decode_cached_placements,
     decode_component_shape_key,
     verify_component_placements,
 )
-from transformers.stencil_solver_api import (
+from .stencil_solver_api import (
     NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
 )
-from transformers.stencil_cache_storage import SolverWorkProfile, make_solver_work_profile
-from transformers.stencil_solver_factory import create_solver_backend
-from transformers.stencil_solver_runtime import solve_component
+from .stencil_cache_storage import SolverWorkProfile, make_solver_work_profile
+from .stencil_solver_factory import create_solver_backend
+from .stencil_solver_runtime import solve_component
 
 logger = logging.getLogger("kataproxy.stencil_bulk_solver")
 

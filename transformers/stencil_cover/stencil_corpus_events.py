@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
-from transformers.stencil_solver_api import (
+from .stencil_solver_api import (
     BackendStatusReported,
     BackendStatusUnavailable,
     Incumbent,
@@ -35,10 +35,10 @@ from transformers.stencil_solver_api import (
     SolverFailure,
     SolverIdentity,
 )
-from transformers.stencil_solver_geometry import decode_component_shape_key
+from .stencil_solver_geometry import decode_component_shape_key
 
 if TYPE_CHECKING:
-    from transformers.stencil_solver_runtime import SolverExecution
+    from .stencil_solver_runtime import SolverExecution
 
 CORPUS_EVENT_SCHEMA = "kataproxy.stencil-cover.corpus-event.v1"
 PLACEMENT_PAYLOAD_CODEC = "kataproxy.stencil-cover.placements-json.v1"

@@ -38,19 +38,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from transformers import stencil_cover_enricher as stencil
-from transformers.stencil_corpus_events import (
+from transformers.stencil_cover.stencil_corpus_events import (
     make_instance_seen_event,
     serialize_event,
 )
-from transformers.stencil_corpus_publisher import (
+from transformers.stencil_cover.stencil_corpus_publisher import (
     CORPUS_STREAM_KEY,
     CorpusEventPublisher,
     SQLiteEventSpool,
     publish_instance_seen,
     publish_instance_seen_many,
 )
-from transformers.stencil_solver_api import STENCIL_CANONICALIZATION_VERSION
-from transformers.stencil_solver_problem import canonical_problem_from_key
+from transformers.stencil_cover.stencil_solver_api import STENCIL_CANONICALIZATION_VERSION
+from transformers.stencil_cover.stencil_solver_problem import canonical_problem_from_key
 
 
 def _fallback_keys() -> tuple[bytes, ...]:

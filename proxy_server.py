@@ -79,8 +79,8 @@ _log = get_proxy_logger(__name__)
 
 
 import sproxy_config as cfg
-from transformers.stencil_corpus_publisher import corpus_events_enabled
-from transformers.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
+from transformers.stencil_cover.stencil_corpus_publisher import corpus_events_enabled
+from transformers.stencil_cover.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
 from katago import (
     AnalyzeResponse,
     KataGoAction,
@@ -1417,7 +1417,7 @@ class ProxyServer:
 # ---------------------------------------------------------------------------
 from contextual import Contextual
 from transformers.transposition_enricher import transposition_enricher
-from transformers.stencil_cover_enricher import stencil_cover_enricher
+from transformers.stencil_cover.stencil_cover_enricher import stencil_cover_enricher
 from transformers.analysis_enricher import analysis_enricher
 from transformers.capability_gate import capability_gate
 from transformers.capabilities_advertiser import capabilities_advertiser

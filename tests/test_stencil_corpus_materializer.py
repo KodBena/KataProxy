@@ -14,22 +14,22 @@ from typing import Any
 import pytest
 
 from transformers import stencil_cover_enricher as stencil
-from transformers.stencil_corpus_events import (
+from transformers.stencil_cover.stencil_corpus_events import (
     make_instance_seen_event,
     make_solver_attempt_event,
     serialize_event,
 )
-from transformers.stencil_corpus_materializer import StencilCorpusMaterializer
-from transformers.stencil_corpus_publisher import (
+from transformers.stencil_cover.stencil_corpus_materializer import StencilCorpusMaterializer
+from transformers.stencil_cover.stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
     CORPUS_STREAM_KEY,
     CorpusEventPublisher,
     SQLiteEventSpool,
 )
-from transformers.stencil_corpus_store import (
+from transformers.stencil_cover.stencil_corpus_store import (
     SQLiteCorpusStore,
 )
-from transformers.stencil_solver_api import (
+from transformers.stencil_cover.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
     NativeEffortUnavailable,
@@ -43,8 +43,8 @@ from transformers.stencil_solver_api import (
     SolverIdentity,
     SolverOutcome,
 )
-from transformers.stencil_solver_problem import canonical_problem_from_key
-from transformers.stencil_solver_runtime import solve_component
+from transformers.stencil_cover.stencil_solver_problem import canonical_problem_from_key
+from transformers.stencil_cover.stencil_solver_runtime import solve_component
 
 
 def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:

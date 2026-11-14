@@ -13,7 +13,7 @@ import math
 import sys
 from pathlib import Path
 
-from transformers.stencil_corpus_publisher import default_corpus_database_path
+from .stencil_corpus_publisher import default_corpus_database_path
 
 logger = logging.getLogger("kataproxy.stencil_corpus_supervisor")
 
@@ -149,7 +149,7 @@ class StencilCorpusMaterializerSupervisor:
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
-            "transformers.stencil_corpus_materializer",
+            "transformers.stencil_cover.stencil_corpus_materializer",
             "--database",
             str(self.database_path),
             "--poll-interval",

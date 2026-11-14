@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from transformers.stencil_solver_api import (
+from .stencil_solver_api import (
     CanonicalProblem,
     STENCIL_CANONICALIZATION_VERSION,
 )
-from transformers.stencil_solver_geometry import Stencil, decode_component_shape_key
-from transformers.stencil_solver_identity import stable_digest
+from .stencil_solver_geometry import Stencil, decode_component_shape_key
+from .stencil_solver_identity import stable_digest
 
 
 def canonical_problem_from_key(

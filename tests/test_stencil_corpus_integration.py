@@ -43,34 +43,34 @@ from AbstractProxy.proxy_core import CanonicalId
 from katago import KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
 from transformers import stencil_cover_enricher as stencil
-from transformers import stencil_corpus_publisher as corpus_publisher
-from transformers import stencil_corpus_supervisor
-from transformers.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
-from transformers import stencil_cache_storage
-from transformers.stencil_cache_storage import (
+from transformers.stencil_cover.stencil_cover import stencil_corpus_publisher as corpus_publisher
+from transformers.stencil_cover.stencil_cover import stencil_corpus_supervisor
+from transformers.stencil_cover.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
+from transformers.stencil_cover.stencil_cover import stencil_cache_storage
+from transformers.stencil_cover.stencil_cache_storage import (
     RedisCacheConflict,
     RedisStencilStore,
     SolverWorkProfile,
 )
-from transformers.stencil_corpus_events import (
+from transformers.stencil_cover.stencil_corpus_events import (
     make_instance_seen_event,
     parse_event,
     serialize_event,
 )
-from transformers.stencil_corpus_materializer import (
+from transformers.stencil_cover.stencil_corpus_materializer import (
     RedisStreamPort,
     StencilCorpusMaterializer,
 )
-from transformers.stencil_corpus_publisher import (
+from transformers.stencil_cover.stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
     CORPUS_STREAM_KEY,
     CorpusEventPublisher,
 )
-from transformers.stencil_corpus_store import SQLiteCorpusStore
-from transformers.stencil_solver_api import NoNativeEffortLimit, SolverBudget
-from transformers.stencil_solver_factory import create_solver_backend
-from transformers.stencil_solver_problem import canonical_problem_from_key
-from transformers.stencil_solver_runtime import solve_component
+from transformers.stencil_cover.stencil_corpus_store import SQLiteCorpusStore
+from transformers.stencil_cover.stencil_solver_api import NoNativeEffortLimit, SolverBudget
+from transformers.stencil_cover.stencil_solver_factory import create_solver_backend
+from transformers.stencil_cover.stencil_solver_problem import canonical_problem_from_key
+from transformers.stencil_cover.stencil_solver_runtime import solve_component
 
 
 @pytest.fixture
@@ -826,8 +826,8 @@ def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
     # has returned (SQLite commit complete) and before the production XACK.
     child_code = (
         "import os, sys, redis; "
-        "from transformers.stencil_corpus_store import SQLiteCorpusStore; "
-        "from transformers.stencil_corpus_materializer import StencilCorpusMaterializer; "
+        "from transformers.stencil_cover.stencil_corpus_store import SQLiteCorpusStore; "
+        "from transformers.stencil_cover.stencil_corpus_materializer import StencilCorpusMaterializer; "
         "client = redis.Redis.from_url(sys.argv[2], decode_responses=False); "
         "store = SQLiteCorpusStore(sys.argv[1]); "
         "worker = StencilCorpusMaterializer("
@@ -884,7 +884,7 @@ def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
     restarted = subprocess.run(
         [
             sys.executable,
-            "-m", "transformers.stencil_corpus_materializer",
+            "-m", "transformers.stencil_cover.stencil_corpus_materializer",
             "--database", str(database),
             "--once",
             "--block-ms", "0",

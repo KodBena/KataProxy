@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from transformers import stencil_cover_enricher as stencil
-from transformers.stencil_corpus_events import (
+from transformers.stencil_cover.stencil_corpus_events import (
     CORPUS_EVENT_SCHEMA,
     PLACEMENT_PAYLOAD_CODEC,
     CorpusEventError,
@@ -21,7 +21,7 @@ from transformers.stencil_corpus_events import (
     serialize_event,
     validate_event,
 )
-from transformers.stencil_solver_api import (
+from transformers.stencil_cover.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
     LowerBoundUnavailable,
@@ -40,7 +40,7 @@ from transformers.stencil_solver_api import (
     SolverIdentity,
     SolverOutcome,
 )
-from transformers.stencil_solver_problem import canonical_problem_from_key
+from transformers.stencil_cover.stencil_solver_problem import canonical_problem_from_key
 
 
 def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:

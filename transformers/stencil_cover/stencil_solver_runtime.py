@@ -9,18 +9,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from transformers.stencil_corpus_events import ProducerPath, make_solver_attempt_event
-from transformers.stencil_corpus_publisher import (
+from .stencil_corpus_events import ProducerPath, make_solver_attempt_event
+from .stencil_corpus_publisher import (
     CorpusEventSink, get_default_event_publisher,
 )
-from transformers.stencil_solver_api import (
+from .stencil_solver_api import (
     BackendStatusUnavailable, CanonicalProblem, Incumbent, LowerBoundUnavailable,
     NativeEffortUnavailable, NoIncumbent, NoIncumbentReason, NoNativeEffortReason,
     NoSolverFailure, OutcomeStatus, PlacementWitness, SolverBackend, SolverBudget,
     SolverFailure, SolverIdentity, SolverOutcome,
 )
-from transformers.stencil_solver_problem import canonical_problem_from_key
-from transformers.stencil_solver_geometry import (
+from .stencil_solver_problem import canonical_problem_from_key
+from .stencil_solver_geometry import (
     Stencil, encode_cached_placements, verify_canonical_placements,
 )
 

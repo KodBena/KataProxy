@@ -7,9 +7,9 @@ from typing import Any
 import pytest
 
 from transformers import stencil_cover_enricher as stencil
-from transformers.stencil_bulk_solver import StencilBulkSolver
-from transformers import stencil_bulk_solver as bulk_module
-from transformers.stencil_solver_api import (
+from transformers.stencil_cover.stencil_bulk_solver import StencilBulkSolver
+from transformers.stencil_cover.stencil_cover import stencil_bulk_solver as bulk_module
+from transformers.stencil_cover.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
     LowerBoundUnavailable,
@@ -27,13 +27,13 @@ from transformers.stencil_solver_api import (
     SolverIdentity,
     SolverOutcome,
 )
-from transformers.stencil_solver_runtime import solve_component
-from transformers.stencil_cache_storage import (
+from transformers.stencil_cover.stencil_solver_runtime import solve_component
+from transformers.stencil_cover.stencil_cache_storage import (
     SolverCacheRequest,
     SolverWorkProfile,
     make_solver_work_profile,
 )
-from transformers.stencil_solver_factory import (
+from transformers.stencil_cover.stencil_solver_factory import (
     create_solver_backend, register_solver_backend,
 )
 

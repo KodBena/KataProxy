@@ -9,11 +9,11 @@ and foreground-latency measurement are separate and must not be treated as
 complete until their runtime checks and measurements have actually run.
 
 This document is the design contract for the next stencil-cover iteration.
-The typed solver port lives in `transformers/stencil_solver_api.py`; this
+The typed solver port lives in `transformers/stencil_cover/stencil_solver_api.py`; this
 document owns the cross-process event and persistence contracts. Phase 1
-implements the default adapter in `transformers/stencil_solver_highs.py`,
-with composition in `transformers/stencil_solver_factory.py` and shared
-invocation in `transformers/stencil_solver_runtime.py`.
+implements the default adapter in `transformers/stencil_cover/stencil_solver_highs.py`,
+with composition in `transformers/stencil_cover/stencil_solver_factory.py` and shared
+invocation in `transformers/stencil_cover/stencil_solver_runtime.py`.
 
 ## 1. Solver port
 
@@ -174,7 +174,7 @@ row-major cell indices `(0, 2, 3)`.
 
 ### D4 closure and compatibility
 
-The current `transformers/stencil_family.txt` is intended to be D4-closed.
+The current `transformers/stencil_cover/stencil_family.txt` is intended to be D4-closed.
 Phase 0 tests assert that its computed stabilizer is exactly all eight
 transforms and that all eight transformed family shape sets equal the
 original. A future family that is not D4-closed is canonicalized only under
@@ -460,7 +460,7 @@ global hard index without inheriting another profile's timeout. A strictly
 better non-optimal result requeues only its originating profile; an optimum
 clears work across all registered profiles. Detailed queue semantics and
 legacy migration rules are recorded in
-transformers/stencil_cover_concurrency.md.
+transformers/stencil_cover/stencil_cover_concurrency.md.
 
 The best-result row remains global to the instance/family, independent of
 backend and budget. Provenance belongs to the attempt that produced that
@@ -485,8 +485,8 @@ the HiGHS adapter, routed foreground and bulk execution through the shared
 solver interface, and added fake-backend substitution tests.
 
 Phase 2 implements the transport-neutral event envelope and strict validator
-in `transformers/stencil_corpus_events.py`, and the best-effort publisher in
-`transformers/stencil_corpus_publisher.py`. Foreground and bulk sightings
+in `transformers/stencil_cover/stencil_corpus_events.py`, and the best-effort publisher in
+`transformers/stencil_cover/stencil_corpus_publisher.py`. Foreground and bulk sightings
 occur before result-cache/attempt work; actual foreground and bulk invocations
 publish attempt events. Redis Stream entries have no producer-side trimming
 policy. On Redis failure, the same canonical bytes are appended to the local

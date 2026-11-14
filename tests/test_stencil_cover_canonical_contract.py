@@ -4,9 +4,9 @@ from __future__ import annotations
 import pytest
 
 from transformers import stencil_cover_enricher as stencil
-from transformers.stencil_cache_storage import RedisStencilStore
-from transformers.stencil_solver_identity import stable_digest as _stable_digest
-from transformers.stencil_solver_api import (
+from transformers.stencil_cover.stencil_cache_storage import RedisStencilStore
+from transformers.stencil_cover.stencil_solver_identity import stable_digest as _stable_digest
+from transformers.stencil_cover.stencil_solver_api import (
     BackendStatusUnavailable,
     Incumbent,
     LowerBoundUnavailable,

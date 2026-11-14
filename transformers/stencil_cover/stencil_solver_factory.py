@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
-from transformers.stencil_solver_api import SolverBackend
-from transformers.stencil_solver_highs import HiGHSBackend
+from .stencil_solver_api import SolverBackend
+from .stencil_solver_highs import HiGHSBackend
 
 
 class SolverBackendUnavailable(RuntimeError):

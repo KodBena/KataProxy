@@ -33,7 +33,7 @@ import numpy as np
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, KataGoResponse
-from transformers.stencil_cache_storage import (
+from transformers.stencil_cover.stencil_cache_storage import (
     CacheResult,
     SolverCacheCandidate,
     SolverCacheRequest,
@@ -41,15 +41,15 @@ from transformers.stencil_cache_storage import (
     redis_persistent_cache,
     register_cache_invalidator,
 )
-from transformers.stencil_solver_api import (
+from transformers.stencil_cover.stencil_solver_api import (
     NoNativeEffortLimit, OutcomeStatus, SolverBackend, SolverBudget, SolverFailure,
 )
-from transformers.stencil_solver_factory import create_solver_backend
-from transformers.stencil_family import (
+from transformers.stencil_cover.stencil_solver_factory import create_solver_backend
+from transformers.stencil_cover.stencil_family import (
     STENCIL_FAMILY,
     parse_stencil_family as _parse_stencil_family,
 )
-from transformers.stencil_solver_geometry import (
+from transformers.stencil_cover.stencil_solver_geometry import (
     MAX_COMPONENT_DIMENSION as _MAX_BOARD_SIZE,
     D4_INVERSE as _D4_INVERSE,
     D4_MATRICES as _D4_MATRICES,
@@ -64,8 +64,8 @@ from transformers.stencil_solver_geometry import (
     transform_cell as _transform_cell,
     verify_component_placements as _verify_component_placements,
 )
-from transformers.stencil_solver_runtime import solve_component as _solve_with_backend
-from transformers.stencil_corpus_publisher import publish_instance_seen_many
+from transformers.stencil_cover.stencil_solver_runtime import solve_component as _solve_with_backend
+from transformers.stencil_cover.stencil_corpus_publisher import publish_instance_seen_many
 
 logger = logging.getLogger("kataproxy.stencil_cover_enricher")
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from transformers.stencil_solver_geometry import Stencil
+from .stencil_solver_geometry import Stencil
 
 
 def parse_stencil_family(source: str) -> tuple[Stencil, ...]:

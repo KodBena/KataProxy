@@ -14,7 +14,7 @@ from typing import Any, Mapping, cast
 import highspy
 import numpy as np
 
-from transformers.stencil_solver_api import (
+from .stencil_solver_api import (
     BackendStatusReported, CanonicalProblem, Incumbent, LowerBoundUnavailable,
     NativeEffortReported, NativeEffortUnavailable, NoIncumbent, NoIncumbentReason,
     NoLowerBoundReason, NoNativeEffortReason, NoNativeEffortLimit, NoSolverFailure,

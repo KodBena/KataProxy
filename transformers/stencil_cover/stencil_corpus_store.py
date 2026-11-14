@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from transformers.stencil_corpus_events import (
+from .stencil_corpus_events import (
     CORPUS_EVENT_SCHEMA,
     instance_id_for,
     parse_event,
