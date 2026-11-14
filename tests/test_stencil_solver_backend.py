@@ -136,7 +136,7 @@ def test_fake_backend_can_be_injected_at_transformer_component_boundary(
         return component_cache._solve_component_uncached(request).result
 
     monkeypatch.setattr(
-        stencil, "_solve_component_cached", solve_without_persistent_cache,
+        region_solver, "_solve_component_cached", solve_without_persistent_cache,
     )
     family = _domino_family()
     backend = _FakeOptimalBackend(name="fake-transformer-boundary")

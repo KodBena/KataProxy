@@ -423,7 +423,7 @@ def test_disconnected_components_are_published_in_one_batch_before_cache(
         )
         return True, 0, encoded
 
-    monkeypatch.setattr(stencil, "publish_instance_seen_many", record_batch)
+    monkeypatch.setattr(region_solver, "publish_instance_seen_many", record_batch)
     monkeypatch.setattr(region_solver, "_solve_component_cached", cache_hit)
     result = region_solver._solve_region([0, 1, 8], 3, 3, family)
 
