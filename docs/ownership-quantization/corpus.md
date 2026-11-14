@@ -189,10 +189,13 @@ attempts. Only a solver-reported proof is marked optimal; a small observed gap
 is still reported as approximate.
 
 The campaign writes two files beside the archive by default:
-`<database>.bulk-solve.checkpoint.json` and
-`<database>.bulk-solve.results.json`. They are separate from the evidence
-database. Checkpoints are atomically replaced after each solve slice and can
-be resumed by running the same command with the same budget schedule. The
+`<database>.bulk-solve.checkpoint.sqlite3` and
+`<database>.bulk-solve.results.json`. Both are separate from the evidence
+database. The checkpoint is its own versioned SQLite database, using WAL mode
+and full synchronous commits. Each completed solver slice updates only that
+task's row in a transaction, avoiding a full-campaign rewrite after every
+instance. Resume reads the checkpoint in read-only mode and revalidates every
+stored witness against the exact eligible-point set and objective. The
 checkpoint is tied to the deduplicated archive snapshot and schedule; if the
 archive or schedule changes, use a new checkpoint path.
 

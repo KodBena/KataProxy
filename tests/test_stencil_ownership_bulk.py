@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -105,7 +106,7 @@ def test_campaign_rounds_every_item_through_cumulative_levels_and_resumes(
     levels_ms = (1000, 2000)
     slice_ms = 500
     fingerprint = campaign_fingerprint(campaign, levels_ms, slice_ms)
-    checkpoint = tmp_path / "bulk-checkpoint.json"
+    checkpoint = tmp_path / "bulk-checkpoint.sqlite3"
     budgets: list[int] = []
 
     def fake_solver(
@@ -170,7 +171,7 @@ def test_campaign_retries_solver_error_once_at_each_budget_level(
     levels_ms = (1000, 2000, 3000)
     slice_ms = 500
     fingerprint = campaign_fingerprint(campaign, levels_ms, slice_ms)
-    checkpoint = tmp_path / "error-checkpoint.json"
+    checkpoint = tmp_path / "error-checkpoint.sqlite3"
     requested: list[int] = []
 
     def failing_solver(
@@ -259,7 +260,7 @@ def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(
     progress = {item.task_id: _initial_progress(item)}
     levels_ms = (1000,)
     fingerprint = campaign_fingerprint(campaign, levels_ms, 500)
-    checkpoint = tmp_path / "bulk-checkpoint.json"
+    checkpoint = tmp_path / "bulk-checkpoint.sqlite3"
 
     def fake_solver(
         _task: CampaignItem,
@@ -288,9 +289,15 @@ def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(
         progress_interval_seconds=3600.0,
         solver=fake_solver,
     )
-    document = json.loads(checkpoint.read_text(encoding="utf-8"))
-    document["tasks"][item.task_id]["best_labels"] = [[999, 1]]
-    checkpoint.write_text(json.dumps(document), encoding="utf-8")
+    with sqlite3.connect(checkpoint) as connection:
+        connection.execute(
+            """
+            UPDATE task_progress
+            SET best_labels_json = ?
+            WHERE task_id = ?
+            """,
+            (json.dumps([[999, 1]], separators=(",", ":")), item.task_id),
+        )
 
     with pytest.raises(ValueError, match="eligible-point set"):
         load_checkpoint(checkpoint, campaign, fingerprint)

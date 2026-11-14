@@ -1200,7 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="checkpoint JSON path (default: next to the archive)",
+        help="separate checkpoint SQLite database path (default: next to the archive)",
     )
     parser.add_argument(
         "--results",
