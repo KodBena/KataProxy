@@ -531,7 +531,7 @@ def solve_forest_dp(
             dp_state_count += len(current)
             completed_nodes += 1
             if progress is not None:
-                progress(completed_nodes, total_nodes, dp_state_count)
+                progress(completed_nodes, total_nodes + len(components), dp_state_count)
 
         profile: dict[int, float] = {}
         root_choices: dict[int, int] = {}
