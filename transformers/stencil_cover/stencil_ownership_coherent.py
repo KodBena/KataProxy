@@ -7,7 +7,7 @@ import heapq
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Tuple, cast
 
 import highspy
 import numpy as np
@@ -340,7 +340,8 @@ class CoherentOwnershipPolicy:
         optimal = False
         remaining_seconds = deadline - time.perf_counter()
         if remaining_seconds > 0.005:
-            highs = highspy.Highs()
+            highs_constructor = cast(Any, highspy.Highs)
+            highs = highs_constructor()
             for option_name, option_value in (
                 ("output_flag", False),
                 ("threads", 1),

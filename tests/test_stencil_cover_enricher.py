@@ -11,7 +11,7 @@ import threading
 import sys
 import time
 from types import ModuleType, SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 import pytest
 
@@ -1049,9 +1049,9 @@ def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
     elapsed = time.perf_counter() - started
     diagnostics = selected.diagnostics
 
-    assert abs(
-        diagnostics["actualNetOwnership"] - diagnostics["targetNetOwnership"]
-    ) <= policy.score_tolerance
+    actual_net = cast(float, diagnostics["actualNetOwnership"])
+    target_net = cast(float, diagnostics["targetNetOwnership"])
+    assert abs(actual_net - target_net) <= policy.score_tolerance
     assert diagnostics["solverStatus"] in {"optimal", "feasible_time_limit"}
     assert diagnostics["emptyPointCount"] == width * height
     assert elapsed < 2.5
