@@ -630,6 +630,78 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
+_ATTEMPT_STATUS_RANK = {
+    "optimal": 7,
+    "feasible": 6,
+    "feasible_supported": 6,
+    "feasible_repaired": 5,
+    "seed_only": 4,
+    "not_required": 7,
+    "error": 1,
+    "no_attempt": 0,
+}
+
+
+def _unique_problem_tally(
+    rows: Sequence[ArchiveRow],
+    references: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Count distinct evidence/objective problems, not repeated observations."""
+    grouped: dict[tuple[str, str], list[ArchiveRow]] = defaultdict(list)
+    for row in rows:
+        config = _coherent_config(row)
+        if (
+            row.policy_id not in COHERENT_POLICIES
+            or config is None
+            or row.ownership_stdev is None
+        ):
+            continue
+        key = (row.evidence_id, _objective_key(row, config))
+        grouped[key].append(row)
+
+    solve_states: Counter[str] = Counter()
+    best_attempt_statuses: Counter[str] = Counter()
+    reference_sources: Counter[str] = Counter()
+    attempt_count = 0
+    observation_count = 0
+    for key, problem_rows in grouped.items():
+        observation_count += len(problem_rows)
+        statuses: list[str] = []
+        for row in problem_rows:
+            if row.attempt is not None:
+                attempt_count += 1
+                statuses.append(str(row.attempt.get("status", "error")))
+        best_attempt = max(
+            statuses or ["no_attempt"],
+            key=lambda status: _ATTEMPT_STATUS_RANK.get(status, 0),
+        )
+        best_attempt_statuses[best_attempt] += 1
+
+        reference = references.get(key)
+        if reference is None:
+            solve_states["no_feasible_witness"] += 1
+            reference_sources["none"] += 1
+        elif bool(reference["optimal_proven"]):
+            solve_states["optimal_proven"] += 1
+            reference_sources[str(reference["source"])] += 1
+        else:
+            solve_states["approximate_feasible"] += 1
+            reference_sources[str(reference["source"])] += 1
+
+    return {
+        "identity": "distinct evidence_id plus coherent objective identity across coherent policies",
+        "unique_problem_count": len(grouped),
+        "observation_count": observation_count,
+        "attempt_count": attempt_count,
+        "solve_state_counts": dict(sorted(solve_states.items())),
+        "best_attempt_status_counts": dict(sorted(best_attempt_statuses.items())),
+        "best_reference_source_counts": dict(sorted(reference_sources.items())),
+        "fully_solved_count": solve_states["optimal_proven"],
+        "approximate_feasible_count": solve_states["approximate_feasible"],
+        "no_feasible_witness_count": solve_states["no_feasible_witness"],
+    }
+
+
 def build_summary(rows: Sequence[ArchiveRow]) -> dict[str, Any]:
     """Summarize observed models, solver attempts, feasibility, and energy."""
     references = _reference_index(rows)
@@ -695,6 +767,7 @@ def build_summary(rows: Sequence[ArchiveRow]) -> dict[str, Any]:
         "distinct_evidence_count": len({row.evidence_id for row in rows}),
         "model_count": len(grouped),
         "attempt_count": sum(row.attempt is not None for row in rows),
+        "unique_problem_tally": _unique_problem_tally(rows, references),
         "reference_scope": (
             "best feasible witness recorded for the same evidence and matching "
             "coherent objective parameters; optimal_proven is not inferred from "

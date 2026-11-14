@@ -125,6 +125,12 @@ def test_summary_uses_shared_energy_and_compares_matching_coherent_models(
     assert models["coherent"]["coherent_energy_gap"]["p50"] == 0.0
     assert models["coherent-cut"]["coherent_energy_gap"]["p50"] > 0.0
     assert models["coherent-cut"]["coherent_energy_ratio"]["p50"] > 1.0
+    tally = summary["unique_problem_tally"]
+    assert tally["unique_problem_count"] == 1
+    assert tally["fully_solved_count"] == 0
+    assert tally["approximate_feasible_count"] == 1
+    assert tally["no_feasible_witness_count"] == 0
+    assert tally["best_reference_source_counts"] == {"selected_output": 1}
 
 
 def test_sensitivity_pairs_only_identical_replayed_boards(
