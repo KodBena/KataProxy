@@ -53,6 +53,17 @@ def _evidence(
     )
 
 
+def _unary_energy(
+    problem: ReducedOwnershipProblem,
+    labels: dict[int, int],
+) -> float:
+    return sum(
+        problem.unary_absolute[index] * abs(labels[point])
+        + problem.unary_linear[index] * labels[point]
+        for index, point in enumerate(problem.points)
+    )
+
+
 def _enumerated_minimum(
     problem: ReducedOwnershipProblem,
     retained_edges: tuple[tuple[int, int], ...],
@@ -121,7 +132,7 @@ def test_marginal_sort_is_exact_for_the_separable_global_budget_problem() -> Non
     labels = budget_exact_marginal_labeling(problem)
 
     assert problem.aggregate_lower <= sum(labels.values()) <= problem.aggregate_upper
-    assert reduced_energy(problem, labels) == pytest.approx(
+    assert _unary_energy(problem, labels) == pytest.approx(
         _enumerated_minimum(problem, ()),
     )
 
@@ -156,9 +167,11 @@ def test_empty_retained_forest_equals_budget_exact_marginal_sort() -> None:
     marginal = budget_exact_marginal_labeling(problem)
     forest = solve_forest_dp(problem, ())
 
-    assert forest.surrogate_energy == pytest.approx(reduced_energy(problem, marginal))
-    assert reduced_energy(problem, dict(forest.labeling)) == pytest.approx(
-        reduced_energy(problem, marginal),
+    separable_optimum = _enumerated_minimum(problem, ())
+    assert forest.surrogate_energy == pytest.approx(separable_optimum)
+    assert _unary_energy(problem, marginal) == pytest.approx(separable_optimum)
+    assert _unary_energy(problem, dict(forest.labeling)) == pytest.approx(
+        separable_optimum,
     )
 
 
