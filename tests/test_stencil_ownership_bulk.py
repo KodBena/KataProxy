@@ -15,6 +15,7 @@ from scripts.solve_ownership_corpus import (
     campaign_fingerprint,
     load_checkpoint,
     run_campaign,
+    _validate_output_paths,
 )
 from transformers.stencil_cover.stencil_ownership import (
     OwnershipEvidence,
@@ -154,6 +155,74 @@ def test_campaign_rounds_every_item_through_cumulative_levels_and_resumes(
 
     with pytest.raises(ValueError, match="does not match"):
         load_checkpoint(checkpoint, campaign, "different-campaign")
+
+
+def test_campaign_retries_solver_error_once_at_each_budget_level(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "ownership.sqlite3"
+    store = SQLiteOwnershipStore(database)
+    _record(store, CoherentOwnershipPolicy(), _evidence(), (0,), (1,))
+
+    campaign = build_campaign(load_archive(database))
+    item = campaign.items[0]
+    progress = {item.task_id: _initial_progress(item)}
+    levels_ms = (1000, 2000)
+    slice_ms = 500
+    fingerprint = campaign_fingerprint(campaign, levels_ms, slice_ms)
+    checkpoint = tmp_path / "error-checkpoint.json"
+    requested: list[int] = []
+
+    def failing_solver(
+        _task: CampaignItem,
+        _state: TaskProgress,
+        time_limit_ms: int,
+    ) -> SliceOutcome:
+        requested.append(time_limit_ms)
+        return SliceOutcome(
+            elapsed_wall_ms=1.0,
+            labels=None,
+            energy=None,
+            lower_bound=None,
+            status="error",
+            error="synthetic solver failure",
+        )
+
+    run_campaign(
+        campaign,
+        progress,
+        levels_ms=levels_ms,
+        slice_ms=slice_ms,
+        checkpoint_path=checkpoint,
+        fingerprint=fingerprint,
+        progress_interval_seconds=3600.0,
+        solver=failing_solver,
+    )
+
+    state = progress[item.task_id]
+    assert requested == [500, 500]
+    assert state.attempt_count == 2
+    assert state.last_error_level_ms == 2000
+    assert state.last_error == "synthetic solver failure"
+
+    resumed = load_checkpoint(checkpoint, campaign, fingerprint)
+    assert resumed[item.task_id].last_error_level_ms == 2000
+
+
+def test_campaign_output_paths_cannot_overwrite_the_evidence_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "ownership.sqlite3"
+    checkpoint = tmp_path / "checkpoint.json"
+    results = tmp_path / "results.json"
+
+    _validate_output_paths(database, checkpoint, results)
+    with pytest.raises(ValueError, match="source database"):
+        _validate_output_paths(database, database, results)
+    with pytest.raises(ValueError, match="source database"):
+        _validate_output_paths(database, checkpoint, database)
+    with pytest.raises(ValueError, match="different"):
+        _validate_output_paths(database, checkpoint, checkpoint)
 
 
 def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(

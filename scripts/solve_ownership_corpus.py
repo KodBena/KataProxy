@@ -85,6 +85,7 @@ class TaskProgress:
     optimal_proven: bool = False
     last_status: str = "not_started"
     last_error: str | None = None
+    last_error_level_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -490,16 +491,26 @@ def load_checkpoint(
                 raise ValueError("checkpoint claims proof without a closed objective gap")
         status = raw.get("last_status", "resumed")
         error = raw.get("last_error")
+        error_level = raw.get("last_error_level_ms")
         if not isinstance(status, str) or (
             error is not None and not isinstance(error, str)
         ):
             raise ValueError("checkpoint status/error fields are invalid")
+        if error_level is not None and (
+            isinstance(error_level, bool)
+            or not isinstance(error_level, int)
+            or error_level <= 0
+        ):
+            raise ValueError("checkpoint last_error_level_ms must be a positive integer or null")
+        if status == "error" and error_level is None:
+            raise ValueError("checkpoint error status requires its last budget level")
 
         state.spent_wall_ms = spent
         state.attempt_count = attempts_value
         state.optimal_proven = proven
         state.last_status = status
         state.last_error = error
+        state.last_error_level_ms = error_level
     return progress
 
 
@@ -531,6 +542,7 @@ def _progress_document(
                 "optimal_proven": state.optimal_proven,
                 "last_status": state.last_status,
                 "last_error": state.last_error,
+                "last_error_level_ms": state.last_error_level_ms,
             }
             for task_id, state in sorted(progress.items())
         },
@@ -669,6 +681,10 @@ def _apply_outcome(
     state.attempt_count += 1
     state.last_status = outcome.status
     state.last_error = outcome.error
+    if outcome.status == "error":
+        state.last_error_level_ms = state.last_error_level_ms
+    else:
+        state.last_error_level_ms = None
 
     if outcome.labels is not None:
         energy = _evaluate_labels(
@@ -796,6 +812,7 @@ def run_campaign(
                 if (
                     not progress[item.task_id].optimal_proven
                     and progress[item.task_id].spent_wall_ms < target_ms
+                    and progress[item.task_id].last_error_level_ms != target_ms
                 )
             ]
             if not pending:
@@ -807,6 +824,8 @@ def run_campaign(
                 budget_ms = max(1, min(slice_ms, math.ceil(remaining_ms)))
                 outcome = solver(item, state, budget_ms)
                 _apply_outcome(item, state, outcome)
+                if outcome.status == "error":
+                    state.last_error_level_ms = target_ms
                 save_checkpoint(
                     checkpoint_path,
                     campaign,
@@ -890,6 +909,7 @@ def _results_document(
             "status": final_status,
             "last_solver_status": state.last_status,
             "last_error": state.last_error,
+            "last_error_level_ms": state.last_error_level_ms,
             "spent_wall_ms": state.spent_wall_ms,
             "attempt_count": state.attempt_count,
             "best_labels": (
@@ -912,6 +932,23 @@ def _results_document(
         "counts": _state_counts(campaign, progress),
         "instances": instances,
     }
+
+
+def _validate_output_paths(
+    database: Path,
+    checkpoint: Path,
+    results: Path,
+) -> None:
+    """Prevent campaign output from replacing the source archive or each other."""
+    resolved_database = database.resolve()
+    resolved_checkpoint = checkpoint.resolve()
+    resolved_results = results.resolve()
+    if resolved_checkpoint == resolved_database:
+        raise ValueError("checkpoint path must not overwrite the source database")
+    if resolved_results == resolved_database:
+        raise ValueError("results path must not overwrite the source database")
+    if resolved_checkpoint == resolved_results:
+        raise ValueError("checkpoint and results paths must be different")
 
 
 def _parse_levels(value: str) -> tuple[float, ...]:
@@ -1029,6 +1066,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.results is not None
             else database.with_name(database.name + ".bulk-solve.results.json")
         )
+        _validate_output_paths(database, checkpoint_path, results_path)
         fingerprint = campaign_fingerprint(campaign, levels_ms, slice_ms)
 
         if args.plan_only:
@@ -1038,6 +1076,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "already_proven_count": campaign.already_proven_count,
                 "no_optimization_required_count": campaign.no_optimization_required_count,
                 "scheduled_count": len(campaign.items),
+                "approximate_feasible_count": sum(
+                    item.initial_labels is not None for item in campaign.items
+                ),
+                "no_feasible_witness_count": sum(
+                    item.initial_labels is None for item in campaign.items
+                ),
                 "omitted_by_limit_count": campaign.omitted_by_limit_count,
                 "budget_levels_seconds": levels_seconds,
                 "slice_seconds": slice_ms / 1000.0,

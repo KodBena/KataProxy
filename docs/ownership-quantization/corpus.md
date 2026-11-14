@@ -167,11 +167,18 @@ python -m scripts.solve_ownership_corpus --plan-only
 python -m scripts.solve_ownership_corpus
 ```
 
-The source SQLite database is opened read-only. The campaign deduplicates by
-exact evidence identity plus coherent objective identity, so repeated
-in-search/final observations and the coherent MIP/cut variants do not create
-duplicate solve tasks. Instances already proved optimal and instances with no
+The source SQLite database is opened read-only. Checkpoint and results
+paths are rejected if they resolve to the source database or to each other.
+The campaign deduplicates by exact evidence identity plus coherent objective
+identity, so repeated in-search/final observations and the coherent MIP/cut
+variants do not create duplicate solve tasks. Instances already proved optimal and instances with no
 empty points are not scheduled.
+
+Solver errors are not retried repeatedly within the same budget
+level. A failed item is attempted at most once per level and is retried at
+the next level; the error and last attempted level are checkpointed and shown
+in the results report. This prevents a fast deterministic backend failure
+from spinning through thousands of calls while other items are waiting.
 
 Each unresolved instance receives the same cumulative budget ceiling at a
 given level. The scheduler visits every outstanding instance at that level
