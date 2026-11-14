@@ -437,3 +437,20 @@ SELECTOR_MODELS: tuple[tuple[str, str, Optional[str]], ...] = _parse_selector_mo
 ORCHESTRATION_BUFFER_MAX: int = int(
     os.environ.get("PROXY_ORCHESTRATION_BUFFER_MAX", "1024")
 )
+
+
+# ---------------------------------------------------------------------------
+# Stencil-cover ownership-region policy
+# ---------------------------------------------------------------------------
+#
+# Policy selection is read once at process startup. The policy implementation
+# is composed behind the OwnershipRegionPolicy port under transformers/stencil_cover.
+
+STENCIL_OWNERSHIP_POLICY: str = os.environ.get(
+    "KATAPROXY_STENCIL_OWNERSHIP_POLICY", "threshold"
+).strip().lower()
+if STENCIL_OWNERSHIP_POLICY != "threshold":
+    raise ValueError(
+        "KATAPROXY_STENCIL_OWNERSHIP_POLICY must be 'threshold'"
+    )
+

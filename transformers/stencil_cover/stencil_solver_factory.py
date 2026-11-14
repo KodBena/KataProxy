@@ -55,3 +55,6 @@ def create_solver_backend(
     if not callable(getattr(backend, "solve", None)):
         raise SolverBackendUnavailable("selected solver backend does not implement solve()")
     return backend
+
+# The default foreground adapter is constructed once at the composition boundary.
+DEFAULT_SOLVER_BACKEND: SolverBackend = create_solver_backend("highs")

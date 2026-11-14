@@ -12,7 +12,18 @@ from typing import Any, Dict, List
 import pytest
 
 import transformers.stencil_cover.stencil_cache_storage as storage
-import transformers.stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_board as board_position
+import transformers.stencil_cover.stencil_family as stencil_family_module
+import transformers.stencil_cover.stencil_ownership as ownership
+import transformers.stencil_cover.stencil_ownership_policy as ownership_policy_factory
+import transformers.stencil_cover.stencil_region_solver as region_solver
+import transformers.stencil_cover.stencil_region_components as region_components
+import transformers.stencil_cover.stencil_component_cache as component_cache
+import transformers.stencil_cover.stencil_solver_factory as solver_factory
+import transformers.stencil_cover.stencil_solver_geometry as geometry
+import transformers.stencil_cover_enricher as enricher
+from transformers.stencil_cover.stencil_ownership_threshold import ThresholdOwnershipPolicy
+import sproxy_config as cfg
 from AbstractProxy.proxy_core import ClientId
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, make_katago_link
 from transformers.stencil_cover.stencil_bulk_solver import (
@@ -42,6 +53,27 @@ from transformers.stencil_cover.stencil_solver_api import (
     SolverOutcome,
 )
 from transformers.stencil_cover.stencil_solver_geometry import ComponentFrame, Stencil
+
+
+
+def _threshold_ownership_regions(
+    ownership_map: List[float],
+    board_map: List[str | None],
+    *,
+    width: int,
+    height: int,
+    threshold: float,
+) -> tuple[List[int], List[int]]:
+    evidence = ownership.make_ownership_evidence(
+        {"ownership": ownership_map},
+        board_map,
+        width,
+        height,
+        {"truncation_threshold": threshold},
+        requires_ownership_stdev=False,
+    )
+    selected = ThresholdOwnershipPolicy().classify(evidence)
+    return list(selected.positive), list(selected.negative)
 
 
 class _MemoryRedis:
@@ -282,7 +314,7 @@ def _cache_request(
     wall_ms: int = 250,
     backend: Any = None,
 ) -> SolverCacheRequest:
-    selected = stencil.DEFAULT_SOLVER_BACKEND if backend is None else backend
+    selected = solver_factory.DEFAULT_SOLVER_BACKEND if backend is None else backend
     return SolverCacheRequest(
         shape_key=shape_key,
         family=family,
@@ -300,7 +332,9 @@ def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
 ) -> None:
     client_id = ClientId("stencil-cover-test")
     link = make_katago_link()
-    transformer = stencil.stencil_cover_enricher(link)
+    transformer = enricher.stencil_cover_enricher(
+        link, ownership_policy=ThresholdOwnershipPolicy(),
+    )
     query = KataGoQuery(
         action=KataGoAction.ANALYZE,
         opaque={
@@ -337,7 +371,7 @@ def test_opt_in_requests_ownership_and_missing_map_does_not_kill_response(
 
 
 def test_family_parser_loads_proxy_owned_rectangles() -> None:
-    family = stencil._parse_stencil_family("name: dot\n#\n\nname: domino\n##\n")
+    family = stencil_family_module.parse_stencil_family("name: dot\n#\n\nname: domino\n##\n")
     assert family == (
         ("dot", ((0, 0),)),
         ("domino", ((0, 0), (0, 1))),
@@ -346,11 +380,11 @@ def test_family_parser_loads_proxy_owned_rectangles() -> None:
 
 def test_family_parser_rejects_disconnected_shapes() -> None:
     with pytest.raises(ValueError, match="4-connected"):
-        stencil._parse_stencil_family("name: split\n#.#\n")
+        stencil_family_module.parse_stencil_family("name: split\n#.#\n")
 
 
 def test_zero_threshold_splits_signs_and_leaves_neutral_points_unowned() -> None:
-    positive, negative = stencil._ownership_regions(
+    positive, negative = _threshold_ownership_regions(
         [0.8, 0.0, -0.7, 0.4],
         [None, None, None, None],
         width=2,
@@ -362,7 +396,7 @@ def test_zero_threshold_splits_signs_and_leaves_neutral_points_unowned() -> None
 
 
 def test_threshold_one_keeps_only_fully_owned_empty_points() -> None:
-    positive, negative = stencil._ownership_regions(
+    positive, negative = _threshold_ownership_regions(
         [1.0, 0.999, -1.0, -0.999],
         [None, None, None, None],
         width=2,
@@ -374,9 +408,9 @@ def test_threshold_one_keeps_only_fully_owned_empty_points() -> None:
 
 
 def test_coordinate_parser_handles_numeric_and_rectangular_coordinates() -> None:
-    assert stencil._coordinate_index("(2, 0)", 3, 2, allow_pass=False) == 2
-    assert stencil._coordinate_index("C2", 3, 2, allow_pass=False) == 2
-    assert stencil._coordinate_index("A1", 3, 2, allow_pass=False) == 3
+    assert board_position._coordinate_index("(2, 0)", 3, 2, allow_pass=False) == 2
+    assert board_position._coordinate_index("C2", 3, 2, allow_pass=False) == 2
+    assert board_position._coordinate_index("A1", 3, 2, allow_pass=False) == 3
 
 
 def test_dead_chains_join_opponent_territory_and_living_stones_are_excluded() -> None:
@@ -385,7 +419,7 @@ def test_dead_chains_join_opponent_territory_and_living_stones_are_excluded() ->
     board = ["B", "B", None, "W", "W", None, "B", None]
     ownership = [0.3, 0.0, 0.95, -0.95, -0.5, -0.9, -0.95, -0.9]
 
-    positive, negative = stencil._ownership_regions(
+    positive, negative = _threshold_ownership_regions(
         ownership, board, width=4, height=2, threshold=0.8,
     )
 
@@ -396,25 +430,25 @@ def test_dead_chains_join_opponent_territory_and_living_stones_are_excluded() ->
 
 
 def test_board_replay_stops_at_the_requested_turn_and_applies_captures() -> None:
-    context = stencil.RequestContext(
+    context = board_position.RequestContext(
         width=3,
         height=3,
-        threshold=0.6,
         initial_stones=(
-            ("W", stencil._coordinate_index("B2", 3, 3, allow_pass=False)),
-            ("B", stencil._coordinate_index("B3", 3, 3, allow_pass=False)),
+            ("W", board_position._coordinate_index("B2", 3, 3, allow_pass=False)),
+            ("B", board_position._coordinate_index("B3", 3, 3, allow_pass=False)),
         ),
         moves=(
-            ("B", stencil._coordinate_index("A2", 3, 3, allow_pass=True)),
+            ("B", board_position._coordinate_index("A2", 3, 3, allow_pass=True)),
             ("W", None),
-            ("B", stencil._coordinate_index("C2", 3, 3, allow_pass=True)),
+            ("B", board_position._coordinate_index("C2", 3, 3, allow_pass=True)),
             ("W", None),
-            ("B", stencil._coordinate_index("B1", 3, 3, allow_pass=True)),
+            ("B", board_position._coordinate_index("B1", 3, 3, allow_pass=True)),
         ),
+        policy_metadata={},
     )
 
-    before_capture = stencil._board_at_turn(context, 4)
-    after_capture = stencil._board_at_turn(context, 5)
+    before_capture = board_position._board_at_turn(context, 4)
+    after_capture = board_position._board_at_turn(context, 5)
     assert before_capture[4] == "W"
     assert after_capture[4] is None
     assert after_capture[1] == "B"
@@ -422,7 +456,7 @@ def test_board_replay_stops_at_the_requested_turn_and_applies_captures() -> None
 
 def test_candidates_include_singletons_for_every_region_point() -> None:
     family = (("domino", ((0, 0), (0, 1))),)
-    candidates = stencil._candidate_placements([0, 1, 2], 3, 1, family)
+    candidates = region_components._candidate_placements([0, 1, 2], 3, 1, family)
     candidate_cells = {points for _, points in candidates}
     assert (0,) in candidate_cells
     assert (1,) in candidate_cells
@@ -433,15 +467,15 @@ def test_candidates_include_singletons_for_every_region_point() -> None:
 
 
 def test_components_use_four_connectivity_not_diagonal_connectivity() -> None:
-    components = stencil._connected_components(
+    components = region_components._connected_components(
         [0, 1, 7, 8], width=3, height=3,
     )
     assert components == [(0, 1), (7, 8)]
 
 
 def test_component_shape_key_is_translation_normalized() -> None:
-    first, first_frame = stencil._component_shape_key((0, 1, 3, 4), board_width=3)
-    translated, translated_frame = stencil._component_shape_key(
+    first, first_frame = region_components._component_shape_key((0, 1, 3, 4), board_width=3)
+    translated, translated_frame = region_components._component_shape_key(
         (7, 8, 10, 11), board_width=3,
     )
     assert first == translated
@@ -462,7 +496,7 @@ def test_component_shape_key_is_translation_normalized() -> None:
 
 
 def test_rectangle_family_has_the_full_d4_stabilizer() -> None:
-    assert stencil._family_dihedral_group(stencil.STENCIL_FAMILY) == tuple(range(8))
+    assert geometry.family_dihedral_group(stencil_family_module.STENCIL_FAMILY) == tuple(range(8))
 
 
 def test_stencil_family_contains_complete_d4_orbits_of_s_and_l_pieces() -> None:
@@ -473,12 +507,12 @@ def test_stencil_family_contains_complete_d4_orbits_of_s_and_l_pieces() -> None:
     )
     for prefix, prototype, expected_orbit_size in prototypes:
         expected = {
-            stencil._normalise_shape(prototype, transform)
+            geometry.normalise_shape(prototype, transform)
             for transform in range(8)
         }
         actual = {
             cells
-            for name, cells in stencil.STENCIL_FAMILY
+            for name, cells in stencil_family_module.STENCIL_FAMILY
             if name.startswith(prefix + "-")
         }
         assert len(expected) == expected_orbit_size
@@ -493,7 +527,7 @@ def test_each_new_asymmetric_stencil_solves_as_one_exact_tile() -> None:
     )
     new_stencils = [
         (name, cells)
-        for name, cells in stencil.STENCIL_FAMILY
+        for name, cells in stencil_family_module.STENCIL_FAMILY
         if name.startswith(new_names)
     ]
     assert len(new_stencils) == 16
@@ -502,8 +536,8 @@ def test_each_new_asymmetric_stencil_solves_as_one_exact_tile() -> None:
         width = max(x for _, x in cells) + 1
         height = max(y for y, _ in cells) + 1
         region = [y * width + x for y, x in cells]
-        result = stencil._solve_region(
-            region, width, height, stencil.STENCIL_FAMILY,
+        result = region_solver._solve_region(
+            region, width, height, stencil_family_module.STENCIL_FAMILY,
         )
         assert result["optimal"] is True
         assert result["tileCount"] == 1
@@ -518,7 +552,7 @@ def test_component_shape_key_merges_all_eight_dihedral_images() -> None:
     keys: List[bytes] = []
     for transform in range(8):
         mapped = [
-            stencil._transform_cell(y, x, transform)
+            geometry.transform_cell(y, x, transform)
             for y, x in shape
         ]
         min_y = min(y for y, _ in mapped)
@@ -529,7 +563,7 @@ def test_component_shape_key_merges_all_eight_dihedral_images() -> None:
             (y - min_y + 4) * 16 + (x - min_x + 4)
             for y, x in mapped
         )
-        key, _frame = stencil._component_shape_key(points, board_width=16)
+        key, _frame = region_components._component_shape_key(points, board_width=16)
         keys.append(key)
     assert len(set(keys)) == 1
 
@@ -539,13 +573,13 @@ def test_family_symmetry_is_restricted_to_maps_that_preserve_its_shapes() -> Non
         ("dot", ((0, 0),)),
         ("line", ((0, 0), (0, 1), (0, 2))),
     )
-    assert stencil._family_dihedral_group(horizontal_only) == (0, 2, 4, 5)
+    assert geometry.family_dihedral_group(horizontal_only) == (0, 2, 4, 5)
 
 
 def test_canonical_solution_is_recovered_with_rotated_stencil_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    family = stencil.STENCIL_FAMILY
+    family = stencil_family_module.STENCIL_FAMILY
     seen_keys: List[bytes] = []
 
     def fake_cached(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
@@ -553,20 +587,20 @@ def test_canonical_solution_is_recovered_with_rotated_stencil_name(
         family_key = request.family
         assert request.budget.wall_time_limit_ms == 250
         seen_keys.append(shape_key)
-        local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
-        candidates = stencil._candidate_placements(
+        local_width, local_height, cells = geometry.decode_component_shape_key(shape_key)
+        candidates = region_components._candidate_placements(
             cells, local_width, local_height, family_key,
         )
         complete = next(
             candidate for candidate in candidates
             if len(candidate[1]) == len(cells) and set(candidate[1]) == set(cells)
         )
-        return True, 0, stencil._encode_cached_placements([complete], family_key)
+        return True, 0, geometry.encode_cached_placements([complete], family_key)
 
     monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
 
-    horizontal = stencil._solve_region([0, 1], width=2, height=1, family=family)
-    vertical = stencil._solve_region([0, 1], width=1, height=2, family=family)
+    horizontal = region_solver._solve_region([0, 1], width=2, height=1, family=family)
+    vertical = region_solver._solve_region([0, 1], width=1, height=2, family=family)
 
     assert seen_keys[0] == seen_keys[1]
     assert horizontal["placements"] == [
@@ -583,14 +617,14 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
     base_shape = ((0, 0), (1, 0), (1, 1))
     unique_shapes: List[tuple[tuple[int, int], ...]] = []
     for transform in range(8):
-        candidate = stencil._normalise_shape(base_shape, transform)
+        candidate = geometry.normalise_shape(base_shape, transform)
         if candidate not in unique_shapes:
             unique_shapes.append(candidate)
     family = (
         ("dot", ((0, 0),)),
         *((f"L{index}", shape) for index, shape in enumerate(unique_shapes)),
     )
-    assert stencil._family_dihedral_group(family) == tuple(range(8))
+    assert geometry.family_dihedral_group(family) == tuple(range(8))
 
     seen_keys: List[bytes] = []
 
@@ -599,22 +633,22 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
         family_key = request.family
         assert request.budget.wall_time_limit_ms == 250
         seen_keys.append(shape_key)
-        local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
-        candidates = stencil._candidate_placements(
+        local_width, local_height, cells = geometry.decode_component_shape_key(shape_key)
+        candidates = region_components._candidate_placements(
             cells, local_width, local_height, family_key,
         )
         complete = next(
             candidate for candidate in candidates
             if len(candidate[1]) == len(cells) and set(candidate[1]) == set(cells)
         )
-        return True, 0, stencil._encode_cached_placements([complete], family_key)
+        return True, 0, geometry.encode_cached_placements([complete], family_key)
 
     monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
 
     recovered: List[List[Dict[str, Any]]] = []
     for transform in range(8):
         mapped = [
-            stencil._transform_cell(y, x, transform)
+            geometry.transform_cell(y, x, transform)
             for y, x in base_shape
         ]
         min_y = min(y for y, _ in mapped)
@@ -623,7 +657,7 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
             (y - min_y + 3) * 10 + (x - min_x + 3)
             for y, x in mapped
         )
-        result = stencil._solve_region(
+        result = region_solver._solve_region(
             component, width=10, height=10, family=family,
         )
         recovered.append(result["placements"])
@@ -652,9 +686,9 @@ def test_disconnected_region_is_solved_as_independent_components(
         shape_key = request.shape_key
         family_key = request.family
         assert request.budget.wall_time_limit_ms == 250
-        local_width, local_height, cells = stencil._decode_component_shape_key(shape_key)
+        local_width, local_height, cells = geometry.decode_component_shape_key(shape_key)
         # The cache/solver boundary must never receive a disconnected mask.
-        assert stencil._connected_components(
+        assert region_components._connected_components(
             cells, local_width, local_height,
         ) == [tuple(cells)]
         seen_components.append(tuple(cells))
@@ -662,11 +696,11 @@ def test_disconnected_region_is_solved_as_independent_components(
         return (
             True,
             0,
-            stencil._encode_cached_placements(singleton_cover, family_key),
+            geometry.encode_cached_placements(singleton_cover, family_key),
         )
 
     monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
-    result = stencil._solve_region(
+    result = region_solver._solve_region(
         [0, 1, 8], width=3, height=3, family=family,
     )
     assert seen_components == [(0, 1), (0,)]
@@ -705,16 +739,16 @@ def test_raw_components_retain_the_cells_and_status_of_each_solver_call(
         family_key = request.family
         assert request.budget.wall_time_limit_ms == 250
         _optimal, status = next(returned_statuses)
-        _width, _height, cells = stencil._decode_component_shape_key(shape_key)
+        _width, _height, cells = geometry.decode_component_shape_key(shape_key)
         singleton_cover = [("1x1", (point,)) for point in cells]
         return (
             False,
             status,
-            stencil._encode_cached_placements(singleton_cover, family_key),
+            geometry.encode_cached_placements(singleton_cover, family_key),
         )
 
     monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
-    result = stencil._solve_region([0, 1, 8], 3, 3, family)
+    result = region_solver._solve_region([0, 1, 8], 3, 3, family)
 
     assert result["status"] == "fallback"
     assert result["optimal"] is False
@@ -735,7 +769,7 @@ def test_raw_components_retain_the_cells_and_status_of_each_solver_call(
 
 
 def test_empty_region_exposes_an_empty_raw_component_list() -> None:
-    result = stencil._solve_region([], 3, 3, (("1x1", ((0, 0),)),))
+    result = region_solver._solve_region([], 3, 3, (("1x1", ((0, 0),)),))
     assert result == {
         "components": [],
         "placements": [],
@@ -746,7 +780,7 @@ def test_empty_region_exposes_an_empty_raw_component_list() -> None:
 
 
 def test_component_solver_cache_is_large_and_entry_bounded() -> None:
-    info = stencil._solve_component_cached.cache_info()
+    info = component_cache._solve_component_cached.cache_info()
     assert info.maxsize == 90_000
 
 def _mock_link() -> Any:
@@ -784,7 +818,7 @@ def _response(*, during_search: bool = False) -> AnalyzeResponse:
 
 
 def test_transformer_requires_explicit_stencil_cover_opt_in() -> None:
-    transformer = stencil.stencil_cover_enricher(_mock_link())
+    transformer = enricher.stencil_cover_enricher(_mock_link())
     query = _query({})
     assert transformer.on_query(ClientId("q1"), query) is query
     response = _response()
@@ -794,12 +828,14 @@ def test_transformer_requires_explicit_stencil_cover_opt_in() -> None:
 
 
 
-def test_transformer_does_not_need_policy_map_for_territory() -> None:
-    transformer = stencil.stencil_cover_enricher(_mock_link())
-    transformer.on_query(
-        ClientId("q3"),
-        _query({"stencil_cover": {"truncation_threshold": 0.5}}),
+def test_legacy_threshold_policy_does_not_require_ownership_stdev() -> None:
+    transformer = enricher.stencil_cover_enricher(
+        _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),
     )
+    query = _query({"stencil_cover": {"truncation_threshold": 0.5}})
+    transformer.on_query(ClientId("q3"), query)
+    assert query.opaque["includeOwnership"] is True
+    assert "includeOwnershipStdev" not in query.opaque
     response = AnalyzeResponse(
         is_during_search=False,
         turn_number=0,
@@ -809,12 +845,32 @@ def test_transformer_does_not_need_policy_map_for_territory() -> None:
     assert "stencilCover" in response.opaque
 
 
+
+
+def test_environment_policy_factory_selects_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_POLICY", "threshold")
+    assert isinstance(
+        ownership_policy_factory.create_ownership_region_policy(),
+        ThresholdOwnershipPolicy,
+    )
+
+
+def test_legacy_threshold_policy_validates_its_per_query_cutoff() -> None:
+    transformer = enricher.stencil_cover_enricher(
+        _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),
+    )
+    with pytest.raises(ValueError, match="truncation_threshold"):
+        transformer.on_query(ClientId("missing-threshold"), _query({"stencil_cover": {}}))
+
+
 def test_highs_returns_a_valid_minimum_exact_cover_for_a_domino_region() -> None:
     family = (
         ("1x1", ((0, 0),)),
         ("1x2", ((0, 0), (0, 1))),
     )
-    result = stencil._solve_region([0, 1], 2, 1, family)
+    result = region_solver._solve_region([0, 1], 2, 1, family)
     assert result["tileCount"] == 1
     assert result["optimal"] is True
     assert result["placements"] == [
@@ -873,7 +929,7 @@ def test_foreground_persistent_write_registers_selected_work_profile(
         policy_id="foreground-250ms",
     )
     profile = storage.make_solver_work_profile(identity, budget)
-    encoded = stencil._encode_cached_placements([("dot", (0,))], family)
+    encoded = geometry.encode_cached_placements([("dot", (0,))], family)
     calls: list[bytes] = []
     selected_backend = _CacheRequestBackend(identity)
 
@@ -916,7 +972,7 @@ def test_redis_persistent_cache_keeps_approximation_and_indexes_hard_problem(
     )
     approximation = (
         False, 1,
-        stencil._encode_cached_placements([("domino", (0, 1))], family),
+        geometry.encode_cached_placements([("domino", (0, 1))], family),
     )
 
     def solve(request: SolverCacheRequest) -> SolverCacheCandidate:
@@ -966,17 +1022,17 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
     shape_key = b"canonical-component"
     fallback = (
         False, 2,
-        stencil._encode_cached_placements(
+        geometry.encode_cached_placements(
             [("dot", (0,)), ("dot", (1,))], family,
         ),
     )
     approximation = (
         False, 1,
-        stencil._encode_cached_placements([("domino", (0, 1))], family),
+        geometry.encode_cached_placements([("domino", (0, 1))], family),
     )
     exact = (
         True, 0,
-        stencil._encode_cached_placements([("domino", (0, 1))], family),
+        geometry.encode_cached_placements([("domino", (0, 1))], family),
     )
 
     assert store.put_result(shape_key, family, fallback) is True
@@ -997,7 +1053,7 @@ def test_redis_stencil_store_only_upgrades_to_better_results() -> None:
 
     contradictory_exact = (
         True, 0,
-        stencil._encode_cached_placements(
+        geometry.encode_cached_placements(
             [("dot", (0,)), ("dot", (1,))], family,
         ),
     )
@@ -1033,7 +1089,7 @@ def test_pending_queue_migrates_existing_hard_components_once() -> None:
     shape_key = b"pre-existing-hard-component"
     approximation = (
         False, 1,
-        stencil._encode_cached_placements([("dot", (0,))], family),
+        geometry.encode_cached_placements([("dot", (0,))], family),
     )
 
     store.put_result(shape_key, family, approximation)
@@ -1058,13 +1114,13 @@ def test_timeout_metadata_retires_pending_work_and_better_results_requeue() -> N
     shape_key = b"hard-square"
     two_dominoes = (
         False, 1,
-        stencil._encode_cached_placements(
+        geometry.encode_cached_placements(
             [("domino", (0, 1)), ("domino", (2, 3))], family,
         ),
     )
     one_square = (
         False, 1,
-        stencil._encode_cached_placements([("square", (0, 1, 2, 3))], family),
+        geometry.encode_cached_placements([("square", (0, 1, 2, 3))], family),
     )
 
     assert store.put_result(shape_key, family, two_dominoes)
@@ -1104,13 +1160,13 @@ def test_timeout_metadata_uses_result_current_at_atomic_retirement() -> None:
     shape_key = b"race-component"
     stale = (
         False, 1,
-        stencil._encode_cached_placements(
+        geometry.encode_cached_placements(
             [("domino", (0, 1)), ("domino", (2, 3))], family,
         ),
     )
     improved = (
         False, 1,
-        stencil._encode_cached_placements(
+        geometry.encode_cached_placements(
             [("square", (0, 1, 2, 3))], family,
         ),
     )
@@ -1167,7 +1223,7 @@ class _StaticSolverBackend:
             board_width=problem.width, transform=0, offset_y=0, offset_x=0,
             canonical_width=problem.width, canonical_height=problem.height,
         )
-        recovered = stencil._decode_cached_placements(self.encoded, self.family, frame)
+        recovered = geometry.decode_cached_placements(self.encoded, self.family, frame)
         placements = tuple(
             (item["stencil"], tuple((point[1], point[0]) for point in item["points"]))
             for item in recovered
@@ -1192,10 +1248,10 @@ def test_bulk_worker_upgrades_to_optimal_and_uses_ten_second_budget() -> None:
     backend = _MemoryRedis()
     store = storage.RedisStencilStore(backend, "bulk-optimal-test")
     family = (("domino", ((0, 0), (0, 1))),)
-    shape_key, _frame = stencil._component_shape_key(
+    shape_key, _frame = region_components._component_shape_key(
         (0, 1), board_width=2, family=family,
     )
-    encoded = stencil._encode_cached_placements([("domino", (0, 1))], family)
+    encoded = geometry.encode_cached_placements([("domino", (0, 1))], family)
     approximation = (False, 1, encoded)
     exact = (True, 0, encoded)
     assert store.put_result(shape_key, family, approximation)
@@ -1225,10 +1281,10 @@ def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
         ("dot", ((0, 0),)),
         ("domino", ((0, 0), (0, 1))),
     )
-    shape_key, _frame = stencil._component_shape_key(
+    shape_key, _frame = region_components._component_shape_key(
         (0, 1), board_width=2, family=family,
     )
-    encoded = stencil._encode_cached_placements([("domino", (0, 1))], family)
+    encoded = geometry.encode_cached_placements([("domino", (0, 1))], family)
     approximation = (False, 1, encoded)
     assert store.put_result(shape_key, family, approximation)
 
@@ -1258,7 +1314,7 @@ def test_bulk_worker_persists_timeout_and_does_not_retry() -> None:
 def test_bulk_worker_rejects_a_malformed_or_non_covering_solution() -> None:
 
     family = (("domino", ((0, 0), (0, 1))),)
-    shape_key, _frame = stencil._component_shape_key(
+    shape_key, _frame = region_components._component_shape_key(
         (0, 1), board_width=2, family=family,
     )
     malformed = (True, 0, bytes((1, 0, 0, 0)))
@@ -1268,15 +1324,15 @@ def test_bulk_worker_rejects_a_malformed_or_non_covering_solution() -> None:
 
 def test_local_solver_cache_invalidation_clears_request_lru() -> None:
     family = (("dot", ((0, 0),)),)
-    shape_key, _frame = stencil._component_shape_key(
+    shape_key, _frame = region_components._component_shape_key(
         (0,), board_width=1, family=family,
     )
-    stencil._solve_component_cached.cache_clear()
-    stencil._solve_component_cached(_cache_request(shape_key, family, wall_ms=100))
-    assert stencil._solve_component_cached.cache_info().currsize == 1
+    component_cache._solve_component_cached.cache_clear()
+    component_cache._solve_component_cached(_cache_request(shape_key, family, wall_ms=100))
+    assert component_cache._solve_component_cached.cache_info().currsize == 1
 
-    stencil._invalidate_component_cache()
-    assert stencil._solve_component_cached.cache_info().currsize == 0
+    component_cache._invalidate_component_cache()
+    assert component_cache._solve_component_cached.cache_info().currsize == 0
 
 
 def test_component_specific_invalidation_preserves_other_lru_entries() -> None:
@@ -1284,23 +1340,23 @@ def test_component_specific_invalidation_preserves_other_lru_entries() -> None:
         ("dot", ((0, 0),)),
         ("domino", ((0, 0), (0, 1))),
     )
-    singleton_key, _ = stencil._component_shape_key(
+    singleton_key, _ = region_components._component_shape_key(
         (0,), board_width=1, family=family,
     )
-    domino_key, _ = stencil._component_shape_key(
+    domino_key, _ = region_components._component_shape_key(
         (0, 1), board_width=2, family=family,
     )
-    stencil._solve_component_cached.cache_clear()
-    stencil._solve_component_cached(_cache_request(singleton_key, family, wall_ms=1_000))
-    stencil._solve_component_cached(_cache_request(domino_key, family, wall_ms=1_000))
-    assert stencil._solve_component_cached.cache_info().currsize == 2
+    component_cache._solve_component_cached.cache_clear()
+    component_cache._solve_component_cached(_cache_request(singleton_key, family, wall_ms=1_000))
+    component_cache._solve_component_cached(_cache_request(domino_key, family, wall_ms=1_000))
+    assert component_cache._solve_component_cached.cache_info().currsize == 2
 
-    stencil._invalidate_component_cache(singleton_key)
-    assert stencil._solve_component_cached.cache_info().currsize == 1
-    before_hits = stencil._solve_component_cached.cache_info().hits
-    stencil._solve_component_cached(_cache_request(domino_key, family, wall_ms=1_000))
-    assert stencil._solve_component_cached.cache_info().hits == before_hits + 1
-    stencil._solve_component_cached.cache_clear()
+    component_cache._invalidate_component_cache(singleton_key)
+    assert component_cache._solve_component_cached.cache_info().currsize == 1
+    before_hits = component_cache._solve_component_cached.cache_info().hits
+    component_cache._solve_component_cached(_cache_request(domino_key, family, wall_ms=1_000))
+    assert component_cache._solve_component_cached.cache_info().hits == before_hits + 1
+    component_cache._solve_component_cached.cache_clear()
 
 
 def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None:
@@ -1321,7 +1377,7 @@ def test_invalidation_during_solver_call_does_not_recache_stale_result() -> None
             return stale
         return improved
 
-    cache = stencil._InvalidatableSolverCache(solve, maxsize=4)
+    cache = component_cache._InvalidatableSolverCache(solve, maxsize=4)
     request = _cache_request(shape_key, family)
     results: List[tuple[bool, int, bytes]] = []
     thread = threading.Thread(
@@ -1399,7 +1455,7 @@ def test_redis_persistent_cache_recovers_after_startup_outage(
     shape_key = b"startup-recovery"
     result = (
         True, 0,
-        stencil._encode_cached_placements([("dot", (0,))], family),
+        geometry.encode_cached_placements([("dot", (0,))], family),
     )
 
     def solve(request: SolverCacheRequest) -> SolverCacheCandidate:
@@ -1461,7 +1517,7 @@ def test_v4_reads_v3_rows_as_legacy_unknown_and_ignores_global_timeout() -> None
     old_result_key = old_store._problem_key(shape_key, family)
     old_hard_key = old_store._hard_set_key(family)
     old_timeout_key = old_store._timeout_hash_key(family)
-    encoded = stencil._encode_cached_placements([("dot", (0,))], family)
+    encoded = geometry.encode_cached_placements([("dot", (0,))], family)
     backend.values[old_result_key] = json.dumps({
         "version": 2,
         "optimal": False,
@@ -1542,7 +1598,7 @@ def test_v3_result_arbitration_uses_certified_bound_for_equal_tile_count() -> No
     shape_key = b"same-cost-quality-bound"
     result = (
         False, 1,
-        stencil._encode_cached_placements([("dot", (0,))], family),
+        geometry.encode_cached_placements([("dot", (0,))], family),
     )
     first = _result_provenance(
         "12345678-1234-5678-1234-567812345678", 0,
@@ -1588,7 +1644,7 @@ def test_solver_profiles_have_independent_pending_and_timeout_state() -> None:
     store = storage.RedisStencilStore(backend, "profile-isolation-test")
     family = (("dot", ((0, 0),)),)
     shape_key = b"profile-isolated-component"
-    result = (False, 1, stencil._encode_cached_placements([("dot", (0,))], family))
+    result = (False, 1, geometry.encode_cached_placements([("dot", (0,))], family))
     profile_a, profile_b = profile("A"), profile("B")
 
     store.initialize_pending_queue(family, profile_a)
@@ -1638,7 +1694,7 @@ def test_new_profile_is_seeded_from_hard_index_despite_other_profile_timeouts() 
     store = storage.RedisStencilStore(backend, "profile-seed-test")
     family = (("dot", ((0, 0),)),)
     shape_key = b"seeded-after-retirement"
-    result = (False, 1, stencil._encode_cached_placements([("dot", (0,))], family))
+    result = (False, 1, geometry.encode_cached_placements([("dot", (0,))], family))
     a, b, c = profile("A"), profile("B"), profile("C")
     store.initialize_pending_queue(family, a)
     store.initialize_pending_queue(family, b)
@@ -1679,8 +1735,8 @@ def test_better_result_requeues_only_its_origin_profile_and_optimum_clears_all()
         ("domino", ((0, 0), (0, 1))),
     )
     shape_key = b"global-upgrade"
-    two_dots = (False, 2, stencil._encode_cached_placements([("dot", (0,)), ("dot", (1,))], family))
-    one_domino = (False, 1, stencil._encode_cached_placements([("domino", (0, 1))], family))
+    two_dots = (False, 2, geometry.encode_cached_placements([("dot", (0,)), ("dot", (1,))], family))
+    one_domino = (False, 1, geometry.encode_cached_placements([("domino", (0, 1))], family))
     exact = (True, 0, one_domino[2])
     a, b = profile("A"), profile("B")
     store.initialize_pending_queue(family, a)

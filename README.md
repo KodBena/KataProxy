@@ -186,7 +186,7 @@ load balancing) works identically with or without it.
 
 ## Stencil-cover enrichment (opt-in)
 
-An analyze query can request the signed stencil-cover annotation by including:
+An analyze query opts in to the signed stencil-cover annotation by including:
 
 ```json
 {
@@ -198,9 +198,16 @@ An analyze query can request the signed stencil-cover annotation by including:
 }
 ```
 
-The transformer requests KataGo's ownership map automatically for opted-in
-queries and adds `opaque.stencilCover` to final analysis responses. No
-separate `includeOwnership` flag is required from the client.
+The transformer requests KataGo's ownership map for opted-in queries and adds
+`opaque.stencilCover` to final analysis responses. No separate
+`includeOwnership` flag is required from the client.
+
+Ownership-region selection is behind the `OwnershipRegionPolicy` port. The
+initial `threshold` policy preserves the original per-intersection cutoff.
+The policy is selected at startup with
+`KATAPROXY_STENCIL_OWNERSHIP_POLICY=threshold`; see
+[`docs/stencil-ownership-policy.md`](docs/stencil-ownership-policy.md) for the
+policy contract and extension point.
 
 The foreground solver is the normal operating mode: it attempts each
 component with a 250 ms HiGHS time limit and returns its best valid result,
