@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .stencil_ownership import OwnershipEvidence
 from .stencil_ownership_graphcut import ownership_graph
@@ -21,6 +21,7 @@ _NUMERIC_TOLERANCE = 1e-9
 Edge = tuple[int, int]
 Labeling = dict[int, int]
 UnaryAdjustments = Mapping[int, tuple[float, float, float]]
+DPProgress = Callable[[int, int, int], None]
 
 
 @dataclass(frozen=True)
@@ -422,6 +423,7 @@ def solve_forest_dp(
     problem: ReducedOwnershipProblem,
     retained_edges: Sequence[Edge],
     unary_adjustments: UnaryAdjustments | None = None,
+    progress: DPProgress | None = None,
 ) -> ForestDPResult:
     """Exactly minimize a forest surrogate while preserving the global integer sum.
 
@@ -481,6 +483,8 @@ def solve_forest_dp(
     component_profiles: list[dict[int, float]] = []
     component_root_choices: list[dict[int, int]] = []
     dp_state_count = 0
+    completed_nodes = 0
+    total_nodes = len(problem.points)
 
     for component in components:
         root = component[0]
@@ -525,6 +529,9 @@ def solve_forest_dp(
             node_tables[point] = current
             node_back[point] = stage_back
             dp_state_count += len(current)
+            completed_nodes += 1
+            if progress is not None:
+                progress(completed_nodes, total_nodes, dp_state_count)
 
         profile: dict[int, float] = {}
         root_choices: dict[int, int] = {}
@@ -537,7 +544,7 @@ def solve_forest_dp(
 
     global_profile: dict[int, float] = {0: 0.0}
     global_back: list[dict[int, tuple[int, int]]] = []
-    for profile in component_profiles:
+    for component_index, profile in enumerate(component_profiles, start=1):
         merged_global: dict[int, float] = {}
         back_global: dict[int, tuple[int, int]] = {}
         for previous_sum, previous_cost in sorted(global_profile.items()):
@@ -550,6 +557,8 @@ def solve_forest_dp(
         global_profile = merged_global
         global_back.append(back_global)
         dp_state_count += len(global_profile)
+        if progress is not None:
+            progress(total_nodes + component_index, total_nodes + len(components), dp_state_count)
 
     feasible_sums = [
         total for total in global_profile
@@ -672,6 +681,7 @@ def forest_majorize_minimize(
     retained_edges: Sequence[Edge],
     maximum_passes: int,
     initial_labeling: Mapping[int, int] | None = None,
+    progress: DPProgress | None = None,
 ) -> ForestMMResult:
     """Run a bounded, monotone sequence of exactly solved forest majorizers."""
     if (
@@ -698,7 +708,7 @@ def forest_majorize_minimize(
         )
         if abs(surrogate_at_reference - reduced_energy(problem, current)) > 1e-7:
             raise ArithmeticError("MM surrogate does not touch the original energy")
-        optimized = solve_forest_dp(problem, forest, adjustments)
+        optimized = solve_forest_dp(problem, forest, adjustments, progress=progress)
         candidate = dict(optimized.labeling)
         _validate_labeling(problem, candidate)
         surrogate_value = majorizer_energy(
