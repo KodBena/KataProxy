@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
+from numpy.typing import NDArray
 
 from .stencil_board import _chain_and_liberties
 
@@ -49,7 +50,7 @@ class OwnershipRegionPolicy(Protocol):
     def classify(self, evidence: OwnershipEvidence) -> OwnershipRegions: ...
 
 
-def _numeric_array(value: Any, field_name: str) -> np.ndarray:
+def _numeric_array(value: Any, field_name: str) -> NDArray[np.float64]:
     raw = np.asarray(value)
     if raw.dtype.kind not in "iuf":
         raise ValueError(f"{field_name} must contain only numbers")
@@ -60,7 +61,7 @@ def _numeric_array(value: Any, field_name: str) -> np.ndarray:
 
 
 def _dead_stone_owners(
-    ownership: Sequence[float],
+    ownership: NDArray[np.float64],
     board: Sequence[Optional[str]],
     width: int,
     height: int,
