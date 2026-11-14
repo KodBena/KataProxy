@@ -43,10 +43,10 @@ from AbstractProxy.proxy_core import CanonicalId
 from katago import KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
 from transformers import stencil_cover_enricher as stencil
-from transformers.stencil_cover.stencil_cover import stencil_corpus_publisher as corpus_publisher
-from transformers.stencil_cover.stencil_cover import stencil_corpus_supervisor
+from transformers.stencil_cover import stencil_corpus_publisher as corpus_publisher
+from transformers.stencil_cover import stencil_corpus_supervisor
 from transformers.stencil_cover.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
-from transformers.stencil_cover.stencil_cover import stencil_cache_storage
+from transformers.stencil_cover import stencil_cache_storage
 from transformers.stencil_cover.stencil_cache_storage import (
     RedisCacheConflict,
     RedisStencilStore,

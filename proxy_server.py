@@ -1417,7 +1417,7 @@ class ProxyServer:
 # ---------------------------------------------------------------------------
 from contextual import Contextual
 from transformers.transposition_enricher import transposition_enricher
-from transformers.stencil_cover.stencil_cover_enricher import stencil_cover_enricher
+from transformers.stencil_cover_enricher import stencil_cover_enricher
 from transformers.analysis_enricher import analysis_enricher
 from transformers.capability_gate import capability_gate
 from transformers.capabilities_advertiser import capabilities_advertiser
