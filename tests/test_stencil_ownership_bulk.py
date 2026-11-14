@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -188,7 +189,6 @@ def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(
         progress_interval_seconds=3600.0,
         solver=fake_solver,  # type: ignore[arg-type]
     )
-    import json
     document = json.loads(checkpoint.read_text(encoding="utf-8"))
     document["tasks"][item.task_id]["best_labels"] = [[999, 1]]
     checkpoint.write_text(json.dumps(document), encoding="utf-8")
