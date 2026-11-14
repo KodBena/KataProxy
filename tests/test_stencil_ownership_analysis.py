@@ -99,6 +99,34 @@ def test_coherent_policy_rejects_an_infeasible_warm_start() -> None:
 
 
 def test_summary_uses_shared_energy_and_compares_matching_coherent_models(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ownership.sqlite3"
+    store = SQLiteOwnershipStore(path)
+    evidence = _evidence((0.8, -0.7, 0.2, -0.3))
+    mip = CoherentOwnershipPolicy()
+    cut = CoherentCutOwnershipPolicy()
+
+    _record(store, mip, evidence, (0,), (1,))
+    _record(store, cut, evidence, (2,), (1,))
+
+    rows = load_archive(path)
+    summary = build_summary(rows)
+
+    assert summary["observation_count"] == 2
+    assert summary["distinct_evidence_count"] == 1
+    assert summary["model_count"] == 2
+    assert len(summary["models"]) == 2
+    models = {model["policy_id"]: model for model in summary["models"]}
+    assert models["coherent"]["coherent_aggregate_feasibility_rate"] == 1.0
+    assert models["coherent-cut"]["coherent_aggregate_feasibility_rate"] == 1.0
+    assert models["coherent"]["reference_comparison_count"] == 1
+    assert models["coherent-cut"]["reference_comparison_count"] == 1
+    assert models["coherent"]["coherent_energy_gap"]["p50"] == 0.0
+    assert models["coherent-cut"]["coherent_energy_gap"]["p50"] > 0.0
+    assert models["coherent-cut"]["coherent_energy_ratio"]["p50"] > 1.0
+
+
 def test_sensitivity_pairs_only_identical_replayed_boards(
     tmp_path: Path,
 ) -> None:
