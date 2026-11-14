@@ -222,11 +222,12 @@ def build_campaign(rows: Sequence[ArchiveRow]) -> Campaign:
             | set(evidence.dead_black)
             | set(evidence.dead_white)
         ))
-        _neighbours, edges = ownership_graph(
+        _neighbours, raw_edges = ownership_graph(
             eligible,
             evidence.width,
             evidence.height,
         )
+        edges = tuple(raw_edges)
 
         initial_labels: dict[int, int] | None = None
         initial_energy: float | None = None
