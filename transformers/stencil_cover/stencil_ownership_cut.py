@@ -3,10 +3,24 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Mapping
+
+import scipy
+
+from .stencil_ownership_solver_api import (
+    OwnershipLabeling,
+    OwnershipOptimizationRecord,
+    OwnershipSolverStatus,
+)
+from .stencil_solver_api import NoNativeEffortLimit, SolverBudget, SolverIdentity
 
 from .stencil_ownership import OwnershipEvidence, OwnershipRegions
 from .stencil_ownership_graphcut import minimum_cut_labels, ownership_graph
@@ -20,6 +34,47 @@ from .stencil_ownership_repair import (
 _MAX_LAGRANGE_CUTS = 24
 _REPAIR_RESERVE_FRACTION = 0.18
 _REPAIR_RESERVE_FLOOR_MS = 8.0
+
+_OWNERSHIP_CUT_ADAPTER_VERSION = "kataproxy-scipy-ownership-cut-adapter-v1"
+_OWNERSHIP_CUT_FORMULATION_VERSION = "lagrange-bisection-quantized-cut-v1"
+
+
+def _ownership_cut_solver_identity() -> SolverIdentity:
+    configuration_json = json.dumps(
+        {
+            "formulation": _OWNERSHIP_CUT_FORMULATION_VERSION,
+            "capacity_scale": 1_000_000_000,
+            "max_lagrange_cuts": _MAX_LAGRANGE_CUTS,
+            "repair_reserve_fraction": _REPAIR_RESERVE_FRACTION,
+            "repair_reserve_floor_ms": _REPAIR_RESERVE_FLOOR_MS,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    configuration_fingerprint = hashlib.sha256(
+        configuration_json.encode("utf-8")
+    ).hexdigest()
+    try:
+        scipy_version = version("scipy")
+    except PackageNotFoundError:
+        scipy_version = str(scipy.__version__)
+    return SolverIdentity(
+        backend_name="scipy-maximum-flow",
+        backend_version=scipy_version,
+        adapter_version=_OWNERSHIP_CUT_ADAPTER_VERSION,
+        configuration_json=configuration_json,
+        configuration_fingerprint=configuration_fingerprint,
+    )
+
+
+def _ownership_labeling(labels: Mapping[int, int]) -> OwnershipLabeling:
+    return OwnershipLabeling(tuple(sorted(
+        (int(point), int(label)) for point, label in labels.items()
+    )))
+
+
 
 
 @dataclass(frozen=True)
@@ -68,6 +123,17 @@ class CoherentCutOwnershipPolicy:
 
     def classify(self, evidence: OwnershipEvidence) -> OwnershipRegions:
         started_at = time.perf_counter()
+        started_at_utc = datetime.now(timezone.utc).isoformat(
+            timespec="microseconds",
+        ).replace("+00:00", "Z")
+        attempt_started_ns = time.perf_counter_ns()
+        attempt_id = str(uuid.uuid4())
+        budget = SolverBudget(
+            wall_time_limit_ms=self.time_limit_ms,
+            native_effort_limit=NoNativeEffortLimit(),
+            policy_id=f"ownership-cut-foreground-{self.time_limit_ms}ms",
+        )
+        solver_identity = _ownership_cut_solver_identity()
         stdev = evidence.ownership_stdev
         if stdev is None:
             raise ValueError("coherent ownership policy requires ownershipStdev")
@@ -292,7 +358,44 @@ class CoherentCutOwnershipPolicy:
             self.beta,
         )
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        elapsed_wall_ns = time.perf_counter_ns() - attempt_started_ns
         residual = abs(actual_empty_net - expected_empty_net)
+        optimizer_labels = best_feasible_labels
+        optimizer_objective = (
+            best_feasible_energy if best_feasible_labels is not None else None
+        )
+        ownership_status = (
+            OwnershipSolverStatus.OPTIMAL if optimal
+            else OwnershipSolverStatus.FEASIBLE_REPAIRED
+            if solver_status == "feasible_repaired"
+            else OwnershipSolverStatus.FEASIBLE_SUPPORTED
+        )
+        lower_bound = objective_value if optimal else None
+        optimization_record = OwnershipOptimizationRecord(
+            attempt_id=attempt_id,
+            started_at_utc=started_at_utc,
+            elapsed_wall_ns=elapsed_wall_ns,
+            budget=budget,
+            solver_identity=solver_identity,
+            status=ownership_status,
+            initial_heuristic=None,
+            initial_objective=None,
+            optimizer_incumbent=(
+                None if optimizer_labels is None else _ownership_labeling(optimizer_labels)
+            ),
+            optimizer_objective=optimizer_objective,
+            selected_labeling=_ownership_labeling(labels),
+            selected_objective=float(objective_value),
+            lower_bound=lower_bound,
+            absolute_gap=(
+                max(0.0, optimizer_objective - lower_bound)
+                if optimizer_objective is not None and lower_bound is not None
+                else None
+            ),
+            backend_reported_gap=None,
+            backend_status=solver_status,
+            error=None,
+        )
         return OwnershipRegions(
             positive=tuple(sorted(positive)),
             negative=tuple(sorted(negative)),
@@ -320,5 +423,9 @@ class CoherentCutOwnershipPolicy:
                 "wallTimeMs": float(elapsed_ms),
                 "timeBudgetExceeded": bool(elapsed_ms > self.time_limit_ms),
                 "capacityScale": 1_000_000_000,
+                "attemptId": attempt_id,
+                "elapsedWallNs": elapsed_wall_ns,
+                "solverIdentityFingerprint": solver_identity.fingerprint,
             },
+            solver_evidence=optimization_record,
         )

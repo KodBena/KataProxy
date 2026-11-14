@@ -1003,11 +1003,16 @@ def test_coherent_policy_matches_the_explicit_unary_and_spatial_objective() -> N
     )
     selected = policy.classify(evidence)
     assert selected.solver_evidence is not None
-    assert selected.diagnostics["objective"] == pytest.approx(
+    assert selected.solver_evidence.initial_heuristic is not None
+    assert selected.solver_evidence.initial_objective is not None
+    expected_record_objective = (
         selected.solver_evidence.optimizer_objective
         if selected.solver_evidence.optimizer_objective is not None
-        else selected.solver_evidence.initial_objective,
-        abs=1e-7,
+        else selected.solver_evidence.initial_objective
+    )
+    assert expected_record_objective is not None
+    assert selected.diagnostics["objective"] == pytest.approx(
+        expected_record_objective, abs=1e-7,
     )
     chosen = tuple(
         1 if point in selected.positive
@@ -1064,6 +1069,7 @@ def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
     diagnostics = selected.diagnostics
 
     assert selected.solver_evidence is not None
+    assert selected.solver_evidence.initial_heuristic is not None
     assert selected.solver_evidence.initial_heuristic.point_labels
     assert diagnostics["optimizerIncumbentAvailable"] is (
         selected.solver_evidence.optimizer_incumbent is not None
@@ -1094,6 +1100,10 @@ def test_coherent_cut_policy_matches_the_explicit_unary_and_spatial_objective() 
         kappa=0.7, beta=0.35, score_tolerance=0.5, time_limit_ms=2_000,
     )
     selected = policy.classify(evidence)
+    assert selected.solver_evidence is not None
+    assert selected.solver_evidence.status.value == "feasible_repaired"
+    assert selected.solver_evidence.optimizer_incumbent is None
+    assert selected.solver_evidence.selected_labeling.point_labels
     chosen = tuple(
         1 if point in selected.positive
         else -1 if point in selected.negative

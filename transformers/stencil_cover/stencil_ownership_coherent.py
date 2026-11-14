@@ -596,6 +596,8 @@ class CoherentOwnershipPolicy:
                 None if optimizer_labels is None else _ownership_labeling(optimizer_labels)
             ),
             optimizer_objective=optimizer_objective,
+            selected_labeling=_ownership_labeling(labels),
+            selected_objective=objective_value,
             lower_bound=lower_bound,
             absolute_gap=absolute_gap,
             backend_reported_gap=backend_reported_gap,
