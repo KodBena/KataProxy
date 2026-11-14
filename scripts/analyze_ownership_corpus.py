@@ -677,6 +677,11 @@ def _unique_problem_tally(
         )
         best_attempt_statuses[best_attempt] += 1
 
+        if not any(row.empty_points for row in problem_rows):
+            solve_states["no_optimization_required"] += 1
+            reference_sources["not_required"] += 1
+            continue
+
         reference = references.get(key)
         if reference is None:
             solve_states["no_feasible_witness"] += 1
@@ -699,6 +704,7 @@ def _unique_problem_tally(
         "fully_solved_count": solve_states["optimal_proven"],
         "approximate_feasible_count": solve_states["approximate_feasible"],
         "no_feasible_witness_count": solve_states["no_feasible_witness"],
+        "no_optimization_required_count": solve_states["no_optimization_required"],
     }
 
 

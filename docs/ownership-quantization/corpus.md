@@ -148,6 +148,54 @@ the inputs; the dead-chain sets and rule version make the derived eligible
 graph explicit. No client ID, query ID, SGF, full request, full response, or
 solver-internal resumable state is stored.
 
+
+## Post-collection iterative-deepening solve campaign
+
+After representative evidence has accumulated, the bulk solver can improve
+reference witnesses without changing the source archive:
+
+```sh
+# Inspect how many unique coherent evidence/objective problems need work.
+python scripts/analyze_ownership_corpus.py summary |
+  jq '.unique_problem_tally'
+
+# Preview the deduplicated campaign and the default cumulative limits.
+python -m scripts.solve_ownership_corpus --plan-only
+
+# Run the campaign (default cumulative per-instance ceilings: 10, 20, 40,
+# 80, and 160 seconds; each native solve slice is at most 10 seconds).
+python -m scripts.solve_ownership_corpus
+```
+
+The source SQLite database is opened read-only. The campaign deduplicates by
+exact evidence identity plus coherent objective identity, so repeated
+in-search/final observations and the coherent MIP/cut variants do not create
+duplicate solve tasks. Instances already proved optimal and instances with no
+empty points are not scheduled.
+
+Each unresolved instance receives the same cumulative budget ceiling at a
+given level. The scheduler visits every outstanding instance at that level
+before advancing the campaign to the next ceiling. Individual MIP calls are
+bounded to at most 10 seconds. The best feasible witness is supplied as the
+next MIP start, and the strongest valid lower bound is retained across
+attempts. Only a solver-reported proof is marked optimal; a small observed gap
+is still reported as approximate.
+
+The campaign writes two files beside the archive by default:
+`<database>.bulk-solve.checkpoint.json` and
+`<database>.bulk-solve.results.json`. They are separate from the evidence
+database. Checkpoints are atomically replaced after each solve slice and can
+be resumed by running the same command with the same budget schedule. The
+checkpoint is tied to the deduplicated archive snapshot and schedule; if the
+archive or schedule changes, use a new checkpoint path.
+
+Progress is printed at roughly 10-second intervals. Ctrl+C stops scheduling
+new slices, saves the completed work, writes an interrupted results report,
+and exits with status 130. Resume with the same command to continue. The
+runner does not preserve the HiGHS branch-and-bound tree between processes;
+it reuses feasible incumbents and valid lower bounds only. The bulk solver
+never writes attempts or witnesses back into the collection database.
+
 ## Inspection and backup
 
 Open the database directly (the `ownership` alias is not persistent):

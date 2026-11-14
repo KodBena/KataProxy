@@ -949,7 +949,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--slice-seconds",
         type=float,
         default=_DEFAULT_SLICE_SECONDS,
-        help="maximum duration of one solver call and interruption slice",
+        help="maximum duration of one solver call (capped at 10 seconds)",
     )
     parser.add_argument(
         "--progress-interval-seconds",
@@ -995,6 +995,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if slice_seconds <= 0 or report_interval <= 0:
             raise ValueError("slice and progress intervals must be positive")
+        if slice_seconds > _DEFAULT_SLICE_SECONDS:
+            raise ValueError("slice-seconds cannot exceed 10 seconds")
         levels_ms = tuple(max(1, round(value * 1000.0)) for value in levels_seconds)
         slice_ms = max(1, round(slice_seconds * 1000.0))
 
