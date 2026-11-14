@@ -1108,8 +1108,13 @@ def test_coherent_cut_policy_matches_the_explicit_unary_and_spatial_objective() 
         if abs(sum(labels) - expected_net) <= policy.score_tolerance
     )
     optimum = min(energy(labels) for labels in feasible)
+    # This fixture happens to reach the enumerated optimum even though
+    # the cut path skips its aggregate and the connected repair is used.
+    # The output is therefore a correct feasible point, not an optimality
+    # certificate for the general repaired-policy path.
     assert abs(energy(chosen) - optimum) < 1e-7
-    assert selected.diagnostics["solverStatus"] == "optimal"
+    assert selected.diagnostics["solverStatus"] == "feasible_repaired"
+    assert selected.diagnostics["optimal"] is False
 
 
 def test_coherent_cut_policy_keeps_a_25x25_diffuse_region_connected() -> None:
