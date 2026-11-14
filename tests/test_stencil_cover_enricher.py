@@ -1151,7 +1151,7 @@ def test_coherent_cut_policy_keeps_a_25x25_diffuse_region_connected() -> None:
     assert diagnostics["solverStatus"] in {
         "optimal", "feasible_supported", "feasible_repaired",
     }
-    assert diagnostics["wallTimeMs"] < 1_500
+    assert cast(float, diagnostics["wallTimeMs"]) < 1_500
     assert elapsed < 1.5
 
     positive = set(selected.positive)
