@@ -180,7 +180,7 @@ def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(
         energy = state.best_energy
         assert labels is not None and energy is not None
         return SliceOutcome(
-            elapsed_wall_ms=1.0,
+            elapsed_wall_ms=float(time_limit_ms),
             labels=dict(labels),
             energy=energy,
             lower_bound=None,
