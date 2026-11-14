@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -42,7 +43,8 @@ from transformers.stencil_cover.stencil_ownership_solver_api import (
 )
 
 
-_CHECKPOINT_FORMAT = "kataproxy.ownership-bulk-solve-checkpoint.v1"
+_CHECKPOINT_FORMAT = "kataproxy.ownership-bulk-solve-checkpoint.v2"
+_CHECKPOINT_SCHEMA_VERSION = 1
 _RESULTS_FORMAT = "kataproxy.ownership-bulk-solve-results.v1"
 _DEFAULT_LEVELS_SECONDS = (10.0, 20.0, 40.0, 80.0, 160.0)
 _DEFAULT_SLICE_SECONDS = 10.0
@@ -387,12 +389,241 @@ def _decode_checkpoint_labels(value: Any) -> dict[int, int] | None:
     return result
 
 
+def _checkpoint_metadata(
+    campaign: Campaign,
+    fingerprint: str,
+    levels_ms: Sequence[int],
+    slice_ms: int,
+) -> dict[str, str]:
+    return {
+        "format": _CHECKPOINT_FORMAT,
+        "campaign_fingerprint": fingerprint,
+        "levels_ms_json": json.dumps(list(levels_ms), separators=(",", ":")),
+        "slice_ms": str(slice_ms),
+        "unique_problem_count": str(campaign.unique_problem_count),
+        "scheduled_count": str(len(campaign.items)),
+        "already_proven_count": str(campaign.already_proven_count),
+        "no_optimization_required_count": str(
+            campaign.no_optimization_required_count
+        ),
+    }
+
+
+def initialize_checkpoint(
+    path: Path,
+    campaign: Campaign,
+    fingerprint: str,
+    levels_ms: Sequence[int],
+    slice_ms: int,
+) -> None:
+    """Create or validate the separate transactional campaign checkpoint DB."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = FULL")
+        version_row = connection.execute("PRAGMA user_version").fetchone()
+        version = 0 if version_row is None else int(version_row[0])
+        existing_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if version == 0:
+            if existing_tables:
+                raise ValueError(
+                    "refusing to reinterpret an unversioned non-empty checkpoint database"
+                )
+            connection.execute(
+                """
+                CREATE TABLE campaign_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE task_progress (
+                    task_id TEXT PRIMARY KEY,
+                    spent_wall_ms REAL NOT NULL CHECK(spent_wall_ms >= 0),
+                    attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
+                    best_labels_json TEXT,
+                    best_energy REAL,
+                    best_lower_bound REAL,
+                    optimal_proven INTEGER NOT NULL CHECK(optimal_proven IN (0, 1)),
+                    last_status TEXT NOT NULL,
+                    last_error TEXT,
+                    last_error_level_ms INTEGER,
+                    CHECK(
+                        (best_labels_json IS NULL AND best_energy IS NULL)
+                        OR
+                        (best_labels_json IS NOT NULL AND best_energy IS NOT NULL)
+                    )
+                )
+                """
+            )
+            connection.executemany(
+                "INSERT INTO campaign_metadata(key, value) VALUES (?, ?)",
+                sorted(_checkpoint_metadata(
+                    campaign, fingerprint, levels_ms, slice_ms
+                ).items()),
+            )
+            connection.execute(f"PRAGMA user_version = {_CHECKPOINT_SCHEMA_VERSION}")
+            connection.commit()
+            return
+
+        if version != _CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported campaign checkpoint schema version {version}; "
+                f"this runner supports {_CHECKPOINT_SCHEMA_VERSION}"
+            )
+        required_tables = {"campaign_metadata", "task_progress"}
+        if not required_tables.issubset(existing_tables):
+            raise ValueError("campaign checkpoint is missing required tables")
+        metadata = {
+            str(row[0]): str(row[1])
+            for row in connection.execute(
+                "SELECT key, value FROM campaign_metadata"
+            ).fetchall()
+        }
+        expected = _checkpoint_metadata(
+            campaign, fingerprint, levels_ms, slice_ms
+        )
+        if not metadata:
+            raise ValueError("campaign checkpoint metadata is missing")
+        if metadata.get("format") != _CHECKPOINT_FORMAT:
+            raise ValueError("unsupported campaign checkpoint format")
+        if metadata.get("campaign_fingerprint") != fingerprint:
+            raise ValueError(
+                "campaign checkpoint does not match this archive snapshot or budget "
+                "schedule; use a new checkpoint path or remove the old checkpoint"
+            )
+        if metadata != expected:
+            raise ValueError("campaign checkpoint metadata does not match this campaign")
+    except Exception:
+        connection.close()
+        raise
+    connection.close()
+
+
+def _restore_checkpoint_task(
+    item: CampaignItem,
+    state: TaskProgress,
+    raw: dict[str, Any],
+) -> None:
+    spent = _finite_number(raw.get("spent_wall_ms"), "spent_wall_ms")
+    attempts_value = raw.get("attempt_count")
+    if (
+        isinstance(attempts_value, bool)
+        or not isinstance(attempts_value, int)
+        or attempts_value < 0
+        or spent < 0
+    ):
+        raise ValueError("checkpoint time and attempt count must be non-negative")
+
+    raw_labels = raw.get("best_labels_json")
+    if raw_labels is None:
+        labels = None
+    elif isinstance(raw_labels, str):
+        try:
+            labels_document = json.loads(raw_labels)
+        except json.JSONDecodeError as exc:
+            raise ValueError("checkpoint labeling is not valid JSON") from exc
+        labels = _decode_checkpoint_labels(labels_document)
+    else:
+        raise ValueError("checkpoint best_labels_json must be text or NULL")
+
+    stored_energy = _optional_finite_number(
+        raw.get("best_energy"),
+        "checkpoint best_energy",
+    )
+    if labels is None:
+        if stored_energy is not None:
+            raise ValueError("checkpoint energy exists without a labeling")
+    else:
+        calculated_energy = _evaluate_labels(
+            item.evidence,
+            item.config,
+            item.eligible_points,
+            item.edges,
+            labels,
+        )
+        if (
+            stored_energy is None
+            or abs(calculated_energy - stored_energy) > _NUMERIC_TOLERANCE
+        ):
+            raise ValueError("checkpoint witness energy does not reproduce")
+        if state.best_energy is None or calculated_energy < state.best_energy:
+            state.best_labels = labels
+            state.best_energy = calculated_energy
+
+    bound = _optional_finite_number(
+        raw.get("best_lower_bound"),
+        "checkpoint best_lower_bound",
+    )
+    if bound is not None and (
+        state.best_lower_bound is None or bound > state.best_lower_bound
+    ):
+        state.best_lower_bound = bound
+    if (
+        state.best_lower_bound is not None
+        and state.best_energy is not None
+        and state.best_lower_bound > state.best_energy + _NUMERIC_TOLERANCE
+    ):
+        raise ValueError("checkpoint lower bound exceeds its best feasible energy")
+
+    proven_value = raw.get("optimal_proven")
+    if (
+        isinstance(proven_value, bool)
+        or not isinstance(proven_value, int)
+        or proven_value not in (0, 1)
+    ):
+        raise ValueError("checkpoint optimal_proven must be stored as 0 or 1")
+    proven = bool(proven_value)
+    if proven:
+        if (
+            state.best_energy is None
+            or state.best_lower_bound is None
+            or state.best_lower_bound < state.best_energy - _NUMERIC_TOLERANCE
+        ):
+            raise ValueError("checkpoint claims proof without a closed objective gap")
+
+    status = raw.get("last_status")
+    error = raw.get("last_error")
+    error_level = raw.get("last_error_level_ms")
+    if not isinstance(status, str) or (
+        error is not None and not isinstance(error, str)
+    ):
+        raise ValueError("checkpoint status/error fields are invalid")
+    if error_level is not None and (
+        isinstance(error_level, bool)
+        or not isinstance(error_level, int)
+        or error_level <= 0
+    ):
+        raise ValueError(
+            "checkpoint last_error_level_ms must be a positive integer or NULL"
+        )
+    if status == "error" and error_level is None:
+        raise ValueError("checkpoint error status requires its last budget level")
+    if status != "error" and error_level is not None:
+        raise ValueError("non-error checkpoint status cannot retain an error level")
+
+    state.spent_wall_ms = spent
+    state.attempt_count = attempts_value
+    state.optimal_proven = proven
+    state.last_status = status
+    state.last_error = error
+    state.last_error_level_ms = error_level
+
+
 def load_checkpoint(
     path: Path,
     campaign: Campaign,
     fingerprint: str,
 ) -> dict[str, TaskProgress]:
-    """Load and validate a checkpoint, or seed progress from archive witnesses."""
+    """Load and validate task states, or seed progress from archive witnesses."""
     progress = {
         item.task_id: _initial_progress(item)
         for item in campaign.items
@@ -400,153 +631,80 @@ def load_checkpoint(
     if not path.exists():
         return progress
 
+    connection: sqlite3.Connection | None = None
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"could not read campaign checkpoint: {exc}") from exc
-    if not isinstance(document, dict):
-        raise ValueError("campaign checkpoint must contain a JSON object")
-    if document.get("format") != _CHECKPOINT_FORMAT:
-        raise ValueError("unsupported campaign checkpoint format")
-    if document.get("campaign_fingerprint") != fingerprint:
-        raise ValueError(
-            "campaign checkpoint does not match this archive snapshot or budget "
-            "schedule; use a new checkpoint path or remove the old checkpoint"
-        )
-    raw_tasks = document.get("tasks")
-    if not isinstance(raw_tasks, dict):
-        raise ValueError("campaign checkpoint tasks must be a JSON object")
-    unknown_tasks = set(raw_tasks) - set(progress)
-    if unknown_tasks:
-        raise ValueError("campaign checkpoint contains tasks outside this campaign")
-
-    items_by_id = {item.task_id: item for item in campaign.items}
-    for task_id, state in progress.items():
-        raw = raw_tasks.get(task_id)
-        if raw is None:
-            continue
-        if not isinstance(raw, dict):
-            raise ValueError(f"checkpoint task {task_id} must be an object")
-        item = items_by_id[task_id]
-
-        spent = _finite_number(raw.get("spent_wall_ms", 0.0), "spent_wall_ms")
-        attempts_value = raw.get("attempt_count", 0)
-        if (
-            isinstance(attempts_value, bool)
-            or not isinstance(attempts_value, int)
-            or attempts_value < 0
-            or spent < 0
-        ):
-            raise ValueError("checkpoint time and attempt count must be non-negative")
-
-        labels = _decode_checkpoint_labels(raw.get("best_labels"))
-        stored_energy = _optional_finite_number(
-            raw.get("best_energy"),
-            "checkpoint best_energy",
-        )
-        if labels is None:
-            if stored_energy is not None:
-                raise ValueError("checkpoint energy exists without a labeling")
-        else:
-            calculated_energy = _evaluate_labels(
-                item.evidence,
-                item.config,
-                item.eligible_points,
-                item.edges,
-                labels,
+        uri = path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        version_row = connection.execute("PRAGMA user_version").fetchone()
+        version = 0 if version_row is None else int(version_row[0])
+        if version != _CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported campaign checkpoint schema version {version}"
             )
-            if (
-                stored_energy is None
-                or abs(calculated_energy - stored_energy) > _NUMERIC_TOLERANCE
-            ):
-                raise ValueError("checkpoint witness energy does not reproduce")
-            if state.best_energy is None or calculated_energy < state.best_energy:
-                state.best_labels = labels
-                state.best_energy = calculated_energy
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute(
+                "SELECT key, value FROM campaign_metadata"
+            ).fetchall()
+        }
+        if metadata.get("format") != _CHECKPOINT_FORMAT:
+            raise ValueError("unsupported campaign checkpoint format")
+        if metadata.get("campaign_fingerprint") != fingerprint:
+            raise ValueError(
+                "campaign checkpoint does not match this archive snapshot or budget "
+                "schedule; use a new checkpoint path or remove the old checkpoint"
+            )
 
-        bound = _optional_finite_number(
-            raw.get("best_lower_bound"),
-            "checkpoint best_lower_bound",
-        )
-        if bound is not None and (
-            state.best_lower_bound is None or bound > state.best_lower_bound
-        ):
-            state.best_lower_bound = bound
-        if (
-            state.best_lower_bound is not None
-            and state.best_energy is not None
-            and state.best_lower_bound > state.best_energy + _NUMERIC_TOLERANCE
-        ):
-            raise ValueError("checkpoint lower bound exceeds its best feasible energy")
-
-        proven = raw.get("optimal_proven", False)
-        if not isinstance(proven, bool):
-            raise ValueError("checkpoint optimal_proven must be boolean")
-        if proven:
-            if (
-                state.best_energy is None
-                or state.best_lower_bound is None
-                or state.best_lower_bound < state.best_energy - _NUMERIC_TOLERANCE
-            ):
-                raise ValueError("checkpoint claims proof without a closed objective gap")
-        status = raw.get("last_status", "resumed")
-        error = raw.get("last_error")
-        error_level = raw.get("last_error_level_ms")
-        if not isinstance(status, str) or (
-            error is not None and not isinstance(error, str)
-        ):
-            raise ValueError("checkpoint status/error fields are invalid")
-        if error_level is not None and (
-            isinstance(error_level, bool)
-            or not isinstance(error_level, int)
-            or error_level <= 0
-        ):
-            raise ValueError("checkpoint last_error_level_ms must be a positive integer or null")
-        if status == "error" and error_level is None:
-            raise ValueError("checkpoint error status requires its last budget level")
-
-        state.spent_wall_ms = spent
-        state.attempt_count = attempts_value
-        state.optimal_proven = proven
-        state.last_status = status
-        state.last_error = error
-        state.last_error_level_ms = error_level
+        items_by_id = {item.task_id: item for item in campaign.items}
+        rows = connection.execute(
+            "SELECT * FROM task_progress ORDER BY task_id"
+        ).fetchall()
+        for row in rows:
+            task_id = str(row["task_id"])
+            item = items_by_id.get(task_id)
+            if item is None:
+                raise ValueError(
+                    "campaign checkpoint contains tasks outside this campaign"
+                )
+            _restore_checkpoint_task(
+                item,
+                progress[task_id],
+                dict(row),
+            )
+    except sqlite3.Error as exc:
+        raise ValueError(f"could not read campaign checkpoint database: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
     return progress
 
 
-def _progress_document(
-    campaign: Campaign,
-    progress: dict[str, TaskProgress],
-    fingerprint: str,
-    levels_ms: Sequence[int],
-    slice_ms: int,
-) -> dict[str, Any]:
-    return {
-        "format": _CHECKPOINT_FORMAT,
-        "campaign_fingerprint": fingerprint,
-        "levels_ms": list(levels_ms),
-        "slice_ms": slice_ms,
-        "unique_problem_count": campaign.unique_problem_count,
-        "already_proven_count": campaign.already_proven_count,
-        "no_optimization_required_count": campaign.no_optimization_required_count,
-        "tasks": {
-            task_id: {
-                "spent_wall_ms": state.spent_wall_ms,
-                "attempt_count": state.attempt_count,
-                "best_labels": (
-                    None if state.best_labels is None
-                    else [[point, label] for point, label in sorted(state.best_labels.items())]
-                ),
-                "best_energy": state.best_energy,
-                "best_lower_bound": state.best_lower_bound,
-                "optimal_proven": state.optimal_proven,
-                "last_status": state.last_status,
-                "last_error": state.last_error,
-                "last_error_level_ms": state.last_error_level_ms,
-            }
-            for task_id, state in sorted(progress.items())
-        },
-    }
+def _checkpoint_task_values(
+    task_id: str,
+    state: TaskProgress,
+) -> tuple[str, float, int, str | None, float | None, float | None, int, str, str | None, int | None]:
+    labels_json = (
+        None if state.best_labels is None
+        else json.dumps(
+            [[point, label] for point, label in sorted(state.best_labels.items())],
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+    return (
+        task_id,
+        state.spent_wall_ms,
+        state.attempt_count,
+        labels_json,
+        state.best_energy,
+        state.best_lower_bound,
+        1 if state.optimal_proven else 0,
+        state.last_status,
+        state.last_error,
+        state.last_error_level_ms,
+    )
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -586,11 +744,45 @@ def save_checkpoint(
     fingerprint: str,
     levels_ms: Sequence[int],
     slice_ms: int,
+    *,
+    task_id: str | None = None,
 ) -> None:
-    _write_json_atomic(
-        path,
-        _progress_document(campaign, progress, fingerprint, levels_ms, slice_ms),
-    )
+    """Durably update one task row, or flush the full campaign in one transaction."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA synchronous = FULL")
+        selected = (
+            [(task_id, progress[task_id])]
+            if task_id is not None
+            else sorted(progress.items())
+        )
+        connection.executemany(
+            """
+            INSERT INTO task_progress (
+                task_id, spent_wall_ms, attempt_count, best_labels_json,
+                best_energy, best_lower_bound, optimal_proven, last_status,
+                last_error, last_error_level_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                spent_wall_ms = excluded.spent_wall_ms,
+                attempt_count = excluded.attempt_count,
+                best_labels_json = excluded.best_labels_json,
+                best_energy = excluded.best_energy,
+                best_lower_bound = excluded.best_lower_bound,
+                optimal_proven = excluded.optimal_proven,
+                last_status = excluded.last_status,
+                last_error = excluded.last_error,
+                last_error_level_ms = excluded.last_error_level_ms
+            """,
+            [
+                _checkpoint_task_values(current_task_id, state)
+                for current_task_id, state in selected
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _solve_slice(
@@ -800,6 +992,13 @@ def run_campaign(
     solver: SliceSolver = _solve_slice,
 ) -> None:
     """Run level-synchronous rounds, checkpointing after every bounded slice."""
+    initialize_checkpoint(
+        checkpoint_path,
+        campaign,
+        fingerprint,
+        levels_ms,
+        slice_ms,
+    )
     started = time.monotonic()
     last_report = started
     _progress_line(
@@ -835,6 +1034,7 @@ def run_campaign(
                     fingerprint,
                     levels_ms,
                     slice_ms,
+                    task_id=item.task_id,
                 )
 
                 now = time.monotonic()
@@ -1061,7 +1261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_path = (
             Path(args.checkpoint).expanduser()
             if args.checkpoint is not None
-            else database.with_name(database.name + ".bulk-solve.checkpoint.json")
+            else database.with_name(database.name + ".bulk-solve.checkpoint.sqlite3")
         )
         results_path = (
             Path(args.results).expanduser()
