@@ -7,7 +7,9 @@ import pytest
 
 from scripts.analyze_ownership_corpus import load_archive
 from scripts.solve_ownership_corpus import (
+    CampaignItem,
     SliceOutcome,
+    TaskProgress,
     _initial_progress,
     build_campaign,
     campaign_fingerprint,
@@ -15,6 +17,7 @@ from scripts.solve_ownership_corpus import (
     run_campaign,
 )
 from transformers.stencil_cover.stencil_ownership import (
+    OwnershipEvidence,
     OwnershipRegions,
     make_ownership_evidence,
 )
@@ -27,7 +30,7 @@ from transformers.stencil_cover.stencil_ownership_cut import (
 from transformers.stencil_cover.stencil_ownership_store import SQLiteOwnershipStore
 
 
-def _evidence() -> object:
+def _evidence() -> OwnershipEvidence:
     return make_ownership_evidence(
         {
             "ownership": [0.8, -0.7, 0.2, -0.3],
@@ -44,7 +47,7 @@ def _evidence() -> object:
 def _record(
     store: SQLiteOwnershipStore,
     policy: CoherentOwnershipPolicy | CoherentCutOwnershipPolicy,
-    evidence: object,
+    evidence: OwnershipEvidence,
     positive: tuple[int, ...],
     negative: tuple[int, ...],
 ) -> None:
@@ -55,7 +58,7 @@ def _record(
         diagnostics={"solverStatus": "unit_test"},
     )
     store.record(
-        evidence,  # type: ignore[arg-type]
+        evidence,
         regions,
         policy,
         turn_number=1,
@@ -104,16 +107,18 @@ def test_campaign_rounds_every_item_through_cumulative_levels_and_resumes(
     checkpoint = tmp_path / "bulk-checkpoint.json"
     budgets: list[int] = []
 
-    def fake_solver(task: object, state: object, time_limit_ms: int) -> SliceOutcome:
+    def fake_solver(
+        campaign_item: CampaignItem,
+        task_progress: TaskProgress,
+        time_limit_ms: int,
+    ) -> SliceOutcome:
         budgets.append(time_limit_ms)
-        campaign_item = task  # narrowed below for a small test double
-        task_progress = state
-        labels = task_progress.best_labels or campaign_item.initial_labels  # type: ignore[attr-defined]
-        energy = task_progress.best_energy  # type: ignore[attr-defined]
-        if labels is None:
-            labels = campaign_item.initial_labels  # type: ignore[attr-defined]
-        if energy is None:
-            energy = campaign_item.initial_energy  # type: ignore[attr-defined]
+        if task_progress.best_labels is None:
+            labels = campaign_item.initial_labels
+            energy = campaign_item.initial_energy
+        else:
+            labels = task_progress.best_labels
+            energy = task_progress.best_energy
         assert labels is not None
         assert energy is not None
         return SliceOutcome(
@@ -133,7 +138,7 @@ def test_campaign_rounds_every_item_through_cumulative_levels_and_resumes(
         checkpoint_path=checkpoint,
         fingerprint=fingerprint,
         progress_interval_seconds=3600.0,
-        solver=fake_solver,  # type: ignore[arg-type]
+        solver=fake_solver,
     )
 
     state = progress[item.task_id]
@@ -166,9 +171,13 @@ def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(
     fingerprint = campaign_fingerprint(campaign, levels_ms, 500)
     checkpoint = tmp_path / "bulk-checkpoint.json"
 
-    def fake_solver(task: object, state: object, time_limit_ms: int) -> SliceOutcome:
-        labels = state.best_labels  # type: ignore[attr-defined]
-        energy = state.best_energy  # type: ignore[attr-defined]
+    def fake_solver(
+        _task: CampaignItem,
+        state: TaskProgress,
+        time_limit_ms: int,
+    ) -> SliceOutcome:
+        labels = state.best_labels
+        energy = state.best_energy
         assert labels is not None and energy is not None
         return SliceOutcome(
             elapsed_wall_ms=1.0,
@@ -187,7 +196,7 @@ def test_campaign_rejects_checkpoint_witness_outside_eligible_graph(
         checkpoint_path=checkpoint,
         fingerprint=fingerprint,
         progress_interval_seconds=3600.0,
-        solver=fake_solver,  # type: ignore[arg-type]
+        solver=fake_solver,
     )
     document = json.loads(checkpoint.read_text(encoding="utf-8"))
     document["tasks"][item.task_id]["best_labels"] = [[999, 1]]
