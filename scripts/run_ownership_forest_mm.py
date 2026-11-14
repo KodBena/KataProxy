@@ -20,7 +20,7 @@ import struct
 import sys
 import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -232,6 +232,7 @@ def build_results(
     split_seed: str,
     maximum_passes: int,
     limit: int | None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate each unique evidence/objective problem once."""
     references = _reference_index(rows)
@@ -285,7 +286,18 @@ def build_results(
     reference_kind_counts: Counter[str] = Counter()
     board_group_signatures: set[str] = set()
 
-    for key, problem_rows, reference, board_split in prepared:
+    for problem_number, (key, problem_rows, reference, board_split) in enumerate(
+        prepared, start=1,
+    ):
+        problem_started = time.perf_counter()
+        task_id = hashlib.sha256(
+            json.dumps([key[0], key[1]], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if progress is not None:
+            progress(
+                f"[{problem_number}/{len(prepared)}] problem {task_id[:12]} "
+                f"starting ({len(problem_rows)} observations)"
+            )
         reference_observation = str(reference["observation_id"])
         reference_row = rows_by_observation.get(reference_observation)
         if reference_row is None:
@@ -328,6 +340,8 @@ def build_results(
         if lower_bound is not None and lower_bound > reference_energy + 1e-6:
             raise ValueError("archived lower bound exceeds best feasible reference energy")
 
+        if progress is not None:
+            progress(f"[{problem_number}/{len(prepared)}] marginal initializer")
         start = time.perf_counter_ns()
         marginal_empty = budget_exact_marginal_labeling(problem)
         marginal_ms = (time.perf_counter_ns() - start) / 1_000_000.0
@@ -350,8 +364,26 @@ def build_results(
         omitted_forest_edges = tuple(
             edge for edge in problem.edges if edge not in retained_forest
         )
+        if progress is not None:
+            progress(f"[{problem_number}/{len(prepared)}] forest DP starting")
+        last_dp_report = 0
+
+        def report_dp_progress(done: int, total: int, states: int) -> None:
+            nonlocal last_dp_report
+            if progress is None:
+                return
+            interval = max(1, total // 100)
+            if done == total or done - last_dp_report >= interval:
+                last_dp_report = done
+                elapsed = time.perf_counter() - problem_started
+                progress(
+                    f"[{problem_number}/{len(prepared)}] forest DP "
+                    f"{done}/{total} units; {states} DP state entries; "
+                    f"{elapsed:.1f}s elapsed"
+                )
+
         start = time.perf_counter_ns()
-        forest_result = solve_forest_dp(problem, forest)
+        forest_result = solve_forest_dp(problem, forest, progress=report_dp_progress)
         forest_ms = (time.perf_counter_ns() - start) / 1_000_000.0
         forest_empty = dict(forest_result.labeling)
         forest_full = _archive_labeling(forest_empty, representative)
@@ -372,12 +404,34 @@ def build_results(
         ) > 1e-6:
             raise ArithmeticError("forest candidate failed full-energy cross-check")
 
+        if progress is not None:
+            progress(
+                f"[{problem_number}/{len(prepared)}] forest MM starting "
+                f"(at most {maximum_passes} passes)"
+            )
+        last_mm_report = 0
+
+        def report_mm_progress(done: int, total: int, states: int) -> None:
+            nonlocal last_mm_report
+            if progress is None:
+                return
+            interval = max(1, total // 100)
+            if done == total or done - last_mm_report >= interval:
+                last_mm_report = done
+                elapsed = time.perf_counter() - problem_started
+                progress(
+                    f"[{problem_number}/{len(prepared)}] forest MM DP "
+                    f"{done}/{total} units; {states} DP state entries; "
+                    f"{elapsed:.1f}s elapsed"
+                )
+
         start = time.perf_counter_ns()
         mm_result = forest_majorize_minimize(
             problem,
             forest,
             maximum_passes=maximum_passes,
             initial_labeling=marginal_empty,
+            progress=report_mm_progress,
         )
         mm_ms = (time.perf_counter_ns() - start) / 1_000_000.0
         mm_empty = dict(mm_result.labeling)
@@ -438,9 +492,7 @@ def build_results(
         board_group = _board_signature(representative)
         board_group_signatures.add(board_group)
         records.append({
-            "task_id": hashlib.sha256(
-                json.dumps([key[0], key[1]], separators=(",", ":")).encode("utf-8")
-            ).hexdigest(),
+            "task_id": task_id,
             "evidence_id": key[0],
             "objective_key": key[1],
             "board_signature": board_group,
@@ -507,6 +559,12 @@ def build_results(
             },
             "methods": methods,
         })
+        if progress is not None:
+            progress(
+                f"[{problem_number}/{len(prepared)}] problem complete "
+                f"({time.perf_counter() - problem_started:.1f}s; "
+                f"{forest_result.dp_state_count} forest DP state entries)"
+            )
 
     summary: dict[str, Any] = {
         "format": RESULT_FORMAT,
@@ -608,13 +666,20 @@ def main() -> int:
     if not args.split_seed:
         raise ValueError("--split-seed must be non-empty")
 
+    print(f"Loading ownership archive: {database}", file=sys.stderr, flush=True)
     rows = load_archive(database)
+    print(
+        f"Loaded {len(rows)} observations; preparing {args.split} split",
+        file=sys.stderr,
+        flush=True,
+    )
     report = build_results(
         rows,
         split=args.split,
         split_seed=args.split_seed,
         maximum_passes=args.max_passes,
         limit=args.limit,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
     )
     report["source_archive"] = {
         "sha256": _sha256_file(database),
