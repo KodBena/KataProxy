@@ -367,8 +367,8 @@ def spanning_forest_edges(
     for first, second in problem.edges:
         adjacency[first].append(second)
         adjacency[second].append(first)
-    for adjacent in adjacency.values():
-        adjacent.sort()
+    for neighbour_points in adjacency.values():
+        neighbour_points.sort()
 
     visited: set[int] = set()
     forest: list[Edge] = []
@@ -456,8 +456,8 @@ def solve_forest_dp(
     for first, second in forest:
         adjacency[first].append(second)
         adjacency[second].append(first)
-    for adjacent in adjacency.values():
-        adjacent.sort()
+    for neighbour_points in adjacency.values():
+        neighbour_points.sort()
 
     components: list[tuple[int, ...]] = []
     unseen = set(problem.points)
