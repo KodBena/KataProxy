@@ -277,3 +277,36 @@ def test_runner_metrics_report_aggregate_and_full_graph_tv_explicitly() -> None:
     assert metrics["boundary_symmetric_difference"] == 2
     assert metrics["unary_energy"] == pytest.approx(2.0)
     assert metrics["unary_energy_difference_vs_reference"] == pytest.approx(0.5)
+
+def test_forest_dp_progress_reports_structural_work_monotonically() -> None:
+    evidence = _evidence(
+        means=(0.6, -0.4, -0.4, 0.6),
+        deviations=(0.05, 0.07, 0.04, 0.09),
+        width=2,
+        height=2,
+    )
+    problem = build_reduced_problem(evidence, 1.0, 0.25, 0.5)
+    events: list[tuple[int, int, int]] = []
+
+    result = solve_forest_dp(
+        problem,
+        spanning_forest_edges(problem),
+        progress=lambda completed, total, states: events.append(
+            (completed, total, states)
+        ),
+    )
+
+    assert events
+    assert events[-1][0] == events[-1][1]
+    assert all(
+        0 < completed <= total
+        for completed, total, _states in events
+    )
+    assert all(
+        previous[0] <= current[0]
+        and previous[1] == current[1]
+        and previous[2] <= current[2]
+        for previous, current in zip(events, events[1:])
+    )
+    assert events[-1][2] == result.dp_state_count
+
