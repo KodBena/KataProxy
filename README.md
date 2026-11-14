@@ -219,7 +219,9 @@ example `{"stencil_cover":{"truncation_threshold":0.6}}`.
 A custom implementation can be selected with
 `KATAPROXY_STENCIL_OWNERSHIP_POLICY=python.module:factory_name`. Its module is
 eagerly imported at proxy startup; its factory returns an implementation of
-`OwnershipRegionPolicy`. Parameters and policy semantics are documented in
+`OwnershipRegionPolicy`. Custom policies must also declare a stable,
+non-empty `model_version` so the evidence archive can distinguish
+implementation revisions. Parameters and policy semantics are documented in
 `docs/stencil-ownership-policy.md`.
 
 The foreground solver is the normal operating mode: it attempts each
@@ -228,9 +230,11 @@ which may be feasible rather than proven optimal. **No background process is
 required.** Redis at `127.0.0.1:6379`, DB 7, adds shared result persistence;
 the foreground solver continues to work when Redis is unavailable.
 
-An optional background process can spend up to a 10-second HiGHS optimization
-limit trying to improve cached non-optimal results. After installing the
-project in the active environment (`pip install -e .`), run:
+An optional background **exact-cover placement** process can spend up
+to a 10-second HiGHS optimization limit trying to improve cached non-optimal
+stencil tilings. This worker is for the placement problem only; it does not
+re-solve ownership quantization. After installing the project in the active
+environment (`pip install -e .`), run:
 
 ```sh
 kataproxy-stencil-bulk-solver
@@ -273,6 +277,40 @@ the Redis entry, and safely deduplicates a replay after a crash. The Redis
 server needs XAUTOCLAIM support (Redis 6.2 or newer). The spool and normalized
 tables share the same SQLite file; a v1 raw spool is backed up and migrated to
 schema version 2 automatically. Query/analysis tooling is not included yet.
+
+---
+
+## Ownership quantization evidence capture
+
+The ownership classifier has a separate research archive for the approximation
+and sensitivity agendas. It records each opted-in analyze response snapshot,
+including in-search updates, with the replayed board, exact ownership mean and
+standard-deviation arrays, fixed dead-chain sets, the selected ternary
+labeling, policy/model identity, optimizer evidence, diagnostics, and optional
+KataGo `rootInfo` context.
+
+Enable it explicitly:
+
+```sh
+export KATAPROXY_STENCIL_OWNERSHIP_CORPUS_ENABLED=1
+# Optional: choose a separate archive file.
+export KATAPROXY_STENCIL_OWNERSHIP_CORPUS_DB=/var/lib/kataproxy/ownership-quantization.sqlite3
+```
+
+The default database is
+`$XDG_STATE_HOME/kataproxy/ownership-quantization.sqlite3`, or
+`~/.local/state/kataproxy/ownership-quantization.sqlite3` when
+`XDG_STATE_HOME` is unset. Its independent SQLite schema and tables are
+documented in [the ownership corpus guide](docs/ownership-quantization/corpus.md).
+
+This path writes directly to SQLite in the foreground. It does not use Redis,
+the stencil exact-cover result cache, a Redis Stream, a spool/materializer, or a
+background ownership solver. Evidence maps are stored as lossless binary64
+blobs; identical evidence is deduplicated, while each response observation
+and each actual optimizer attempt remains append-only. Collection is disabled
+by default because it adds a durable write for every response packet. A
+storage failure is logged and does not suppress the interactive stencil-cover
+response.
 
 ---
 

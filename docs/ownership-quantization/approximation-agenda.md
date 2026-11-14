@@ -2,8 +2,9 @@
 
 This note records the problem, candidate methods, measurement plan, and
 disposal criteria for a latency-oriented sibling of the coherent ownership
-quantizer. It is written so that, once the ownership-evidence corpus exists,
-the agenda can be turned into concrete tests without re-deriving the modelling
+quantizer. The opt-in ownership-evidence corpus is described in
+[corpus.md](corpus.md); once representative snapshots have accumulated, this
+agenda can be turned into concrete tests without re-deriving the modelling
 choices.
 
 It deliberately does not prescribe an implementation. It only fixes the

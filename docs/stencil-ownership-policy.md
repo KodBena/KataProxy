@@ -552,76 +552,66 @@ counts, solver status, and optimality indication. The graph-cut policy also
 reports Lagrange-path and repair diagnostics. The MIP currently reports an
 objective with the constant offset described above.
 
-## Audit boundary and evidence-collection gap
+## Audit boundary and evidence collection
 
-The ownership classifier currently runs directly inside
-\`OwnershipRegionPolicy.classify(evidence)\`. It is not yet routed through the
-shared stencil solver runtime, solver-attempt corpus, persistent result cache,
-or long-budget background worker. The current response diagnostics are not a
-durable record of the full optimization input and all solver evidence.
+The ownership classifier still runs directly inside
+`OwnershipRegionPolicy.classify(evidence)`; it is not routed through the
+stencil exact-cover solver runtime, placement result cache, placement corpus,
+or its longer-budget worker. Those abstractions model tiling components and
+are not honest substitutes for ownership evidence or ternary labeling.
 
-The existing stencil exact-cover infrastructure is useful precedent, but its
-problem and result types are specific to tiling:
+The independent, opt-in ownership evidence archive is implemented in
+`transformers/stencil_cover/stencil_ownership_store.py` and writes directly to
+a separate SQLite database. Its schema and capture lifecycle are documented
+in [the ownership quantization corpus guide](ownership-quantization/corpus.md).
+There is deliberately no ownership background solver, solver-result cache,
+work queue, Redis stream, spool, or materializer. Ownership maps and stdevs
+are response-specific observations and the archive exists to support the
+approximation and sensitivity agendas, not repeated solving of identical
+instances.
 
-- the exact-cover canonical input is a normalized occupied-cell shape plus a
-  stencil family;
-- its incumbent is a tile count and a placement witness;
-- its quality ordering and cache codec validate stencil placements.
+The archive keeps these identities separate:
 
-Those are not honest substitutes for an ownership evidence snapshot or a
-ternary labeling. Reuse of the solver lifecycle, event transport, durable
-spool, corpus materializer, work-profile queue, provenance conventions and
-longer-budget re-solve pattern is a separate question from reusing
-placement-specific contracts.
+1. **Evidence identity** identifies one observed input, independently of
+   objective tuning. It covers board dimensions and coordinate convention,
+   lossless ownership and optional standard-deviation arrays, replayed board
+   disposition, empty-point and fixed dead-chain sets, and the versioned
+   chain-liveness rule.
+2. **Ownership-model identity** identifies the exact classifier/optimization
+   semantics applied to that evidence: objective schema, policy class and
+   stable `model_version`, effective parameters, and request metadata that
+   changes classification.
+3. **Attempt identity** identifies one actual optimizer invocation: algorithm
+   and implementation identity, solver/backend configuration, seed or
+   heuristic witness when available, requested wall/native budget, timing,
+   status, lower bound/gap, and execution provenance.
 
-If an ownership corpus / background solver is added, keep three identities
-separate rather than putting every concern into one cache key:
+An exact-result cache key would be the evidence identity paired with model
+identity, but no ownership result cache is implemented. A solver time budget
+does not change the mathematical model identity; it is attempt provenance.
+Do not round ownership or standard-deviation inputs. The SQLite archive stores
+the float64 values as lossless little-endian IEEE-754 blobs, and preserves the
+replayed board and derived eligibility sets so later replay-code changes
+cannot silently rewrite history.
 
-1. **Evidence identity** identifies one observed input, independent of the
-   solver and objective tuning. It needs board width and height, a stable
-   coordinate convention, the lossless ownership mean and standard-deviation
-   arrays, and the replayed board disposition. Store the empty-point and
-   fixed dead-chain sets, or retain enough source board/turn data plus the
-   versioned chain-liveness rule to reconstruct them. Preserve the replayed
-   board itself so later replay-code changes cannot silently rewrite history.
-2. **Ownership-model identity** identifies the exact optimization problem
-   applied to that evidence: the objective and constraint schema/version,
-   effective \(\kappa\), \(\beta\), and \(\epsilon\), the dead-chain
-   interpretation, and any other policy metadata that changes eligibility or
-   labels. A change to these values creates a different mathematical problem,
-   not a different observation.
-3. **Attempt identity** identifies one solver execution: algorithm and
-   implementation version, solver/backend configuration, seed or heuristic
-   version, requested wall/native-effort budget, and execution provenance.
+`rootInfo` and selected value-head/game-result fields are stored as optional
+context on an observation. They do not enter evidence identity or the
+ownership objective. The value-head estimate and final game outcome may be
+retained as evaluation context, but neither silently becomes a hard constraint
+in the declared ownership objective.
 
-An exact-result cache key is the evidence identity paired with the
-ownership-model identity. It should not include a solver time limit: a later,
-longer attempt against the same evidence and model should be able to improve
-the same best-known result. Solver algorithm and work budget belong to
-attempt/work-profile provenance, not to evidence identity.
+`CoherentOwnershipPolicy` records its feasible initial heuristic separately
+from the validated HiGHS incumbent. The reported objective is the full
+unary-plus-TV energy; the MIP dual bound is normalized to that same energy
+scale before its gap is stored. `CoherentCutOwnershipPolicy` records its
+selected supported or repaired labeling and the cut/repair diagnostics. A
+repaired witness is never relabeled as an optimizer incumbent or claimed
+globally optimal. Threshold-policy observations do not fabricate optimizer
+attempt rows.
 
-Do not round ownership or standard-deviation inputs when creating an evidence
-identity: rounding can merge distinct observations and therefore distinct
-optimization instances. Use a lossless, versioned representation. Preserve
-the original evidence in the corpus even when an exact-input result-cache hit
-is unlikely; one evidence record can then support many model and solver
-attempts without duplicating the raw observation.
-
-A useful experiment record would retain the initial heuristic seed separately
-from each optimizer incumbent, along with the objective in a common
-normalization, any proven lower bound and gap, elapsed time, solver status,
-and algorithm/configuration provenance. This allows later comparison of
-time-shortcircuited heuristics against longer-budget and proven-optimal
-solutions. It also permits comparison of masks, aggregate residuals and
-region shape. The value-head estimate and final game outcome may be retained
-as contextual evaluation data, but neither should silently become a hard
-constraint in this ownership objective.
-
-An exact optimum is a gold reference for this mathematical model, not proof
-that the model perfectly represents Go territory. Keep model quality
-(agreement with outcomes or expert judgments) distinct from solver quality
-(gap to the optimum of the declared objective).
-
+`OwnershipRegionPolicy.classify` remains a policy boundary, not a request to
+add another optimization subsystem. The corpus is an immutable experimental
+record from which approximation and sensitivity analyses can be derived.
 ## Tests and known evidence
 
 The current focused tests include:
@@ -641,8 +631,10 @@ The current focused tests include:
 These tests validate particular encodings, objective calculations, feasibility
 and selected shape/performance properties. They are not a held-out corpus
 evaluation, a calibration of \(\kappa\) or \(\beta\), or evidence that the
-current objective is a complete territory model. No ownership corpus or
-longer-budget ownership worker is currently implemented.
+current objective is a complete territory model. The opt-in ownership evidence corpus is implemented and described in
+[the ownership corpus guide](ownership-quantization/corpus.md). It is a
+foreground SQLite archive; no longer-budget ownership worker is implemented
+or planned.
 
 ## Relevant implementation and history
 
