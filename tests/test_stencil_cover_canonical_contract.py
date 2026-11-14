@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import pytest
 
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_family as stencil_family_module
+import transformers.stencil_cover.stencil_region_components as region_components
+import transformers.stencil_cover.stencil_solver_geometry as geometry
 from transformers.stencil_cover.stencil_cache_storage import RedisStencilStore
 from transformers.stencil_cover.stencil_solver_identity import stable_digest as _stable_digest
 from transformers.stencil_cover.stencil_solver_api import (
@@ -38,7 +40,7 @@ def _board_component(cells: tuple[tuple[int, int], ...], width: int) -> tuple[in
 def _translated_image(
     cells: tuple[tuple[int, int], ...], transform: int, dy: int, dx: int,
 ) -> tuple[tuple[int, int], ...]:
-    mapped = tuple(stencil._transform_cell(y, x, transform) for y, x in cells)
+    mapped = tuple(geometry.transform_cell(y, x, transform) for y, x in cells)
     min_y = min(y for y, _x in mapped)
     min_x = min(x for _y, x in mapped)
     return tuple(sorted((y - min_y + dy, x - min_x + dx) for y, x in mapped))
@@ -48,33 +50,33 @@ def test_canonicalization_protocol_is_explicit_and_key_codec_is_lsb_first() -> N
     assert STENCIL_CANONICALIZATION_VERSION == "kata-proxy-stencil-d4-lsb-v1"
 
     family = (("L", ((0, 0), (1, 0), (1, 1))),)
-    key, _frame = stencil._component_shape_key((0, 8, 9), 8, family)
+    key, _frame = region_components._component_shape_key((0, 8, 9), 8, family)
 
     # Header is height,width. Cell indices 0,2,3 set LSB-first -> 0b00001101.
     assert key == bytes((2, 2, 0x0D))
-    assert stencil._decode_component_shape_key(key) == (2, 2, (0, 2, 3))
+    assert geometry.decode_component_shape_key(key) == (2, 2, (0, 2, 3))
 
 
 def test_active_stencil_family_is_closed_under_all_eight_d4_maps() -> None:
     expected_shapes = {
-        stencil._normalise_shape(cells)
-        for _name, cells in stencil.STENCIL_FAMILY
+        geometry.normalise_shape(cells)
+        for _name, cells in stencil_family_module.STENCIL_FAMILY
     }
 
-    assert stencil._family_dihedral_group(stencil.STENCIL_FAMILY) == tuple(range(8))
+    assert geometry.family_dihedral_group(stencil_family_module.STENCIL_FAMILY) == tuple(range(8))
     for transform in range(8):
         assert {
-            stencil._normalise_shape(cells, transform)
-            for _name, cells in stencil.STENCIL_FAMILY
+            geometry.normalise_shape(cells, transform)
+            for _name, cells in stencil_family_module.STENCIL_FAMILY
         } == expected_shapes
 
 
 def test_all_d4_images_and_translations_share_an_instance_key_and_frame_round_trip() -> None:
     board_width = 31
-    expected_key, _ = stencil._component_shape_key(
+    expected_key, _ = region_components._component_shape_key(
         _board_component(_ASYMMETRIC_COMPONENT, board_width),
         board_width,
-        stencil.STENCIL_FAMILY,
+        stencil_family_module.STENCIL_FAMILY,
     )
 
     for transform in range(8):
@@ -85,8 +87,8 @@ def test_all_d4_images_and_translations_share_an_instance_key_and_frame_round_tr
             dx=transform + 2,
         )
         component = _board_component(image, board_width)
-        key, frame = stencil._component_shape_key(
-            component, board_width, stencil.STENCIL_FAMILY,
+        key, frame = region_components._component_shape_key(
+            component, board_width, stencil_family_module.STENCIL_FAMILY,
         )
         assert key == expected_key
 
@@ -94,7 +96,7 @@ def test_all_d4_images_and_translations_share_an_instance_key_and_frame_round_tr
         original_cells = set()
         for point in component:
             y, x = divmod(point, board_width)
-            transformed_y, transformed_x = stencil._transform_cell(
+            transformed_y, transformed_x = geometry.transform_cell(
                 y, x, frame.transform,
             )
             canonical_cells.add((
@@ -103,7 +105,7 @@ def test_all_d4_images_and_translations_share_an_instance_key_and_frame_round_tr
             ))
             original_cells.add((y, x))
 
-        width, _height, flat_cells = stencil._decode_component_shape_key(key)
+        width, _height, flat_cells = geometry.decode_component_shape_key(key)
         decoded_cells = {
             (point // width, point % width)
             for point in flat_cells
@@ -111,10 +113,10 @@ def test_all_d4_images_and_translations_share_an_instance_key_and_frame_round_tr
         assert canonical_cells == decoded_cells
 
         recovered_cells = {
-            stencil._transform_cell(
+            geometry.transform_cell(
                 y + frame.offset_y,
                 x + frame.offset_x,
-                stencil._D4_INVERSE[frame.transform],
+                geometry.D4_INVERSE[frame.transform],
             )
             for y, x in canonical_cells
         }
@@ -123,7 +125,7 @@ def test_all_d4_images_and_translations_share_an_instance_key_and_frame_round_tr
 
 def test_non_closed_family_uses_its_stabilizer_not_the_whole_d4_group() -> None:
     family = (("L-tromino", ((0, 0), (1, 0), (1, 1))),)
-    stabilizer = stencil._family_dihedral_group(family)
+    stabilizer = geometry.family_dihedral_group(family)
 
     # This shape is preserved by the identity and anti-diagonal reflection,
     # but not by a quarter turn. The actual family stabilizer is authoritative.
@@ -133,8 +135,8 @@ def test_non_closed_family_uses_its_stabilizer_not_the_whole_d4_group() -> None:
         _translated_image(((0, 0), (1, 0), (1, 1)), 1, 2, 2),
         8,
     )
-    original_key, _ = stencil._component_shape_key(original, 8, family)
-    rotated_key, _ = stencil._component_shape_key(rotated, 8, family)
+    original_key, _ = region_components._component_shape_key(original, 8, family)
+    rotated_key, _ = region_components._component_shape_key(rotated, 8, family)
     assert rotated_key != original_key
 
 
@@ -143,8 +145,8 @@ def test_family_fingerprint_is_part_of_instance_identity() -> None:
     family_a = (("L-tromino", shape),)
     family_b = (("renamed-L-tromino", shape),)
     component = (0, 8, 9)
-    key_a, _ = stencil._component_shape_key(component, 8, family_a)
-    key_b, _ = stencil._component_shape_key(component, 8, family_b)
+    key_a, _ = region_components._component_shape_key(component, 8, family_a)
+    key_b, _ = region_components._component_shape_key(component, 8, family_b)
 
     assert key_a == key_b
     assert _stable_digest(family_a) != _stable_digest(family_b)

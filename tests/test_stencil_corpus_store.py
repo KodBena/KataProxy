@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_region_components as region_components
 from transformers.stencil_cover.stencil_corpus_events import (
     make_instance_seen_event,
     make_solver_attempt_event,
@@ -49,7 +49,7 @@ def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
 
 
 def _key() -> bytes:
-    value, _frame = stencil._component_shape_key((0, 1), 2, _family())
+    value, _frame = region_components._component_shape_key((0, 1), 2, _family())
     return value
 
 

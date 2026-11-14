@@ -36,13 +36,20 @@ _test_redis = urlsplit(_TEST_REDIS_URL)
 os.environ["KATAPROXY_REDIS_HOST"] = _test_redis.hostname or "127.0.0.1"
 os.environ["KATAPROXY_REDIS_PORT"] = str(_test_redis.port or 6379)
 os.environ["KATAPROXY_REDIS_DB"] = (_test_redis.path.lstrip("/") or "0")
+# This suite verifies Redis capture/materialization. Its synthetic KataGo
+# packets include ownership but not ownershipStdev, so select the retained
+# threshold policy explicitly rather than testing the coherent inference path.
+os.environ["KATAPROXY_STENCIL_OWNERSHIP_POLICY"] = "threshold"
 
 import proxy_server
 import sproxy_config as cfg
 from AbstractProxy.proxy_core import CanonicalId
 from katago import KataGoQuery
 from router import BackendRouter, OnComplete, OnResponse, WireDict
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover_enricher as stencil_enricher
+import transformers.stencil_cover.stencil_family as stencil_family_module
+import transformers.stencil_cover.stencil_region_components as region_components
+import transformers.stencil_cover.stencil_component_cache as component_cache
 from transformers.stencil_cover import stencil_corpus_publisher as corpus_publisher
 from transformers.stencil_cover import stencil_corpus_supervisor
 from transformers.stencil_cover.stencil_corpus_supervisor import StencilCorpusMaterializerSupervisor
@@ -223,8 +230,8 @@ def test_real_redis_executes_legacy_result_migration_lua_script(
 
 
 def _seen_event() -> dict[str, Any]:
-    family = stencil.STENCIL_FAMILY
-    shape_key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    family = stencil_family_module.STENCIL_FAMILY
+    shape_key, _frame = region_components._component_shape_key((0, 1), 2, family)
     problem = canonical_problem_from_key(shape_key, family)
     return make_instance_seen_event(
         problem, shape_key, producer_path="foreground",
@@ -317,7 +324,7 @@ def _install_capture(
         "solver-component-d4-v4",
         client,
     )
-    stencil._invalidate_component_cache()
+    component_cache._invalidate_component_cache()
     return publisher
 
 
@@ -337,7 +344,7 @@ async def _start_proxy(
         lambda **_kwargs: _OwnershipRouter(),
     )
     server = proxy_server.ProxyServer(
-        transformer_factory=lambda link: stencil.stencil_cover_enricher(link),
+        transformer_factory=lambda link: stencil_enricher.stencil_cover_enricher(link),
     )
     task = asyncio.create_task(server.start())
     uri = f"ws://127.0.0.1:{port}"
@@ -463,7 +470,7 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         "solver-component-d4-v4",
         redis_client,
     )
-    stencil._invalidate_component_cache()
+    component_cache._invalidate_component_cache()
     assert corpus_publisher.corpus_events_enabled() is True
     assert corpus_publisher.default_corpus_database_path() == database
     assert "KATAPROXY_STENCIL_CORPUS_DB" not in os.environ
@@ -512,8 +519,8 @@ async def test_ordinary_service_startup_enables_and_supervises_continuous_captur
         # Exercise the real shared solver-runtime foreground and bulk paths.
         # Pair each actual attempt with a sighting in one Redis transaction so
         # the materializer observes the required instance-before-attempt order.
-        family = stencil.STENCIL_FAMILY
-        shape_key, _frame = stencil._component_shape_key((0, 1), 2, family)
+        family = stencil_family_module.STENCIL_FAMILY
+        shape_key, _frame = region_components._component_shape_key((0, 1), 2, family)
         problem = canonical_problem_from_key(shape_key, family)
 
         class _CollectingSink:

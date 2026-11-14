@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence
 
+from .stencil_cache_storage import SolverCacheRequest
 from .stencil_component_cache import _solve_component_cached
 from .stencil_corpus_publisher import publish_instance_seen_many
 from .stencil_family import STENCIL_FAMILY

@@ -37,7 +37,8 @@ from urllib.parse import urlsplit
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_family as stencil_family_module
+import transformers.stencil_cover.stencil_region_components as region_components
 from transformers.stencil_cover.stencil_corpus_events import (
     make_instance_seen_event,
     serialize_event,
@@ -66,8 +67,8 @@ def _fallback_keys() -> tuple[bytes, ...]:
     for cells in components:
         width = max(x for _y, x in cells) + 1
         flat = tuple(y * width + x for y, x in cells)
-        key, _frame = stencil._component_shape_key(
-            flat, width, stencil.STENCIL_FAMILY,
+        key, _frame = region_components._component_shape_key(
+            flat, width, stencil_family_module.STENCIL_FAMILY,
         )
         result.append(key)
     return tuple(result)
@@ -95,7 +96,7 @@ def _load_workload(database: str | None) -> tuple[tuple[bytes, ...], str]:
         return _fallback_keys(), "built-in deterministic connected component fixture"
 
     family_fingerprint = canonical_problem_from_key(
-        _fallback_keys()[0], stencil.STENCIL_FAMILY,
+        _fallback_keys()[0], stencil_family_module.STENCIL_FAMILY,
     ).family_fingerprint
     path = Path(database).expanduser()
     with sqlite3.connect(path) as connection:
@@ -193,7 +194,7 @@ def _summary(durations_ns: Sequence[int]) -> dict[str, float | int]:
 
 
 def _new_event(key: bytes) -> dict[str, Any]:
-    problem = canonical_problem_from_key(key, stencil.STENCIL_FAMILY)
+    problem = canonical_problem_from_key(key, stencil_family_module.STENCIL_FAMILY)
     return make_instance_seen_event(problem, key, producer_path="foreground")
 
 
@@ -214,7 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def canonicalization() -> Any:
         cells, width = next(canonical_cycle)
-        return stencil._component_shape_key(cells, width, stencil.STENCIL_FAMILY)
+        return region_components._component_shape_key(cells, width, stencil_family_module.STENCIL_FAMILY)
 
     event_cycle = itertools.cycle(keys)
     event_construction = lambda: _new_event(next(event_cycle))
@@ -229,10 +230,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     os.environ.pop("KATAPROXY_STENCIL_CORPUS_ENABLED", None)
     disabled_cycle = itertools.cycle(keys)
     capture_disabled = lambda: publish_instance_seen(
-        next(disabled_cycle), stencil.STENCIL_FAMILY, "foreground",
+        next(disabled_cycle), stencil_family_module.STENCIL_FAMILY, "foreground",
     )
     capture_disabled_batch = lambda: publish_instance_seen_many(
-        keys, stencil.STENCIL_FAMILY, "foreground",
+        keys, stencil_family_module.STENCIL_FAMILY, "foreground",
     )
 
     redis_module = __import__("redis")
@@ -275,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def capture_redis() -> None:
                 result = publish_instance_seen(
-                    next(redis_cycle), stencil.STENCIL_FAMILY, "foreground",
+                    next(redis_cycle), stencil_family_module.STENCIL_FAMILY, "foreground",
                     publisher=redirected_publisher,
                 )
                 if result != "redis_stream":
@@ -287,7 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def capture_fallback() -> None:
                 result = publish_instance_seen(
-                    next(fallback_cycle), stencil.STENCIL_FAMILY, "foreground",
+                    next(fallback_cycle), stencil_family_module.STENCIL_FAMILY, "foreground",
                     publisher=fallback_publisher,
                 )
                 if result != "sqlite_spool":
@@ -297,7 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def capture_redis_batch() -> None:
                 result = publish_instance_seen_many(
-                    keys, stencil.STENCIL_FAMILY, "foreground",
+                    keys, stencil_family_module.STENCIL_FAMILY, "foreground",
                     publisher=redirected_publisher,
                 )
                 if result != "redis_stream":
@@ -307,7 +308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def capture_fallback_batch() -> None:
                 result = publish_instance_seen_many(
-                    keys, stencil.STENCIL_FAMILY, "foreground",
+                    keys, stencil_family_module.STENCIL_FAMILY, "foreground",
                     publisher=fallback_publisher,
                 )
                 if result != "sqlite_spool":
@@ -385,7 +386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "workload": workload_description,
             "component_keys": len(keys),
             "active_family_fingerprint": canonical_problem_from_key(
-                keys[0], stencil.STENCIL_FAMILY,
+                keys[0], stencil_family_module.STENCIL_FAMILY,
             ).family_fingerprint,
         },
         "measurements": measurements,

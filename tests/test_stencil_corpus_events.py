@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_region_components as region_components
 from transformers.stencil_cover.stencil_corpus_events import (
     CORPUS_EVENT_SCHEMA,
     PLACEMENT_PAYLOAD_CODEC,
@@ -51,7 +51,7 @@ def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
 
 
 def _key_and_problem() -> tuple[bytes, Any]:
-    key, _frame = stencil._component_shape_key((0, 1), 2, _family())
+    key, _frame = region_components._component_shape_key((0, 1), 2, _family())
     return key, canonical_problem_from_key(key, _family())
 
 
@@ -307,7 +307,7 @@ def test_event_parser_rejects_noncanonical_json_whitespace() -> None:
 
 def test_instance_sighting_builder_rejects_a_mismatched_canonical_key() -> None:
     key, problem = _key_and_problem()
-    other_key, _frame = stencil._component_shape_key((0,), 2, _family())
+    other_key, _frame = region_components._component_shape_key((0,), 2, _family())
 
     with pytest.raises(ValueError, match="does not identify"):
         make_instance_seen_event(problem, other_key)

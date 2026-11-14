@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import importlib
+import itertools
 import hashlib
 import json
 import os
@@ -601,7 +602,7 @@ def test_canonical_solution_is_recovered_with_rotated_stencil_name(
         )
         return True, 0, geometry.encode_cached_placements([complete], family_key)
 
-    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+    monkeypatch.setattr(region_solver, "_solve_component_cached", fake_cached)
 
     horizontal = region_solver._solve_region([0, 1], width=2, height=1, family=family)
     vertical = region_solver._solve_region([0, 1], width=1, height=2, family=family)
@@ -647,7 +648,7 @@ def test_solution_recovery_is_equivariant_for_all_d4_images(
         )
         return True, 0, geometry.encode_cached_placements([complete], family_key)
 
-    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+    monkeypatch.setattr(region_solver, "_solve_component_cached", fake_cached)
 
     recovered: List[List[Dict[str, Any]]] = []
     for transform in range(8):
@@ -703,7 +704,7 @@ def test_disconnected_region_is_solved_as_independent_components(
             geometry.encode_cached_placements(singleton_cover, family_key),
         )
 
-    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+    monkeypatch.setattr(region_solver, "_solve_component_cached", fake_cached)
     result = region_solver._solve_region(
         [0, 1, 8], width=3, height=3, family=family,
     )
@@ -751,7 +752,7 @@ def test_raw_components_retain_the_cells_and_status_of_each_solver_call(
             geometry.encode_cached_placements(singleton_cover, family_key),
         )
 
-    monkeypatch.setattr(stencil, "_solve_component_cached", fake_cached)
+    monkeypatch.setattr(region_solver, "_solve_component_cached", fake_cached)
     result = region_solver._solve_region([0, 1, 8], 3, 3, family)
 
     assert result["status"] == "fallback"
@@ -972,6 +973,53 @@ def test_coherent_policy_uses_ownership_stdev_as_a_confidence_penalty() -> None:
     assert selected.positive == (1, 2)
     assert selected.negative == ()
 
+
+
+def test_coherent_policy_matches_the_explicit_unary_and_spatial_objective() -> None:
+    means = (0.75, -0.15, 0.45, 0.05)
+    deviations = (0.10, 0.20, 0.05, 0.15)
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": list(means),
+            "ownershipStdev": list(deviations),
+        },
+        [None] * 4,
+        2,
+        2,
+        {},
+        requires_ownership_stdev=True,
+    )
+    policy = CoherentOwnershipPolicy(
+        kappa=0.7, beta=0.35, score_tolerance=0.5, time_limit_ms=2_000,
+    )
+    selected = policy.classify(evidence)
+    chosen = tuple(
+        1 if point in selected.positive
+        else -1 if point in selected.negative
+        else 0
+        for point in range(4)
+    )
+    neighbours = ((0, 1), (0, 2), (1, 3), (2, 3))
+
+    def energy(labels: tuple[int, ...]) -> float:
+        unary = sum(
+            0.0 if label == 0
+            else 1.0 - 2.0 * label * mean + 2.0 * policy.kappa * deviation
+            for label, mean, deviation in zip(labels, means, deviations)
+        )
+        spatial = policy.beta * sum(
+            abs(labels[first] - labels[second])
+            for first, second in neighbours
+        )
+        return unary + spatial
+
+    expected_net = sum(means)
+    feasible = (
+        labels for labels in itertools.product((-1, 0, 1), repeat=4)
+        if abs(sum(labels) - expected_net) <= policy.score_tolerance
+    )
+    optimum = min(energy(labels) for labels in feasible)
+    assert abs(energy(chosen) - optimum) < 1e-7
 
 def test_coherent_policy_builds_a_connected_region_for_diffuse_ownership() -> None:
     ownership_map = [0.2] * 25

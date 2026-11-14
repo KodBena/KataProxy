@@ -6,7 +6,10 @@ from typing import Any
 
 import pytest
 
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_region_components as region_components
+import transformers.stencil_cover.stencil_component_cache as component_cache
+import transformers.stencil_cover.stencil_region_solver as region_solver
+import transformers.stencil_cover.stencil_solver_geometry as geometry
 from transformers.stencil_cover.stencil_bulk_solver import StencilBulkSolver
 from transformers.stencil_cover import stencil_bulk_solver as bulk_module
 from transformers.stencil_cover.stencil_solver_api import (
@@ -83,7 +86,7 @@ def _domino_family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
 
 
 def _domino_key() -> bytes:
-    key, _frame = stencil._component_shape_key((0, 1), 2, _domino_family())
+    key, _frame = region_components._component_shape_key((0, 1), 2, _domino_family())
     return key
 
 
@@ -100,7 +103,7 @@ def test_fake_backend_substitutes_without_transformer_solver_changes() -> None:
             policy_id="foreground-250ms",
         ),
     )
-    candidate = stencil._solve_component_uncached(request)
+    candidate = component_cache._solve_component_uncached(request)
     optimal, status, encoded = candidate
     assert candidate.provenance["disposition"] == "present"
     assert candidate.provenance["producer_path"] == "foreground"
@@ -130,14 +133,14 @@ def test_fake_backend_can_be_injected_at_transformer_component_boundary(
     def solve_without_persistent_cache(
         request: SolverCacheRequest,
     ) -> tuple[bool, int, bytes]:
-        return stencil._solve_component_uncached(request).result
+        return component_cache._solve_component_uncached(request).result
 
     monkeypatch.setattr(
         stencil, "_solve_component_cached", solve_without_persistent_cache,
     )
     family = _domino_family()
     backend = _FakeOptimalBackend(name="fake-transformer-boundary")
-    result = stencil._solve_region(
+    result = region_solver._solve_region(
         [0, 1], width=2, height=1, family=family, solver_backend=backend,
     )
     assert result["optimal"] is True
@@ -217,7 +220,7 @@ class _MemoryStore:
 
 def test_bulk_worker_uses_the_same_backend_boundary_and_budget() -> None:
     family = _domino_family()
-    fallback = stencil._encode_cached_placements(
+    fallback = geometry.encode_cached_placements(
         [("1x1", (0,)), ("1x1", (1,))], family,
     )
     store = _MemoryStore((False, 2, fallback))
@@ -266,7 +269,7 @@ def test_local_lru_keeps_different_backend_profiles_separate() -> None:
         calls.append(request.backend.identity.fingerprint)
         return (True, 0, b"\x01\x00\x00\x02\x00\x00\x00\x01\x00")
 
-    cache = stencil._InvalidatableSolverCache(invoke, maxsize=8)
+    cache = component_cache._InvalidatableSolverCache(invoke, maxsize=8)
     first = _FakeOptimalBackend(name="same", mode="first")
     second = _FakeOptimalBackend(name="same", mode="second")
 
@@ -309,7 +312,7 @@ class _FakeNoIncumbentBackend:
 
 def test_no_incumbent_uses_a_distinct_singleton_fallback() -> None:
     family = (("domino", ((0, 0), (0, 1))),)
-    key, _frame = stencil._component_shape_key((0,), 1, family)
+    key, _frame = region_components._component_shape_key((0,), 1, family)
     execution = solve_component(
         _FakeNoIncumbentBackend(),
         key,
@@ -395,7 +398,7 @@ def test_bulk_attempt_records_a_bulk_sighting_before_solving(
 ) -> None:
     monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "false")
     family = _domino_family()
-    fallback = stencil._encode_cached_placements(
+    fallback = geometry.encode_cached_placements(
         [("1x1", (0,)), ("1x1", (1,))], family,
     )
     store = _MemoryStore((False, 2, fallback))
@@ -420,7 +423,7 @@ def test_bulk_sighting_precedes_timeout_and_result_cache_returns(
 ) -> None:
     monkeypatch.setenv("KATAPROXY_STENCIL_CORPUS_ENABLED", "false")
     family = _domino_family()
-    optimal = stencil._encode_cached_placements([("1x2", (0, 1))], family)
+    optimal = geometry.encode_cached_placements([("1x2", (0, 1))], family)
     store = _MemoryStore((True, 0, optimal))
     order: list[str] = []
 

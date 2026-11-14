@@ -11,7 +11,9 @@ from typing import Any
 
 import pytest
 
-from transformers import stencil_cover_enricher as stencil
+import transformers.stencil_cover.stencil_region_components as region_components
+import transformers.stencil_cover.stencil_region_solver as region_solver
+import transformers.stencil_cover.stencil_solver_geometry as geometry
 from transformers.stencil_cover.stencil_cache_storage import SolverCacheRequest
 from transformers.stencil_cover.stencil_corpus_events import (
     make_instance_seen_event,
@@ -52,7 +54,7 @@ def _family() -> tuple[tuple[str, tuple[tuple[int, int], ...]], ...]:
 
 def _event(event_id: str = "12345678-1234-5678-1234-567812345678") -> dict[str, Any]:
     family = _family()
-    key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    key, _frame = region_components._component_shape_key((0, 1), 2, family)
     return make_instance_seen_event(
         canonical_problem_from_key(key, family),
         key,
@@ -341,7 +343,7 @@ class _FakeBackend:
 
 def test_shared_runtime_publishes_real_attempt_with_the_selected_path() -> None:
     family = _family()
-    key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    key, _frame = region_components._component_shape_key((0, 1), 2, family)
     publisher = _CapturingPublisher()
     execution = solve_component(
         _FakeBackend(),
@@ -370,7 +372,7 @@ def test_foreground_sighting_is_emitted_before_the_result_cache_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     family = _family()
-    encoded = stencil._encode_cached_placements([("1x2", (0, 1))], family)
+    encoded = geometry.encode_cached_placements([("1x2", (0, 1))], family)
     events: list[str] = []
 
     def record_sighting(
@@ -387,9 +389,9 @@ def test_foreground_sighting_is_emitted_before_the_result_cache_lookup(
         events.append("cache")
         return True, 0, encoded
 
-    monkeypatch.setattr(stencil, "publish_instance_seen_many", record_sighting)
-    monkeypatch.setattr(stencil, "_solve_component_cached", cache_hit)
-    result = stencil._solve_region([0, 1], 2, 1, family)
+    monkeypatch.setattr(region_solver, "publish_instance_seen_many", record_sighting)
+    monkeypatch.setattr(region_solver, "_solve_component_cached", cache_hit)
+    result = region_solver._solve_region([0, 1], 2, 1, family)
 
     assert result["optimal"] is True
     assert events == ["sighting", "cache"]
@@ -413,17 +415,17 @@ def test_disconnected_components_are_published_in_one_batch_before_cache(
     def cache_hit(request: SolverCacheRequest) -> tuple[bool, int, bytes]:
         assert events == ["batch"] or events == ["batch", "cache"]
         events.append("cache")
-        _width, _height, cells = stencil._decode_component_shape_key(
+        _width, _height, cells = geometry.decode_component_shape_key(
             request.shape_key,
         )
-        encoded = stencil._encode_cached_placements(
+        encoded = geometry.encode_cached_placements(
             [("1x1", (point,)) for point in cells], family,
         )
         return True, 0, encoded
 
     monkeypatch.setattr(stencil, "publish_instance_seen_many", record_batch)
-    monkeypatch.setattr(stencil, "_solve_component_cached", cache_hit)
-    result = stencil._solve_region([0, 1, 8], 3, 3, family)
+    monkeypatch.setattr(region_solver, "_solve_component_cached", cache_hit)
+    result = region_solver._solve_region([0, 1, 8], 3, 3, family)
 
     assert len(captured_keys) == 2
     assert events == ["batch", "cache", "cache"]
@@ -437,7 +439,7 @@ def test_solver_result_is_not_lost_when_corpus_sink_raises() -> None:
             raise OSError("spool offline")
 
     family = _family()
-    key, _frame = stencil._component_shape_key((0, 1), 2, family)
+    key, _frame = region_components._component_shape_key((0, 1), 2, family)
     execution = solve_component(
         _FakeBackend(),
         key,
