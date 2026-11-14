@@ -1108,6 +1108,7 @@ def build_sensitivity(
         "sampled_group_count": sampled_group_count,
         "max_snapshots_per_group": max_snapshots_per_group,
         "potential_pair_count": potential_pair_count,
+        "snapshot_pair_count": candidate_count,
         "evaluated_pair_count": candidate_count,
         "returned_pair_count": len(selected),
         "pair_results_truncated": candidate_count > len(selected),
