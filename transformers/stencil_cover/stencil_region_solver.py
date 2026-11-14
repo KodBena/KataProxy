@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
+import logging
+from typing import Any, Dict, List, Mapping, Sequence
+
+import sproxy_config as cfg
 
 from .stencil_cache_storage import SolverCacheRequest
 from .stencil_component_cache import _solve_component_cached
 from .stencil_corpus_publisher import publish_instance_seen_many
 from .stencil_family import STENCIL_FAMILY
 from .stencil_ownership import OwnershipRegionPolicy, make_ownership_evidence
+from .stencil_ownership_store import SQLiteOwnershipStore
 from .stencil_region_components import (
     _PreparedComponent,
     _prepare_region_components,
@@ -24,6 +28,8 @@ from .stencil_solver_geometry import (
     verify_component_placements as _verify_component_placements,
 )
 
+
+logger = logging.getLogger("kataproxy.stencil_region_solver")
 
 _SOLVER_TIME_LIMIT_MS = 250
 
@@ -131,6 +137,10 @@ def _build_stencil_cover(
     policy_metadata: Dict[str, Any],
     ownership_policy: OwnershipRegionPolicy,
     solver_backend: SolverBackend | None = None,
+    *,
+    turn_number: int = 0,
+    is_during_search: bool = False,
+    response_context: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     evidence = make_ownership_evidence(
         opaque,
@@ -141,6 +151,32 @@ def _build_stencil_cover(
         requires_ownership_stdev=ownership_policy.requires_ownership_stdev,
     )
     selected_regions = ownership_policy.classify(evidence)
+    if cfg.STENCIL_OWNERSHIP_CORPUS_ENABLED:
+        context: dict[str, Any] = {}
+        context_keys = (
+            "rootInfo", "scoreLead", "scoreStdev", "winrate",
+            "visits", "winner", "finalScore",
+        )
+        for key in context_keys:
+            if response_context is not None and key in response_context:
+                context[key] = response_context[key]
+        try:
+            SQLiteOwnershipStore(cfg.STENCIL_OWNERSHIP_CORPUS_DB).record(
+                evidence,
+                selected_regions,
+                ownership_policy,
+                turn_number=turn_number,
+                is_during_search=is_during_search,
+                response_context=context,
+            )
+        except Exception:
+            # Evidence capture must not suppress the interactive stencil-cover
+            # response. The diagnostic names a real durability gap.
+            logger.exception(
+                "Could not persist ownership evidence for turn %s; "
+                "the stencil-cover response will continue without this observation",
+                turn_number,
+            )
     family_key = tuple(STENCIL_FAMILY)
     positive_components = _prepare_region_components(
         selected_regions.positive, width, height, family_key,

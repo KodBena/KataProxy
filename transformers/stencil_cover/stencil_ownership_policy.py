@@ -41,6 +41,8 @@ def _validate_policy(policy: OwnershipRegionPolicy) -> OwnershipRegionPolicy:
     """Refuse an incomplete or dishonest policy implementation at composition."""
     if not isinstance(policy.policy_id, str) or not policy.policy_id.strip():
         raise TypeError("ownership policy policy_id must be a non-empty string")
+    if not isinstance(policy.model_version, str) or not policy.model_version.strip():
+        raise TypeError("ownership policy model_version must be a non-empty string")
     if not isinstance(policy.requires_ownership_stdev, bool):
         raise TypeError("ownership policy requires_ownership_stdev must be bool")
     if not callable(policy.validate_request_metadata):

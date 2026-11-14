@@ -471,6 +471,28 @@ STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS: int = int(
     os.environ.get("KATAPROXY_STENCIL_OWNERSHIP_SOLVER_TIME_LIMIT_MS", "250")
 )
 
+# Ownership evidence is an explicit, direct-to-SQLite research capture path.
+# It is opt-in because each analyze response adds a durable observation.
+_OWNERSHIP_CORPUS_ENABLED_RAW = os.environ.get(
+    "KATAPROXY_STENCIL_OWNERSHIP_CORPUS_ENABLED", "false"
+).strip().lower()
+if _OWNERSHIP_CORPUS_ENABLED_RAW not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+    raise ValueError(
+        "KATAPROXY_STENCIL_OWNERSHIP_CORPUS_ENABLED must be a boolean value"
+    )
+STENCIL_OWNERSHIP_CORPUS_ENABLED: bool = (
+    _OWNERSHIP_CORPUS_ENABLED_RAW in {"1", "true", "yes", "on"}
+)
+_OWNERSHIP_STATE_HOME = Path(
+    os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+)
+STENCIL_OWNERSHIP_CORPUS_DB: Path = Path(
+    os.environ.get(
+        "KATAPROXY_STENCIL_OWNERSHIP_CORPUS_DB",
+        str(_OWNERSHIP_STATE_HOME / "kataproxy" / "ownership-quantization.sqlite3"),
+    )
+).expanduser()
+
 for _config_name, _config_value in (
     ("KATAPROXY_STENCIL_OWNERSHIP_CONFIDENCE_KAPPA", STENCIL_OWNERSHIP_CONFIDENCE_KAPPA),
     ("KATAPROXY_STENCIL_OWNERSHIP_SPATIAL_BETA", STENCIL_OWNERSHIP_SPATIAL_BETA),

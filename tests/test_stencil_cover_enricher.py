@@ -876,6 +876,34 @@ def test_environment_policy_factory_selects_sibling_implementations(
     assert cut_selected.beta == 0.4
 
 
+def test_capture_mode_requests_stdev_for_threshold_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_CORPUS_ENABLED", True)
+    transformer = enricher.stencil_cover_enricher(
+        _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),
+    )
+    query = _query({"stencil_cover": {"truncation_threshold": 0.5}})
+    transformer.on_query(ClientId("threshold-capture"), query)
+    assert query.opaque["includeOwnership"] is True
+    assert query.opaque["includeOwnershipStdev"] is True
+
+
+def test_threshold_evidence_preserves_optional_stdev_when_it_is_supplied() -> None:
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": [0.8, -0.8, 0.0, 0.1],
+            "ownershipStdev": [0.1, 0.2, 0.3, 0.4],
+        },
+        [None] * 4,
+        2,
+        2,
+        {"truncation_threshold": 0.5},
+        requires_ownership_stdev=False,
+    )
+    assert evidence.ownership_stdev == (0.1, 0.2, 0.3, 0.4)
+
+
 def test_legacy_threshold_policy_validates_its_per_query_cutoff() -> None:
     transformer = enricher.stencil_cover_enricher(
         _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),

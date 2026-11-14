@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from typing import Dict
 
+import sproxy_config as cfg
+
 from AbstractProxy.protocol_transformer import Transformer
 from AbstractProxy.proxy_core import ClientId, InternalId, ProxyLink
 from katago import AnalyzeResponse, KataGoQuery, KataGoResponse
@@ -46,7 +48,10 @@ def stencil_cover_enricher(
             selected_policy.validate_request_metadata(context.policy_metadata)
             request_cache[eid] = context
             query.opaque["includeOwnership"] = True
-            if selected_policy.requires_ownership_stdev:
+            if (
+                selected_policy.requires_ownership_stdev
+                or cfg.STENCIL_OWNERSHIP_CORPUS_ENABLED
+            ):
                 query.opaque["includeOwnershipStdev"] = True
         return query
 
@@ -64,6 +69,9 @@ def stencil_cover_enricher(
                         context.policy_metadata,
                         selected_policy,
                         solver_backend=solver_backend,
+                        turn_number=response.turn_number,
+                        is_during_search=response.is_during_search,
+                        response_context=response.opaque,
                     )
                 except Exception:
                     logger.exception(

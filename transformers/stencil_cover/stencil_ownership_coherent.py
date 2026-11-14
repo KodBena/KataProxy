@@ -86,6 +86,7 @@ class CoherentOwnershipPolicy:
     time_limit_ms: int = 250
 
     policy_id = "coherent"
+    model_version = "coherent-ownership-mip-v2"
     requires_ownership_stdev = True
 
     def __post_init__(self) -> None:

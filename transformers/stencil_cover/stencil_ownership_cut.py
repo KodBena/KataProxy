@@ -94,6 +94,7 @@ class CoherentCutOwnershipPolicy:
     time_limit_ms: int = 250
 
     policy_id = "coherent-cut"
+    model_version = "coherent-ownership-cut-v1"
     requires_ownership_stdev = True
 
     def __post_init__(self) -> None:

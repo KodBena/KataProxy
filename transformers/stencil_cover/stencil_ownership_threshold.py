@@ -25,6 +25,7 @@ class ThresholdOwnershipPolicy:
     """The original hard cutoff, retained as an explicitly selectable policy."""
 
     policy_id = "threshold"
+    model_version = "threshold-pointwise-v1"
     requires_ownership_stdev = False
 
     def validate_request_metadata(self, metadata: Mapping[str, Any]) -> None:

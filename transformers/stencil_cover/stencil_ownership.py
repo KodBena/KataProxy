@@ -45,6 +45,7 @@ class OwnershipRegionPolicy(Protocol):
     """One selectable rule for mapping ownership evidence to signed board regions."""
 
     policy_id: str
+    model_version: str
     requires_ownership_stdev: bool
 
     def validate_request_metadata(self, metadata: Mapping[str, Any]) -> None: ...
@@ -128,10 +129,15 @@ def make_ownership_evidence(
         raise ValueError("ownership values must lie in [-1, 1]")
 
     stdev_values: Optional[Tuple[float, ...]] = None
-    if requires_ownership_stdev:
-        raw_stdev = opaque.get("ownershipStdev")
-        if raw_stdev is None:
-            raise ValueError("response has no ownershipStdev map required by the selected policy")
+    raw_stdev = opaque.get("ownershipStdev")
+    if raw_stdev is None:
+        if requires_ownership_stdev:
+            raise ValueError(
+                "response has no ownershipStdev map required by the selected policy"
+            )
+    else:
+        # Preserve the map whenever KataGo supplied it, even for a policy that
+        # does not use uncertainty in its classification objective.
         stdev = _numeric_array(raw_stdev, "ownershipStdev")
         if stdev.size != area:
             raise ValueError(
