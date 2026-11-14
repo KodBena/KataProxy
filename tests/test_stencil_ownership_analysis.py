@@ -126,7 +126,10 @@ def test_sensitivity_pairs_only_identical_replayed_boards(
     )
 
     result = build_sensitivity(load_archive(path))
-    assert result["snapshot_pair_count"] == 1
+    assert result["potential_pair_count"] == 1
+    assert result["evaluated_pair_count"] == 1
+    assert result["sampled_group_count"] == 0
+    assert result["sampled_snapshot_count"] == 0
     assert result["returned_pair_count"] == 1
     assert "no game/session identifier" in result["pair_scope"]
     pair = result["pairs"][0]
