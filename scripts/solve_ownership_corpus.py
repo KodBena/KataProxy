@@ -681,9 +681,7 @@ def _apply_outcome(
     state.attempt_count += 1
     state.last_status = outcome.status
     state.last_error = outcome.error
-    if outcome.status == "error":
-        state.last_error_level_ms = state.last_error_level_ms
-    else:
+    if outcome.status != "error":
         state.last_error_level_ms = None
 
     if outcome.labels is not None:
@@ -812,7 +810,10 @@ def run_campaign(
                 if (
                     not progress[item.task_id].optimal_proven
                     and progress[item.task_id].spent_wall_ms < target_ms
-                    and progress[item.task_id].last_error_level_ms != target_ms
+                    and (
+                        progress[item.task_id].last_error_level_ms is None
+                        or progress[item.task_id].last_error_level_ms < target_ms
+                    )
                 )
             ]
             if not pending:

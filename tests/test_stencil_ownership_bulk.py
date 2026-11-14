@@ -167,7 +167,7 @@ def test_campaign_retries_solver_error_once_at_each_budget_level(
     campaign = build_campaign(load_archive(database))
     item = campaign.items[0]
     progress = {item.task_id: _initial_progress(item)}
-    levels_ms = (1000, 2000)
+    levels_ms = (1000, 2000, 3000)
     slice_ms = 500
     fingerprint = campaign_fingerprint(campaign, levels_ms, slice_ms)
     checkpoint = tmp_path / "error-checkpoint.json"
@@ -200,13 +200,34 @@ def test_campaign_retries_solver_error_once_at_each_budget_level(
     )
 
     state = progress[item.task_id]
-    assert requested == [500, 500]
-    assert state.attempt_count == 2
-    assert state.last_error_level_ms == 2000
+    assert requested == [500, 500, 500]
+    assert state.attempt_count == 3
+    assert state.last_error_level_ms == 3000
     assert state.last_error == "synthetic solver failure"
 
     resumed = load_checkpoint(checkpoint, campaign, fingerprint)
-    assert resumed[item.task_id].last_error_level_ms == 2000
+    assert resumed[item.task_id].last_error_level_ms == 3000
+    resume_calls: list[int] = []
+
+    def resumed_solver(
+        _task: CampaignItem,
+        _state: TaskProgress,
+        time_limit_ms: int,
+    ) -> SliceOutcome:
+        resume_calls.append(time_limit_ms)
+        raise AssertionError("completed error levels must not be retried on resume")
+
+    run_campaign(
+        campaign,
+        resumed,
+        levels_ms=levels_ms,
+        slice_ms=slice_ms,
+        checkpoint_path=checkpoint,
+        fingerprint=fingerprint,
+        progress_interval_seconds=3600.0,
+        solver=resumed_solver,
+    )
+    assert resume_calls == []
 
 
 def test_campaign_output_paths_cannot_overwrite_the_evidence_database(
