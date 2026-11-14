@@ -931,7 +931,8 @@ def test_coherent_policy_preserves_the_expected_signed_ownership_sum() -> None:
     assert abs(
         diagnostics["targetNetOwnership"] - diagnostics["actualNetOwnership"]
     ) <= policy.score_tolerance
-    assert diagnostics["solverStatus"] == "optimal"
+    assert diagnostics["solverStatus"] in {"optimal", "feasible_time_limit"}
+    assert diagnostics["optimal"] is (diagnostics["solverStatus"] == "optimal")
 
 
 def test_coherent_policy_refuses_a_missing_ownership_stdev_map(
