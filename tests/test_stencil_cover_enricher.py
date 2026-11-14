@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 import pytest
 
 import transformers.stencil_cover.stencil_cache_storage as storage
-import transformers.stencil_cover.stencil_cover_enricher as stencil
+import transformers.stencil_cover_enricher as stencil
 from AbstractProxy.proxy_core import ClientId
 from katago import AnalyzeResponse, KataGoAction, KataGoQuery, make_katago_link
 from transformers.stencil_cover.stencil_bulk_solver import (

@@ -8,7 +8,7 @@ import pytest
 
 from transformers import stencil_cover_enricher as stencil
 from transformers.stencil_cover.stencil_bulk_solver import StencilBulkSolver
-from transformers.stencil_cover.stencil_cover import stencil_bulk_solver as bulk_module
+from transformers.stencil_cover import stencil_bulk_solver as bulk_module
 from transformers.stencil_cover.stencil_solver_api import (
     BackendStatusReported,
     Incumbent,
