@@ -9,6 +9,7 @@ import json
 import os
 import threading
 import sys
+import time
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
 
@@ -1020,6 +1021,39 @@ def test_coherent_policy_matches_the_explicit_unary_and_spatial_objective() -> N
     )
     optimum = min(energy(labels) for labels in feasible)
     assert abs(energy(chosen) - optimum) < 1e-7
+
+
+def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
+    width = 25
+    height = 25
+    ownership_map = [0.15] * (width * height)
+    stdev_map = [0.05] * (width * height)
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": ownership_map,
+            "ownershipStdev": stdev_map,
+        },
+        [None] * (width * height),
+        width,
+        height,
+        {},
+        requires_ownership_stdev=True,
+    )
+    policy = CoherentOwnershipPolicy(
+        kappa=1.0, beta=0.25, score_tolerance=0.5, time_limit_ms=250,
+    )
+
+    started = time.perf_counter()
+    selected = policy.classify(evidence)
+    elapsed = time.perf_counter() - started
+    diagnostics = selected.diagnostics
+
+    assert abs(
+        diagnostics["actualNetOwnership"] - diagnostics["targetNetOwnership"]
+    ) <= policy.score_tolerance
+    assert diagnostics["solverStatus"] in {"optimal", "feasible_time_limit"}
+    assert diagnostics["emptyPointCount"] == width * height
+    assert elapsed < 2.5
 
 def test_coherent_policy_builds_a_connected_region_for_diffuse_ownership() -> None:
     ownership_map = [0.2] * 25

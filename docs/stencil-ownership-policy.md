@@ -70,11 +70,17 @@ absolute differences. The aggregate interval is an explicit integer
 constraint. This avoids relying on a Lagrange-multiplier search to happen to
 land on a score sum that may be skipped by discrete label changes.
 
-The implementation uses SciPy's HiGHS MILP interface. An optimal solution is
-marked as such; a feasible incumbent found before the time limit is marked
-`feasible_time_limit`. If no valid incumbent is available, enrichment is
-omitted and the original KataGo response is forwarded with an error diagnostic
-in the proxy log.
+The implementation uses the HiGHS MIP engine through its Python API. Before
+branch-and-bound it constructs a feasible labeling by starting at the
+independent unary minima and applying the cheapest one-point changes needed to
+meet the integer score interval. The seed includes the exact auxiliary values
+for the spatial total-variation terms, so it is a complete feasible MIP start,
+not an unconstrained fallback. HiGHS runs single-threaded; model assembly and
+optimization both consume the configured per-response budget. An optimal
+solution is marked as such. If the budget expires first, the best valid
+incumbent (at least the feasible seed) is returned with
+`solverStatus=feasible_time_limit`; the transformer does not need to discard
+an otherwise usable annotation merely because optimality was not proven.
 
 These weights are modelling choices, not calibrated constants. They are
 exposed for investigation:
