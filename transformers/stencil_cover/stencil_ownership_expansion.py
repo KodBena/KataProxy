@@ -271,6 +271,7 @@ def ordered_label_expansion(
     component_for = component_ids(eligible, neighbours)
 
     current = dict(initial)
+    current_full = {**current, **fixed_labels}
     current_energy = full_energy_from_reduction(problem, current)
     cross_checked_energy = ownership_energy(
         current_full,

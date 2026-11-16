@@ -572,16 +572,16 @@ def build_results(
                 problem.aggregate_upper,
                 problem.beta,
             )
-            gap_value: float | None = None
+            checkpoint_checkpoint_gap_value: float | None = None
             if reference_is_proven:
-                raw_gap = checkpoint_metrics.get("additive_optimality_gap")
-                if isinstance(raw_gap, (int, float)):
-                    gap_value = float(raw_gap)
+                raw_checkpoint_gap = checkpoint_metrics.get("additive_optimality_gap")
+                if isinstance(raw_checkpoint_gap, (int, float)):
+                    checkpoint_checkpoint_gap_value = float(raw_checkpoint_gap)
                 gap_kind = "exact_additive_optimality_gap"
             elif lower_bound is not None:
-                raw_gap = checkpoint_metrics.get("additive_gap_upper_bound")
-                if isinstance(raw_gap, (int, float)):
-                    gap_value = float(raw_gap)
+                raw_checkpoint_gap = checkpoint_metrics.get("additive_gap_upper_bound")
+                if isinstance(raw_checkpoint_gap, (int, float)):
+                    checkpoint_checkpoint_gap_value = float(raw_checkpoint_gap)
                 gap_kind = "additive_gap_upper_bound"
             else:
                 gap_kind = "unavailable_without_proven_optimum_or_lower_bound"
@@ -589,7 +589,7 @@ def build_results(
                 "pass_number": checkpoint.pass_number,
                 "latency_ms": checkpoint.elapsed_wall_ns / 1_000_000.0,
                 "energy": float(checkpoint_energy),
-                "gap": gap_value,
+                "gap": checkpoint_gap_value,
                 "gap_kind": gap_kind,
                 "cut_calls": checkpoint.cut_calls,
                 "accepted_moves": checkpoint.accepted_moves,
@@ -604,12 +604,12 @@ def build_results(
                 "method": f"ordered_expansion_pass_{checkpoint.pass_number}",
                 "latency_ms": float(trace_point["latency_ms"]),
                 "energy": float(checkpoint_energy),
-                "gap": gap_value,
+                "gap": checkpoint_gap_value,
                 "gap_kind": gap_kind,
             })
-            if gap_value is not None and gap_value < best_gap_so_far - 1e-12:
+            if checkpoint_gap_value is not None and checkpoint_gap_value < best_gap_so_far - 1e-12:
                 expansion_frontier.append(trace_point)
-                best_gap_so_far = gap_value
+                best_gap_so_far = checkpoint_gap_value
 
         latency_gap_pareto_frontier: list[dict[str, Any]] = []
         best_gap_seen = math.inf
