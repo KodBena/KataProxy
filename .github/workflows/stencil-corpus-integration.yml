@@ -2,9 +2,9 @@ name: Stencil corpus integration and benchmark
 
 on:
   push:
-    branches: [next]
+    branches: [next, "scratch/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "scratch/**"]
   workflow_dispatch:
 
 jobs:

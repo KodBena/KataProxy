@@ -2,9 +2,9 @@ name: ADR-0000 structural and type gate
 
 on:
   push:
-    branches: [next]
+    branches: [next, "scratch/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "scratch/**"]
   workflow_dispatch:
 
 jobs:
@@ -24,6 +24,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
+
+      - name: Enforce eager-import law
+        run: python gates/no_lazy_imports.py
 
       - name: Check the complete Python import surface
         run: python -m pytest -q tests/test_import_contract.py
