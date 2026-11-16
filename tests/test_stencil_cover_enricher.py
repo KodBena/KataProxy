@@ -19,6 +19,7 @@ import transformers.stencil_cover.stencil_cache_storage as storage
 import transformers.stencil_cover.stencil_board as board_position
 import transformers.stencil_cover.stencil_family as stencil_family_module
 import transformers.stencil_cover.stencil_ownership as ownership
+import transformers.stencil_cover.stencil_ownership_coherent as coherent_ownership
 import transformers.stencil_cover.stencil_ownership_policy as ownership_policy_factory
 import transformers.stencil_cover.stencil_region_solver as region_solver
 import transformers.stencil_cover.stencil_region_components as region_components
@@ -28,6 +29,7 @@ import transformers.stencil_cover.stencil_solver_geometry as geometry
 import transformers.stencil_cover_enricher as enricher
 from transformers.stencil_cover.stencil_ownership_coherent import CoherentOwnershipPolicy
 from transformers.stencil_cover.stencil_ownership_cut import CoherentCutOwnershipPolicy
+from transformers.stencil_cover.stencil_ownership_solver_api import OwnershipLabeling
 from transformers.stencil_cover.stencil_ownership_threshold import ThresholdOwnershipPolicy
 import sproxy_config as cfg
 from AbstractProxy.proxy_core import ClientId
@@ -1074,6 +1076,104 @@ def test_coherent_policy_matches_the_explicit_unary_and_spatial_objective() -> N
     assert abs(energy(chosen) - optimum) < 1e-7
 
 
+def test_coherent_policy_retains_seed_when_mip_preparation_deadline_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": [0.15] * 16,
+            "ownershipStdev": [0.05] * 16,
+        },
+        [None] * 16,
+        4,
+        4,
+        {},
+        requires_ownership_stdev=True,
+    )
+    expired = coherent_ownership._OwnershipMipPreparationExpired(
+        "constraint_rows", 8,
+    )
+    monkeypatch.setattr(
+        coherent_ownership,
+        "_prepare_ownership_mip",
+        lambda **_kwargs: expired,
+    )
+
+    selected = CoherentOwnershipPolicy(time_limit_ms=250).classify(evidence)
+
+    assert selected.solver_evidence is not None
+    assert selected.solver_evidence.status.value == "seed_only"
+    assert selected.solver_evidence.initial_heuristic is not None
+    assert selected.solver_evidence.optimizer_incumbent is None
+    assert selected.diagnostics["mipPreparationStatus"] == "deadline_expired"
+    assert selected.diagnostics["mipPreparationPhase"] == "constraint_rows"
+    assert selected.diagnostics["mipPreparationCompletedItems"] == 8
+    actual_net = cast(float, selected.diagnostics["actualNetOwnership"])
+    target_net = cast(float, selected.diagnostics["targetNetOwnership"])
+    assert abs(actual_net - target_net) <= 0.5
+
+
+def test_coherent_policy_passes_the_selected_warm_start_to_mip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = ownership.make_ownership_evidence(
+        {
+            "ownership": [0.9, -0.9, 0.9, -0.9],
+            "ownershipStdev": [0.0, 0.0, 0.0, 0.0],
+        },
+        [None] * 4,
+        4,
+        1,
+        {},
+        requires_ownership_stdev=True,
+    )
+    warm_start = OwnershipLabeling((
+        (0, 1), (1, 1), (2, -1), (3, -1),
+    ))
+    captured_solutions: list[tuple[float, ...]] = []
+    original_prepare = coherent_ownership._prepare_ownership_mip
+
+    def capture_preparation(
+        **kwargs: Any,
+    ) -> (
+        coherent_ownership._PreparedOwnershipMip
+        | coherent_ownership._OwnershipMipPreparationExpired
+    ):
+        preparation = original_prepare(**kwargs)
+        if isinstance(preparation, coherent_ownership._PreparedOwnershipMip):
+            captured_solutions.append(
+                tuple(float(value) for value in preparation.initial_solution)
+            )
+            return coherent_ownership._OwnershipMipPreparationExpired(
+                "sparse_conversion", preparation.row_count,
+            )
+        return preparation
+
+    # Stop before the native solver: the witness here is the exact vector at
+    # the port, not a claim inferred from the selected response.
+    monkeypatch.setattr(
+        coherent_ownership,
+        "_prepare_ownership_mip",
+        capture_preparation,
+    )
+    selected = CoherentOwnershipPolicy(
+        beta=3.0, score_tolerance=0.5, time_limit_ms=2_000,
+    ).classify(evidence, initial_labeling=warm_start)
+
+    assert selected.solver_evidence is not None
+    assert selected.solver_evidence.initial_heuristic is not None
+    assert (
+        selected.solver_evidence.initial_heuristic.point_labels
+        == warm_start.point_labels
+    )
+    assert selected.diagnostics["warmStartUsed"] is True
+    assert selected.diagnostics["solverStatus"] == "seed_only"
+    assert captured_solutions == [
+        (1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, 1.0, 0.0, 0.0)
+    ]
+
+
 def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
     width = 25
     height = 25
@@ -1110,6 +1210,10 @@ def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
     assert abs(actual_net - target_net) <= policy.score_tolerance
     assert diagnostics["solverStatus"] in {"optimal", "feasible", "seed_only", "error"}
     assert diagnostics["emptyPointCount"] == width * height
+    assert diagnostics["mipPreparationStatus"] in {"prepared", "deadline_expired"}
+    if diagnostics["mipPreparationStatus"] == "deadline_expired":
+        assert diagnostics["solverStatus"] == "seed_only"
+        assert "mipPreparationPhase" in diagnostics
     assert elapsed < 2.5
 
 

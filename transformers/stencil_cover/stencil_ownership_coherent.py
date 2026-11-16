@@ -12,10 +12,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Dict, List, Mapping, Tuple, cast
+from typing import Any, Dict, List, Literal, Mapping, Tuple, cast
 
 import highspy
 import numpy as np
+from numpy.typing import NDArray
 
 from .stencil_ownership import OwnershipEvidence, OwnershipRegions
 from .stencil_ownership_repair import ownership_energy
@@ -35,6 +36,220 @@ try:
     _HIGHS_PACKAGE_VERSION = version("highspy")
 except PackageNotFoundError:
     _HIGHS_PACKAGE_VERSION = str(getattr(highspy, "__version__", "unknown"))
+
+
+
+@dataclass(frozen=True)
+class _PreparedOwnershipMip:
+    """A complete, deadline-admitted MIP model; partial models are never exposed."""
+
+    variable_count: int
+    objective: NDArray[Any]
+    lower_bounds: NDArray[Any]
+    upper_bounds: NDArray[Any]
+    integer_columns: NDArray[Any]
+    initial_solution: NDArray[Any]
+    row_count: int
+    nonzero_count: int
+    row_starts: NDArray[Any]
+    column_indices: NDArray[Any]
+    coefficients: NDArray[Any]
+    row_lower: NDArray[Any]
+    row_upper: NDArray[Any]
+
+
+@dataclass(frozen=True)
+class _OwnershipMipPreparationExpired:
+    """Typed outcome when model preparation consumes the wall-clock budget."""
+
+    phase: Literal[
+        "variable_bounds",
+        "edge_costs",
+        "initial_solution",
+        "constraint_rows",
+        "sparse_conversion",
+    ]
+    completed_items: int
+
+
+def _prepare_ownership_mip(
+    *,
+    evidence: OwnershipEvidence,
+    empty_points: Tuple[int, ...],
+    eligible: Tuple[int, ...],
+    fixed_positive: set[int],
+    fixed_negative: set[int],
+    empty_set: set[int],
+    node_index: Dict[int, int],
+    edge_pairs: List[Tuple[int, int]],
+    initial_labels: Mapping[int, int],
+    stdev: Tuple[float, ...],
+    minimum_net: int,
+    maximum_net: int,
+    kappa: float,
+    beta: float,
+    deadline: float,
+) -> _PreparedOwnershipMip | _OwnershipMipPreparationExpired:
+    """Build a complete MIP only while the attempt's deadline remains live.
+
+    The feasible labeling is constructed by the caller first. This function
+    owns only optional optimizer preparation, so an expired preparation can
+    return a typed outcome and the caller can safely retain that feasible seed.
+    """
+    node_count = len(eligible)
+    edge_count = len(edge_pairs)
+    variable_count = 2 * node_count + 2 * edge_count
+
+    if time.perf_counter() >= deadline:
+        return _OwnershipMipPreparationExpired("variable_bounds", 0)
+
+    objective = np.zeros(variable_count, dtype=np.float64)
+    lower_bounds = np.zeros(variable_count, dtype=np.float64)
+    upper_bounds = np.ones(variable_count, dtype=np.float64)
+    integer_columns = np.arange(2 * node_count, dtype=np.int32)
+
+    for completed, (point, index) in enumerate(node_index.items()):
+        if completed % 32 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("variable_bounds", completed)
+        a_index = 2 * index
+        b_index = a_index + 1
+        if point in fixed_positive:
+            lower_bounds[a_index] = upper_bounds[a_index] = 1.0
+            lower_bounds[b_index] = upper_bounds[b_index] = 1.0
+        elif point in fixed_negative:
+            lower_bounds[a_index] = upper_bounds[a_index] = 0.0
+            lower_bounds[b_index] = upper_bounds[b_index] = 0.0
+        elif point in empty_set:
+            mean = evidence.ownership[point]
+            uncertainty = stdev[point]
+            cost_negative = 1.0 + 2.0 * mean + 2.0 * kappa * uncertainty
+            cost_positive = 1.0 - 2.0 * mean + 2.0 * kappa * uncertainty
+            # q=a+b-1 encodes -1=(0,0), 0=(1,0), +1=(1,1).
+            # Up to the label-independent cost(-1), these are the exact
+            # unary coefficients for the three requested labels.
+            objective[a_index] = -cost_negative
+            objective[b_index] = cost_positive
+        else:
+            raise RuntimeError(
+                "eligible ownership point has no board disposition"
+            )
+
+    for completed, edge_index in enumerate(range(edge_count)):
+        if completed % 32 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("edge_costs", completed)
+        first_aux = 2 * node_count + 2 * edge_index
+        objective[first_aux] = beta
+        objective[first_aux + 1] = beta
+
+    initial_solution = np.zeros(variable_count, dtype=np.float64)
+    for completed, (point, index) in enumerate(node_index.items()):
+        if completed % 32 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("initial_solution", completed)
+        label = initial_labels[point]
+        initial_solution[2 * index] = 1.0 if label >= 0 else 0.0
+        initial_solution[2 * index + 1] = 1.0 if label == 1 else 0.0
+    for completed, (first, second) in enumerate(edge_pairs):
+        if completed % 32 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("initial_solution", node_count + completed)
+        for bit in (0, 1):
+            auxiliary = 2 * node_count + 2 * completed + bit
+            first_bit = 2 * first + bit
+            second_bit = 2 * second + bit
+            initial_solution[auxiliary] = abs(
+                initial_solution[first_bit] - initial_solution[second_bit]
+            )
+
+    row_indices: List[int] = []
+    column_indices: List[int] = []
+    coefficients: List[float] = []
+    row_lower: List[float] = []
+    row_upper: List[float] = []
+    row = 0
+
+    def add_row(
+        entries: Tuple[Tuple[int, float], ...],
+        minimum: float,
+        maximum: float,
+    ) -> None:
+        nonlocal row
+        for column, value in entries:
+            row_indices.append(row)
+            column_indices.append(column)
+            coefficients.append(value)
+        row_lower.append(minimum)
+        row_upper.append(maximum)
+        row += 1
+
+    # Ordered label indicators: b <= a.
+    for index in range(node_count):
+        if index % 32 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("constraint_rows", row)
+        add_row(((2 * index + 1, 1.0), (2 * index, -1.0)), -np.inf, 0.0)
+
+    # |q_i-q_j| = |a_i-a_j| + |b_i-b_j| for ordered ternary labels.
+    for edge_index, (first, second) in enumerate(edge_pairs):
+        if edge_index % 16 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("constraint_rows", row)
+        for bit in (0, 1):
+            auxiliary = 2 * node_count + 2 * edge_index + bit
+            first_bit = 2 * first + bit
+            second_bit = 2 * second + bit
+            add_row(
+                ((auxiliary, 1.0), (first_bit, -1.0), (second_bit, 1.0)),
+                0.0,
+                np.inf,
+            )
+            add_row(
+                ((auxiliary, 1.0), (first_bit, 1.0), (second_bit, -1.0)),
+                0.0,
+                np.inf,
+            )
+
+    sum_entries: List[Tuple[int, float]] = []
+    for completed, point in enumerate(empty_points):
+        if completed % 32 == 0 and time.perf_counter() >= deadline:
+            return _OwnershipMipPreparationExpired("constraint_rows", row)
+        for bit in (0, 1):
+            sum_entries.append((2 * node_index[point] + bit, 1.0))
+    add_row(
+        tuple(sum_entries),
+        float(len(empty_points) + minimum_net),
+        float(len(empty_points) + maximum_net),
+    )
+
+    # Keep the sparse conversion inside the same deadline. A completed model
+    # is the only value that crosses this boundary.
+    if time.perf_counter() >= deadline:
+        return _OwnershipMipPreparationExpired("sparse_conversion", row)
+    row_counts = np.bincount(
+        np.asarray(row_indices, dtype=np.int32),
+        minlength=row,
+    )
+    row_starts = np.empty(row + 1, dtype=np.int32)
+    row_starts[0] = 0
+    np.cumsum(row_counts, out=row_starts[1:])
+    column_array = np.asarray(column_indices, dtype=np.int32)
+    coefficient_array = np.asarray(coefficients, dtype=np.float64)
+    row_lower_array = np.asarray(row_lower, dtype=np.float64)
+    row_upper_array = np.asarray(row_upper, dtype=np.float64)
+    if time.perf_counter() >= deadline:
+        return _OwnershipMipPreparationExpired("sparse_conversion", row)
+
+    return _PreparedOwnershipMip(
+        variable_count=variable_count,
+        objective=objective,
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        integer_columns=integer_columns,
+        initial_solution=initial_solution,
+        row_count=row,
+        nonzero_count=len(coefficients),
+        row_starts=row_starts,
+        column_indices=column_array,
+        coefficients=coefficient_array,
+        row_lower=row_lower_array,
+        row_upper=row_upper_array,
+    )
 
 
 def _ownership_solver_identity() -> SolverIdentity:
@@ -293,134 +508,13 @@ class CoherentOwnershipPolicy:
 
         node_count = len(eligible)
         edge_count = len(edge_pairs)
-        variable_count = 2 * node_count + 2 * edge_count
-        objective = np.zeros(variable_count, dtype=np.float64)
-        lower_bounds = np.zeros(variable_count, dtype=np.float64)
-        upper_bounds = np.ones(variable_count, dtype=np.float64)
-        integer_columns = np.arange(2 * node_count, dtype=np.int32)
-
-        for point, index in node_index.items():
-            a_index = 2 * index
-            b_index = a_index + 1
-            if point in fixed_positive:
-                lower_bounds[a_index] = upper_bounds[a_index] = 1.0
-                lower_bounds[b_index] = upper_bounds[b_index] = 1.0
-            elif point in fixed_negative:
-                lower_bounds[a_index] = upper_bounds[a_index] = 0.0
-                lower_bounds[b_index] = upper_bounds[b_index] = 0.0
-            elif point in empty_set:
-                mean = evidence.ownership[point]
-                uncertainty = stdev[point]
-                cost_negative = (
-                    1.0 + 2.0 * mean + 2.0 * self.kappa * uncertainty
-                )
-                cost_positive = (
-                    1.0 - 2.0 * mean + 2.0 * self.kappa * uncertainty
-                )
-                # q=a+b-1 encodes -1=(0,0), 0=(1,0), +1=(1,1).
-                # Up to the label-independent cost(-1), these are the exact
-                # unary coefficients for the three requested labels.
-                objective[a_index] = -cost_negative
-                objective[b_index] = cost_positive
-            else:
-                raise RuntimeError(
-                    "eligible ownership point has no board disposition"
-                )
-
-        for edge_index in range(edge_count):
-            first_aux = 2 * node_count + 2 * edge_index
-            objective[first_aux] = self.beta
-            objective[first_aux + 1] = self.beta
-
-        initial_solution = np.zeros(variable_count, dtype=np.float64)
-        for point, index in node_index.items():
-            label = labels[point]
-            initial_solution[2 * index] = 1.0 if label >= 0 else 0.0
-            initial_solution[2 * index + 1] = 1.0 if label == 1 else 0.0
-        for edge_index, (first, second) in enumerate(edge_pairs):
-            for bit in (0, 1):
-                auxiliary = 2 * node_count + 2 * edge_index + bit
-                first_bit = 2 * first + bit
-                second_bit = 2 * second + bit
-                initial_solution[auxiliary] = abs(
-                    initial_solution[first_bit] - initial_solution[second_bit]
-                )
-
-        row_indices: List[int] = []
-        column_indices: List[int] = []
-        coefficients: List[float] = []
-        row_lower: List[float] = []
-        row_upper: List[float] = []
-        row = 0
-
-        def add_row(
-            entries: Tuple[Tuple[int, float], ...],
-            minimum: float,
-            maximum: float,
-        ) -> None:
-            nonlocal row
-            for column, value in entries:
-                row_indices.append(row)
-                column_indices.append(column)
-                coefficients.append(value)
-            row_lower.append(minimum)
-            row_upper.append(maximum)
-            row += 1
-
-        # Ordered label indicators: b <= a.
-        for index in range(node_count):
-            add_row(((2 * index + 1, 1.0), (2 * index, -1.0)), -np.inf, 0.0)
-
-        # |q_i-q_j| = |a_i-a_j| + |b_i-b_j| for ordered ternary labels.
-        for edge_index, (first, second) in enumerate(edge_pairs):
-            for bit in (0, 1):
-                auxiliary = 2 * node_count + 2 * edge_index + bit
-                first_bit = 2 * first + bit
-                second_bit = 2 * second + bit
-                add_row(
-                    ((auxiliary, 1.0), (first_bit, -1.0), (second_bit, 1.0)),
-                    0.0,
-                    np.inf,
-                )
-                add_row(
-                    ((auxiliary, 1.0), (first_bit, 1.0), (second_bit, -1.0)),
-                    0.0,
-                    np.inf,
-                )
-
-        sum_entries = tuple(
-            (2 * node_index[point] + bit, 1.0)
-            for point in empty_points
-            for bit in (0, 1)
-        )
-        add_row(
-            sum_entries,
-            float(len(empty_points) + minimum_net),
-            float(len(empty_points) + maximum_net),
-        )
-
-        # Convert the row-oriented accumulator directly into the compact CSR
-        # representation expected by Highs.addRows; no second sparse-matrix
-        # conversion or per-row Python/C++ call is required.
-        row_counts = np.bincount(
-            np.asarray(row_indices, dtype=np.int32),
-            minlength=row,
-        )
-        row_starts = np.empty(row + 1, dtype=np.int32)
-        row_starts[0] = 0
-        np.cumsum(row_counts, out=row_starts[1:])
-        column_array = np.asarray(column_indices, dtype=np.int32)
-        coefficient_array = np.asarray(coefficients, dtype=np.float64)
-        row_lower_array = np.asarray(row_lower, dtype=np.float64)
-        row_upper_array = np.asarray(row_upper, dtype=np.float64)
-
-        # Preserve a feasible seed as its own evidence item. A prior incumbent
-        # may be reused only for the exact same eligible graph and aggregate
-        # interval; it is not part of model identity or persistent solver state.
-        initial_heuristic = dict(labels)
         energy_edges = tuple(
             (eligible[first], eligible[second]) for first, second in edge_pairs
         )
+
+        # Preserve and validate the feasible seed before doing optional MIP
+        # preparation. The warm start is the actual vector sent to HiGHS.
+        initial_heuristic = dict(labels)
         initial_objective = ownership_energy(
             initial_heuristic, evidence, empty_points, energy_edges,
             self.kappa, self.beta,
@@ -449,6 +543,28 @@ class CoherentOwnershipPolicy:
                 initial_objective = warm_start_objective
                 warm_start_used = True
 
+        mip_preparation = _prepare_ownership_mip(
+            evidence=evidence,
+            empty_points=empty_points,
+            eligible=eligible,
+            fixed_positive=fixed_positive,
+            fixed_negative=fixed_negative,
+            empty_set=empty_set,
+            node_index=node_index,
+            edge_pairs=edge_pairs,
+            initial_labels=initial_heuristic,
+            stdev=stdev,
+            minimum_net=minimum_net,
+            maximum_net=maximum_net,
+            kappa=self.kappa,
+            beta=self.beta,
+            deadline=deadline,
+        )
+        mip_preparation_status = (
+            "prepared"
+            if isinstance(mip_preparation, _PreparedOwnershipMip)
+            else "deadline_expired"
+        )
         optimizer_labels: Dict[int, int] | None = None
         optimizer_objective: float | None = None
         lower_bound: float | None = None
@@ -457,7 +573,11 @@ class CoherentOwnershipPolicy:
         optimizer_error: str | None = None
         solver_status = OwnershipSolverStatus.SEED_ONLY
         remaining_seconds = deadline - time.perf_counter()
-        if remaining_seconds > 0.005:
+        if (
+            isinstance(mip_preparation, _PreparedOwnershipMip)
+            and remaining_seconds > 0.005
+        ):
+            variable_count = mip_preparation.variable_count
             try:
                 highs_constructor = cast(Any, highspy.Highs)
                 highs = highs_constructor()
@@ -471,32 +591,32 @@ class CoherentOwnershipPolicy:
                             f"HiGHS rejected its {option_name} solver option"
                         )
 
-                highs.addVars(variable_count, lower_bounds, upper_bounds)
+                highs.addVars(variable_count, mip_preparation.lower_bounds, mip_preparation.upper_bounds)
                 all_columns = np.arange(variable_count, dtype=np.int32)
-                highs.changeColsCost(variable_count, all_columns, objective)
+                highs.changeColsCost(variable_count, all_columns, mip_preparation.objective)
                 integrality = np.full(
                     2 * node_count,
                     int(highspy.HighsVarType.kInteger),
                     dtype=np.uint8,
                 )
                 highs.changeColsIntegrality(
-                    len(integer_columns),
-                    integer_columns,
+                    len(mip_preparation.integer_columns),
+                    mip_preparation.integer_columns,
                     integrality,
                 )
                 highs.addRows(
-                    row,
-                    row_lower_array,
-                    row_upper_array,
-                    len(coefficients),
-                    row_starts,
-                    column_array,
-                    coefficient_array,
+                    mip_preparation.row_count,
+                    mip_preparation.row_lower,
+                    mip_preparation.row_upper,
+                    mip_preparation.nonzero_count,
+                    mip_preparation.row_starts,
+                    mip_preparation.column_indices,
+                    mip_preparation.coefficients,
                 )
                 highs.setSolution(
                     variable_count,
                     all_columns,
-                    initial_solution,
+                    mip_preparation.initial_solution,
                 )
 
                 # Model construction and the feasible start count against the
@@ -674,7 +794,11 @@ class CoherentOwnershipPolicy:
             "solverIdentityFingerprint": solver_identity.fingerprint,
             "optimizerIncumbentAvailable": optimizer_labels is not None,
             "warmStartUsed": warm_start_used,
+            "mipPreparationStatus": mip_preparation_status,
         }
+        if isinstance(mip_preparation, _OwnershipMipPreparationExpired):
+            diagnostics["mipPreparationPhase"] = mip_preparation.phase
+            diagnostics["mipPreparationCompletedItems"] = mip_preparation.completed_items
         if warm_start_objective is not None:
             diagnostics["warmStartObjective"] = float(warm_start_objective)
         if optimizer_objective is not None:
