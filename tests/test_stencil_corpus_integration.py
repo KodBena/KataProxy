@@ -227,8 +227,15 @@ class _SynchronousRedisStreamPort:
         count: int | None = None,
         block: int | None = None,
     ) -> object:
+        redis_streams: dict[
+            bytes | str | memoryview[int],
+            int | bytes | str | memoryview[int],
+        ] = {
+            stream_name: stream_id
+            for stream_name, stream_id in streams.items()
+        }
         response: object = self._client.xreadgroup(
-            groupname, consumername, streams, count=count, block=block,
+            groupname, consumername, redis_streams, count=count, block=block,
         )
         return _require_synchronous_redis_result(response, "XREADGROUP")
 
