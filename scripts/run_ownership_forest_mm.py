@@ -48,10 +48,11 @@ from transformers.stencil_cover.stencil_ownership_forest import (
 )
 from transformers.stencil_cover.stencil_ownership_graphcut import ownership_graph
 from transformers.stencil_cover.stencil_ownership_repair import ownership_energy
+from transformers.stencil_cover.stencil_ownership_expansion import ordered_label_expansion
 
 
-RESULT_FORMAT = "kataproxy.ownership-forest-mm-results.v1"
-ALGORITHM_VERSION = "cardinality-forest-mm-v1"
+RESULT_FORMAT = "kataproxy.ownership-approximation-comparison-results.v1"
+ALGORITHM_VERSION = "cardinality-forest-mm-and-ordered-expansion-v1"
 DEFAULT_SPLIT_SEED = "ownership-forest-mm-holdout-v1"
 DEFAULT_MAX_PASSES = 8
 
@@ -277,11 +278,13 @@ def build_results(
         "marginal_initializer": [],
         "forest_dp": [],
         "forest_mm_total": [],
+        "ordered_expansion_total": [],
     }
     method_gaps: dict[str, list[float]] = {
         "marginal_initializer": [],
         "forest_dp": [],
         "forest_mm": [],
+        "ordered_expansion": [],
     }
     reference_kind_counts: Counter[str] = Counter()
     board_group_signatures: set[str] = set()
@@ -449,18 +452,54 @@ def build_results(
         if mm_energy > marginal_energy + 1e-7:
             raise ArithmeticError("MM result is worse than its feasible initializer")
 
+        if progress is not None:
+            progress(f"[{problem_number}/{len(prepared)}] ordered-label expansion")
+        expansion_start = time.perf_counter_ns()
+        expansion_result = ordered_label_expansion(
+            problem,
+            evidence,
+            kappa=config["kappa"],
+            maximum_passes=maximum_passes,
+        )
+        expansion_ms = (time.perf_counter_ns() - expansion_start) / 1_000_000.0
+        expansion_empty = dict(expansion_result.labeling)
+        expansion_full = _archive_labeling(expansion_empty, representative)
+        expansion_energy = ownership_energy(
+            expansion_full,
+            evidence,
+            representative.empty_points,
+            all_edges,
+            config["kappa"],
+            config["beta"],
+        )
+        if abs(
+            expansion_energy - full_energy_from_reduction(problem, expansion_empty)
+        ) > 1e-6:
+            raise ArithmeticError("ordered expansion failed full-energy cross-check")
+        if expansion_energy > expansion_result.initial_energy + 1e-7:
+            raise ArithmeticError("ordered expansion increased its feasible initializer")
+
         for name, elapsed in (
             ("marginal_initializer", marginal_ms),
             ("forest_dp", forest_ms),
             ("forest_mm_total", marginal_ms + mm_ms),
+            ("ordered_expansion_total", expansion_ms),
         ):
             method_times[name].append(elapsed)
         method_results = {
             "marginal_initializer": (marginal_full, marginal_energy),
             "forest_dp": (forest_full, forest_energy),
             "forest_mm": (mm_full, mm_energy),
+            "ordered_expansion": (expansion_full, expansion_energy),
         }
         methods: dict[str, Any] = {}
+        method_latency_ms = {
+            "marginal_initializer": marginal_ms,
+            "forest_dp": forest_ms,
+            "forest_mm": marginal_ms + mm_ms,
+            "ordered_expansion": expansion_ms,
+        }
+        latency_gap_comparison_points: list[dict[str, Any]] = []
         for name, (labels, energy) in method_results.items():
             metrics = _method_metrics(
                 labels,
@@ -480,9 +519,115 @@ def build_results(
             metrics["labeling_base64"] = _encode_labeling(labels)
             methods[name] = metrics
             if reference_is_proven:
+                gap_value = metrics.get("additive_optimality_gap")
+                gap_kind = "exact_additive_optimality_gap"
+            elif lower_bound is not None:
+                gap_value = metrics.get("additive_gap_upper_bound")
+                gap_kind = "additive_gap_upper_bound"
+            else:
+                gap_value = None
+                gap_kind = "unavailable_without_proven_optimum_or_lower_bound"
+            latency_gap_comparison_points.append({
+                "method": name,
+                "latency_ms": float(method_latency_ms[name]),
+                "energy": float(energy),
+                "gap": (
+                    float(gap_value)
+                    if isinstance(gap_value, (int, float)) else None
+                ),
+                "gap_kind": gap_kind,
+            })
+            if reference_is_proven:
                 gap = metrics.get("additive_optimality_gap")
                 if isinstance(gap, (int, float)):
                     method_gaps[name].append(float(gap))
+
+        expansion_trace: list[dict[str, Any]] = []
+        expansion_frontier: list[dict[str, Any]] = []
+        best_gap_so_far = math.inf
+        for checkpoint in expansion_result.checkpoints:
+            checkpoint_empty = dict(checkpoint.labeling)
+            checkpoint_full = _archive_labeling(checkpoint_empty, representative)
+            checkpoint_energy = ownership_energy(
+                checkpoint_full,
+                evidence,
+                representative.empty_points,
+                all_edges,
+                config["kappa"],
+                config["beta"],
+            )
+            if abs(checkpoint_energy - checkpoint.energy) > 1e-6:
+                raise ArithmeticError("ordered expansion checkpoint energy drifted")
+            checkpoint_metrics = _method_metrics(
+                checkpoint_full,
+                checkpoint_energy,
+                reference_labels,
+                reference_energy,
+                reference_is_proven,
+                lower_bound,
+                representative.empty_points,
+                all_edges,
+                problem.expected_sum,
+                problem.aggregate_lower,
+                problem.aggregate_upper,
+                problem.beta,
+            )
+            gap_value: float | None = None
+            if reference_is_proven:
+                raw_gap = checkpoint_metrics.get("additive_optimality_gap")
+                if isinstance(raw_gap, (int, float)):
+                    gap_value = float(raw_gap)
+                gap_kind = "exact_additive_optimality_gap"
+            elif lower_bound is not None:
+                raw_gap = checkpoint_metrics.get("additive_gap_upper_bound")
+                if isinstance(raw_gap, (int, float)):
+                    gap_value = float(raw_gap)
+                gap_kind = "additive_gap_upper_bound"
+            else:
+                gap_kind = "unavailable_without_proven_optimum_or_lower_bound"
+            trace_point: dict[str, Any] = {
+                "pass_number": checkpoint.pass_number,
+                "latency_ms": checkpoint.elapsed_wall_ns / 1_000_000.0,
+                "energy": float(checkpoint_energy),
+                "gap": gap_value,
+                "gap_kind": gap_kind,
+                "cut_calls": checkpoint.cut_calls,
+                "accepted_moves": checkpoint.accepted_moves,
+                "repair_attempts": checkpoint.repair_attempts,
+                "repair_moves": checkpoint.repair_moves,
+                "repair_delta_sum_over_attempts": checkpoint.repair_delta_sum_over_attempts,
+                "labeling_codec": "point-u32le-label-i8-v1",
+                "labeling_base64": _encode_labeling(checkpoint_full),
+            }
+            expansion_trace.append(trace_point)
+            latency_gap_comparison_points.append({
+                "method": f"ordered_expansion_pass_{checkpoint.pass_number}",
+                "latency_ms": float(trace_point["latency_ms"]),
+                "energy": float(checkpoint_energy),
+                "gap": gap_value,
+                "gap_kind": gap_kind,
+            })
+            if gap_value is not None and gap_value < best_gap_so_far - 1e-12:
+                expansion_frontier.append(trace_point)
+                best_gap_so_far = gap_value
+
+        latency_gap_pareto_frontier: list[dict[str, Any]] = []
+        best_gap_seen = math.inf
+        for point in sorted(
+            (
+                item for item in latency_gap_comparison_points
+                if isinstance(item["gap"], (int, float))
+            ),
+            key=lambda item: (
+                float(item["latency_ms"]),
+                float(item["gap"]),
+                str(item["method"]),
+            ),
+        ):
+            point_gap = float(point["gap"])
+            if point_gap < best_gap_seen - 1e-12:
+                latency_gap_pareto_frontier.append(point)
+                best_gap_seen = point_gap
 
         reference_kind = (
             "proven_optimum" if reference_is_proven
@@ -525,6 +670,7 @@ def build_results(
                 "forest_dp": forest_ms,
                 "forest_mm_passes": mm_ms,
                 "forest_mm_total_including_initializer": marginal_ms + mm_ms,
+                "ordered_expansion_total": expansion_ms,
             },
             "forest_dp": {
                 "surrogate_energy_reduced": forest_result.surrogate_energy,
@@ -539,6 +685,20 @@ def build_results(
                 "additive_optimality_gap_upper_bound": float(
                     forest_omitted_edge_tv
                 ),
+            },
+            "ordered_expansion": {
+                "initial_energy": expansion_result.initial_energy,
+                "final_energy": expansion_result.final_energy,
+                "pass_count": expansion_result.passes_completed,
+                "cut_calls": expansion_result.cut_calls,
+                "accepted_moves": expansion_result.accepted_moves,
+                "repair_attempts": expansion_result.repair_attempts,
+                "repair_moves": expansion_result.repair_moves,
+                "repair_delta_sum_over_attempts": expansion_result.repair_delta_sum_over_attempts,
+                "requested_capacity_scale": expansion_result.requested_capacity_scale,
+                "latency_ms": expansion_ms,
+                "latency_gap_trace": expansion_trace,
+                "latency_gap_pareto_frontier": expansion_frontier,
             },
             "forest_mm": {
                 "initial_energy": mm_result.initial_energy,
@@ -558,6 +718,8 @@ def build_results(
                 "omitted_edge_tv_energy": mm_result.omitted_edge_tv_energy,
             },
             "methods": methods,
+            "latency_gap_comparison_points": latency_gap_comparison_points,
+            "latency_gap_pareto_frontier": latency_gap_pareto_frontier,
         })
         if progress is not None:
             progress(
@@ -578,6 +740,12 @@ def build_results(
             "grouping": "board dimensions + coordinate convention + exact board-state bytes",
         },
         "maximum_mm_passes": maximum_passes,
+        "maximum_ordered_expansion_passes": maximum_passes,
+        "latency_gap_definition": {
+            "latency": "wall time in milliseconds for the named computation; forest MM and ordered expansion include their initializer, while forest DP is reported separately",
+            "gap": "exact additive gap only for proven optima; otherwise an additive upper bound only when a reference lower bound exists",
+            "frontier_scope": "per evidence/objective instance; do not pool different instances into one frontier",
+        },
         "source_observation_count": len(rows),
         "unique_coherent_problem_count": len(grouped),
         "problems_missing_feasible_reference": missing_reference_count,
@@ -599,7 +767,7 @@ def build_results(
 
 
 def _default_output_path(database: Path) -> Path:
-    return database.with_name(database.name + ".forest-mm.results.json")
+    return database.with_name(database.name + ".ownership-approximation-comparison.results.json")
 
 
 def _parse_args() -> argparse.Namespace:
