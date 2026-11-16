@@ -1,0 +1,128 @@
+% git rev-parse --short HEAD
+3c4aa60
+=============================================================================================== test session starts ===============================================================================================
+platform linux -- Python 3.13.13, pytest-9.0.3, pluggy-1.6.0
+rootdir: /home/bork/w/proxy-fable-bckp
+configfile: pyproject.toml
+plugins: asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 787 items / 1 skipped
+
+goboard_transposition/test_partition_pv.py .............                                                                                                                                                    [  1%]
+tests/test_adaptive_cache_matrix.py ....                                                                                                                                                                    [  2%]
+tests/test_adaptive_selector_pluggability.py ...............................................                                                                                                                [  8%]
+tests/test_adaptive_type_branding.py ........                                                                                                                                                               [  9%]
+tests/test_allocation_algorithms.py .......................................                                                                                                                                 [ 14%]
+tests/test_allocation_refusal.py ............                                                                                                                                                               [ 15%]
+tests/test_analysis_enricher_extra_status.py .................                                                                                                                                              [ 17%]
+tests/test_cache_verbs.py .............                                                                                                                                                                     [ 19%]
+tests/test_capability_negotiation.py ...........................................                                                                                                                            [ 24%]
+tests/test_delta_analysis_color_assignment.py .....                                                                                                                                                         [ 25%]
+tests/test_hub_cache_disabled.py .......................                                                                                                                                                    [ 28%]
+tests/test_hub_cache_key_engine_facing.py .........                                                                                                                                                         [ 29%]
+tests/test_identity_types.py ........                                                                                                                                                                       [ 30%]
+tests/test_import_contract.py .                                                                                                                                                                             [ 30%]
+tests/test_multi_round_adaptation.py ...................................................                                                                                                                    [ 37%]
+tests/test_orchestration_middleware.py .............................                                                                                                                                        [ 40%]
+tests/test_parse_refusal.py ..................                                                                                                                                                              [ 43%]
+tests/test_phase3_dispatch.py .....................                                                                                                                                                         [ 45%]
+tests/test_protocol_parser.py ............................................................                                                                                                                  [ 53%]
+tests/test_proxy_logging.py .........................................................                                                                                                                       [ 60%]
+tests/test_relay_coalescing.py ..                                                                                                                                                                           [ 60%]
+tests/test_relay_load_distribution.py ...                                                                                                                                                                   [ 61%]
+tests/test_relay_router.py ..........                                                                                                                                                                       [ 62%]
+tests/test_role_coverage.py ............                                                                                                                                                                    [ 64%]
+tests/test_roster_admission.py ...............                                                                                                                                                              [ 66%]
+tests/test_selector_router.py ..................................................                                                                                                                            [ 72%]
+tests/test_stencil_cache_candidate.py .                                                                                                                                                                     [ 72%]
+tests/test_stencil_corpus_events.py ..............                                                                                                                                                          [ 74%]
+tests/test_stencil_corpus_materializer.py ..........                                                                                                                                                        [ 75%]
+tests/test_stencil_corpus_publisher.py ..............                                                                                                                                                       [ 77%]
+tests/test_stencil_corpus_store.py .........                                                                                                                                                                [ 78%]
+tests/test_stencil_corpus_supervisor.py .                                                                                                                                                                   [ 78%]
+tests/test_stencil_cover_canonical_contract.py .......                                                                                                                                                      [ 79%]
+tests/test_stencil_cover_enricher.py .......................F.........F............................                                                                                                         [ 87%]
+tests/test_stencil_ownership_analysis.py .......                                                                                                                                                            [ 88%]
+tests/test_stencil_ownership_bulk.py .....                                                                                                                                                                  [ 88%]
+tests/test_stencil_ownership_expansion.py .....                                                                                                                                                             [ 89%]
+tests/test_stencil_ownership_forest.py ..........                                                                                                                                                           [ 90%]
+tests/test_stencil_ownership_store.py .........                                                                                                                                                             [ 91%]
+tests/test_stencil_solver_backend.py ..............                                                                                                                                                         [ 93%]
+tests/test_topology_runner.py ......................                                                                                                                                                        [ 96%]
+tests/test_visit_scaling.py ......................                                                                                                                                                          [ 99%]
+tests/test_warning_completion.py .....                                                                                                                                                                      [100%]
+
+==================================================================================================== FAILURES =====================================================================================================
+__________________________________________________________________________ test_legacy_threshold_policy_does_not_require_ownership_stdev __________________________________________________________________________
+
+    def test_legacy_threshold_policy_does_not_require_ownership_stdev() -> None:
+        transformer = enricher.stencil_cover_enricher(
+            _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),
+        )
+        query = _query({"stencil_cover": {"truncation_threshold": 0.5}})
+        transformer.on_query(ClientId("q3"), query)
+        assert query.opaque["includeOwnership"] is True
+>       assert "includeOwnershipStdev" not in query.opaque
+E       AssertionError: assert 'includeOwnershipStdev' not in {'boardXSize': 2, 'boardYSize': 2, 'capabilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, ...}
+E        +  where {'boardXSize': 2, 'boardYSize': 2, 'capabilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, ...} = KataGoQuery(action=<KataGoAction.ANALYZE: 1>, terminate_id=None, analyze_turns=None, opaque={'boardXSize': 2, 'boardYS...abilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, 'includeOwnershipStdev': True}).opaque
+
+tests/test_stencil_cover_enricher.py:845: AssertionError
+_________________________________________________________________________ test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board _________________________________________________________________________
+
+    def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
+        width = 25
+        height = 25
+        ownership_map = [0.15] * (width * height)
+        stdev_map = [0.05] * (width * height)
+        evidence = ownership.make_ownership_evidence(
+            {
+                "ownership": ownership_map,
+                "ownershipStdev": stdev_map,
+            },
+            [None] * (width * height),
+            width,
+            height,
+            {},
+            requires_ownership_stdev=True,
+        )
+        policy = CoherentOwnershipPolicy(
+            kappa=1.0, beta=0.25, score_tolerance=0.5, time_limit_ms=250,
+        )
+
+        started = time.perf_counter()
+        selected = policy.classify(evidence)
+        elapsed = time.perf_counter() - started
+        diagnostics = selected.diagnostics
+
+        assert selected.solver_evidence is not None
+        assert selected.solver_evidence.initial_heuristic is not None
+        assert selected.solver_evidence.initial_heuristic.point_labels
+        assert diagnostics["optimizerIncumbentAvailable"] is (
+            selected.solver_evidence.optimizer_incumbent is not None
+        )
+        actual_net = cast(float, diagnostics["actualNetOwnership"])
+        target_net = cast(float, diagnostics["targetNetOwnership"])
+        assert abs(actual_net - target_net) <= policy.score_tolerance
+        assert diagnostics["solverStatus"] in {"optimal", "feasible", "seed_only", "error"}
+        assert diagnostics["emptyPointCount"] == width * height
+>       assert elapsed < 2.5
+E       assert 4.36564251803793 < 2.5
+
+tests/test_stencil_cover_enricher.py:1110: AssertionError
+============================================================================================= short test summary info =============================================================================================
+FAILED tests/test_stencil_cover_enricher.py::test_legacy_threshold_policy_does_not_require_ownership_stdev - AssertionError: assert 'includeOwnershipStdev' not in {'boardXSize': 2, 'boardYSize': 2, 'capabilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, ...}
+FAILED tests/test_stencil_cover_enricher.py::test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board - assert 4.36564251803793 < 2.5
+==================================================================================== 2 failed, 785 passed, 1 skipped in 13.84s ====================================================================================
+scripts/run_stencil_corpus_integration.py:236: error: Item "Awaitable[Any]" of "Awaitable[Any] | Any" has no attribute "get"  [union-attr]
+tests/test_stencil_corpus_integration.py:713: error: Item "Awaitable[Any]" of "Awaitable[Any] | Any" has no attribute "__iter__" (not iterable)  [union-attr]
+tests/test_stencil_corpus_integration.py:739: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+tests/test_stencil_corpus_integration.py:814: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+tests/test_stencil_corpus_integration.py:877: error: Argument 1 to "len" has incompatible type "Awaitable[Any] | Any"; expected "Sized"  [arg-type]
+tests/test_stencil_corpus_integration.py:879: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+tests/test_stencil_corpus_integration.py:915: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+scripts/run_ownership_forest_mm.py:592: error: Name "checkpoint_gap_value" is not defined  [name-defined]
+scripts/run_ownership_forest_mm.py:607: error: Name "checkpoint_gap_value" is not defined  [name-defined]
+scripts/run_ownership_forest_mm.py:610: error: Name "checkpoint_gap_value" is not defined  [name-defined]
+scripts/run_ownership_forest_mm.py:612: error: Name "checkpoint_gap_value" is not defined  [name-defined]
+Found 11 errors in 3 files (checked 138 source files)
+

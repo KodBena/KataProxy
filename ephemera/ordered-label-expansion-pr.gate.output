@@ -1,0 +1,397 @@
+==================================================================================================== FAILURES =====================================================================================================
+__________________________________________________________________________ test_legacy_threshold_policy_does_not_require_ownership_stdev __________________________________________________________________________
+
+    def test_legacy_threshold_policy_does_not_require_ownership_stdev() -> None:
+        transformer = enricher.stencil_cover_enricher(
+            _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),
+        )
+        query = _query({"stencil_cover": {"truncation_threshold": 0.5}})
+        transformer.on_query(ClientId("q3"), query)
+        assert query.opaque["includeOwnership"] is True
+>       assert "includeOwnershipStdev" not in query.opaque
+E       AssertionError: assert 'includeOwnershipStdev' not in {'boardXSize': 2, 'boardYSize': 2, 'capabilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, ...}
+E        +  where {'boardXSize': 2, 'boardYSize': 2, 'capabilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, ...} = KataGoQuery(action=<KataGoAction.ANALYZE: 1>, terminate_id=None, analyze_turns=None, opaque={'boardXSize': 2, 'boardYS...abilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, 'includeOwnershipStdev': True}).opaque
+
+tests/test_stencil_cover_enricher.py:845: AssertionError
+_________________________________________________________________________ test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board _________________________________________________________________________
+
+    def test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board() -> None:
+        width = 25
+        height = 25
+        ownership_map = [0.15] * (width * height)
+        stdev_map = [0.05] * (width * height)
+        evidence = ownership.make_ownership_evidence(
+            {
+                "ownership": ownership_map,
+                "ownershipStdev": stdev_map,
+            },
+            [None] * (width * height),
+            width,
+            height,
+            {},
+            requires_ownership_stdev=True,
+        )
+        policy = CoherentOwnershipPolicy(
+            kappa=1.0, beta=0.25, score_tolerance=0.5, time_limit_ms=250,
+        )
+
+        started = time.perf_counter()
+        selected = policy.classify(evidence)
+        elapsed = time.perf_counter() - started
+        diagnostics = selected.diagnostics
+
+        assert selected.solver_evidence is not None
+        assert selected.solver_evidence.initial_heuristic is not None
+        assert selected.solver_evidence.initial_heuristic.point_labels
+        assert diagnostics["optimizerIncumbentAvailable"] is (
+            selected.solver_evidence.optimizer_incumbent is not None
+        )
+        actual_net = cast(float, diagnostics["actualNetOwnership"])
+        target_net = cast(float, diagnostics["targetNetOwnership"])
+        assert abs(actual_net - target_net) <= policy.score_tolerance
+        assert diagnostics["solverStatus"] in {"optimal", "feasible", "seed_only", "error"}
+        assert diagnostics["emptyPointCount"] == width * height
+>       assert elapsed < 2.5
+E       assert 4.382841957965866 < 2.5
+
+tests/test_stencil_cover_enricher.py:1110: AssertionError
+______________________________________________________________________ test_ordered_expansion_is_feasible_monotone_and_energy_cross_checked _______________________________________________________________________
+
+    def test_ordered_expansion_is_feasible_monotone_and_energy_cross_checked() -> None:
+        evidence = _evidence(
+            (0.8, -0.75, 0.65, -0.7, 0.15, -0.1),
+            deviations=(0.03, 0.02, 0.04, 0.05, 0.03, 0.02),
+            width=3,
+            height=2,
+        )
+        problem = build_reduced_problem(evidence, 1.0, 0.25, 0.5)
+>       result = ordered_label_expansion(
+            problem, evidence, kappa=1.0, maximum_passes=6,
+        )
+
+tests/test_stencil_ownership_expansion.py:106:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+problem = ReducedOwnershipProblem(points=(0, 1, 2, 3, 4, 5), unary_absolute=(1.06, 1.04, 1.08, 1.1, 1.06, 1.04), unary_linear=(-...egate_lower=0, aggregate_upper=0, expected_sum=0.0500000000000001, fixed_edge_offset=0.0, beta=0.25, width=3, height=2)
+evidence = OwnershipEvidence(ownership=(0.8, -0.75, 0.65, -0.7, 0.15, -0.1), ownership_stdev=(0.03, 0.02, 0.04, 0.05, 0.03, 0.02)...one, None, None), width=3, height=2, empty_points=(0, 1, 2, 3, 4, 5), dead_black=(), dead_white=(), policy_metadata={})
+
+    def ordered_label_expansion(
+        problem: ReducedOwnershipProblem,
+        evidence: OwnershipEvidence,
+        *,
+        kappa: float,
+        maximum_passes: int = 8,
+        initial_labeling: Mapping[int, int] | None = None,
+        capacity_scale: int = _CAPACITY_SCALE,
+    ) -> OrderedExpansionResult:
+        """Run deterministic ternary alpha-expansion with interval repair.
+
+        Each pass considers alpha in (-1, 0, +1) order. An infeasible expansion
+        proposal is projected to the nearest aggregate-interval endpoint using the
+        existing deterministic connected-growth repair. A proposal is accepted
+        only when it strictly lowers the original full unary-plus-TV energy.
+        """
+        if (
+            isinstance(maximum_passes, bool)
+            or not isinstance(maximum_passes, int)
+            or maximum_passes < 0
+        ):
+            raise ValueError("maximum_passes must be a non-negative integer")
+        if (
+            isinstance(capacity_scale, bool)
+            or not isinstance(capacity_scale, int)
+            or capacity_scale <= 0
+        ):
+            raise ValueError("capacity_scale must be a positive integer")
+        if (
+            isinstance(kappa, bool)
+            or not isinstance(kappa, (int, float))
+            or not math.isfinite(float(kappa))
+            or kappa < 0
+        ):
+            raise ValueError("kappa must be finite and non-negative")
+        if evidence.ownership_stdev is None:
+            raise ValueError("ordered expansion requires ownershipStdev")
+        if tuple(sorted(evidence.empty_points)) != problem.points:
+            raise ValueError("reduced problem points do not match evidence empty points")
+
+        started_ns = time.perf_counter_ns()
+        initial = (
+            budget_exact_marginal_labeling(problem)
+            if initial_labeling is None
+            else dict(initial_labeling)
+        )
+        if tuple(sorted(initial)) != problem.points:
+            raise ValueError("initial labeling must cover exactly the problem points")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value not in _LABELS
+            for value in initial.values()
+        ):
+            raise ValueError("initial ownership labels must be integer -1, 0, or +1")
+        initial_sum = sum(initial.values())
+        if not problem.aggregate_lower <= initial_sum <= problem.aggregate_upper:
+            raise ValueError("initial labeling violates the aggregate interval")
+
+        empty_points = tuple(evidence.empty_points)
+        fixed_positive = set(evidence.dead_black)
+        fixed_negative = set(evidence.dead_white)
+        if fixed_positive & fixed_negative:
+            raise ValueError("fixed dead-Black and dead-White points overlap")
+        fixed_labels = {
+            **{point: 1 for point in fixed_positive},
+            **{point: -1 for point in fixed_negative},
+        }
+        eligible = tuple(sorted(set(empty_points) | set(fixed_labels)))
+        neighbours, all_edges = ownership_graph(
+            eligible, evidence.width, evidence.height,
+        )
+        component_for = component_ids(eligible, neighbours)
+
+        current = dict(initial)
+        current_energy = full_energy_from_reduction(problem, current)
+        cross_checked_energy = ownership_energy(
+>           current_full,
+            ^^^^^^^^^^^^
+            evidence,
+            empty_points,
+            all_edges,
+            float(kappa),
+            problem.beta,
+        )
+E       NameError: name 'current_full' is not defined
+
+transformers/stencil_cover/stencil_ownership_expansion.py:276: NameError
+_________________________________________________________________________ test_ordered_expansion_uses_aggregate_repair_and_keeps_interval _________________________________________________________________________
+
+    def test_ordered_expansion_uses_aggregate_repair_and_keeps_interval() -> None:
+        evidence = _evidence(
+            (0.65, 0.65, 0.65, 0.65, 0.65, 0.65),
+            deviations=(0.02, 0.02, 0.02, 0.02, 0.02, 0.02),
+            width=3,
+            height=2,
+        )
+        problem = build_reduced_problem(evidence, 1.0, 0.25, 0.5)
+        assert problem.aggregate_lower == 4
+        assert problem.aggregate_upper == 4
+
+>       result = ordered_label_expansion(problem, evidence, kappa=1.0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_stencil_ownership_expansion.py:137:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+problem = ReducedOwnershipProblem(points=(0, 1, 2, 3, 4, 5), unary_absolute=(1.04, 1.04, 1.04, 1.04, 1.04, 1.04), unary_linear=(...egate_lower=4, aggregate_upper=4, expected_sum=3.9000000000000004, fixed_edge_offset=0.0, beta=0.25, width=3, height=2)
+evidence = OwnershipEvidence(ownership=(0.65, 0.65, 0.65, 0.65, 0.65, 0.65), ownership_stdev=(0.02, 0.02, 0.02, 0.02, 0.02, 0.02)...one, None, None), width=3, height=2, empty_points=(0, 1, 2, 3, 4, 5), dead_black=(), dead_white=(), policy_metadata={})
+
+    def ordered_label_expansion(
+        problem: ReducedOwnershipProblem,
+        evidence: OwnershipEvidence,
+        *,
+        kappa: float,
+        maximum_passes: int = 8,
+        initial_labeling: Mapping[int, int] | None = None,
+        capacity_scale: int = _CAPACITY_SCALE,
+    ) -> OrderedExpansionResult:
+        """Run deterministic ternary alpha-expansion with interval repair.
+
+        Each pass considers alpha in (-1, 0, +1) order. An infeasible expansion
+        proposal is projected to the nearest aggregate-interval endpoint using the
+        existing deterministic connected-growth repair. A proposal is accepted
+        only when it strictly lowers the original full unary-plus-TV energy.
+        """
+        if (
+            isinstance(maximum_passes, bool)
+            or not isinstance(maximum_passes, int)
+            or maximum_passes < 0
+        ):
+            raise ValueError("maximum_passes must be a non-negative integer")
+        if (
+            isinstance(capacity_scale, bool)
+            or not isinstance(capacity_scale, int)
+            or capacity_scale <= 0
+        ):
+            raise ValueError("capacity_scale must be a positive integer")
+        if (
+            isinstance(kappa, bool)
+            or not isinstance(kappa, (int, float))
+            or not math.isfinite(float(kappa))
+            or kappa < 0
+        ):
+            raise ValueError("kappa must be finite and non-negative")
+        if evidence.ownership_stdev is None:
+            raise ValueError("ordered expansion requires ownershipStdev")
+        if tuple(sorted(evidence.empty_points)) != problem.points:
+            raise ValueError("reduced problem points do not match evidence empty points")
+
+        started_ns = time.perf_counter_ns()
+        initial = (
+            budget_exact_marginal_labeling(problem)
+            if initial_labeling is None
+            else dict(initial_labeling)
+        )
+        if tuple(sorted(initial)) != problem.points:
+            raise ValueError("initial labeling must cover exactly the problem points")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value not in _LABELS
+            for value in initial.values()
+        ):
+            raise ValueError("initial ownership labels must be integer -1, 0, or +1")
+        initial_sum = sum(initial.values())
+        if not problem.aggregate_lower <= initial_sum <= problem.aggregate_upper:
+            raise ValueError("initial labeling violates the aggregate interval")
+
+        empty_points = tuple(evidence.empty_points)
+        fixed_positive = set(evidence.dead_black)
+        fixed_negative = set(evidence.dead_white)
+        if fixed_positive & fixed_negative:
+            raise ValueError("fixed dead-Black and dead-White points overlap")
+        fixed_labels = {
+            **{point: 1 for point in fixed_positive},
+            **{point: -1 for point in fixed_negative},
+        }
+        eligible = tuple(sorted(set(empty_points) | set(fixed_labels)))
+        neighbours, all_edges = ownership_graph(
+            eligible, evidence.width, evidence.height,
+        )
+        component_for = component_ids(eligible, neighbours)
+
+        current = dict(initial)
+        current_energy = full_energy_from_reduction(problem, current)
+        cross_checked_energy = ownership_energy(
+>           current_full,
+            ^^^^^^^^^^^^
+            evidence,
+            empty_points,
+            all_edges,
+            float(kappa),
+            problem.beta,
+        )
+E       NameError: name 'current_full' is not defined
+
+transformers/stencil_cover/stencil_ownership_expansion.py:276: NameError
+____________________________________________________________________ test_ordered_expansion_full_energy_includes_fixed_dead_stone_interactions ____________________________________________________________________
+
+    def test_ordered_expansion_full_energy_includes_fixed_dead_stone_interactions() -> None:
+        evidence = _evidence(
+            (0.35, 0.0, -0.3, 0.1, 0.0, -0.1),
+            deviations=(0.02, 0.04, 0.03, 0.05, 0.03, 0.02),
+            width=3,
+            height=2,
+            board=(None, "B", None, None, "W", None),
+            dead_black=(1,),
+            dead_white=(4,),
+        )
+        problem = build_reduced_problem(evidence, 1.0, 0.25, 0.5)
+>       result = ordered_label_expansion(problem, evidence, kappa=1.0)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_stencil_ownership_expansion.py:165:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+problem = ReducedOwnershipProblem(points=(0, 2, 3, 5), unary_absolute=(1.04, 1.06, 1.1, 1.04), unary_linear=(-0.95, 0.35, 0.0499...gate_lower=0, aggregate_upper=0, expected_sum=0.04999999999999999, fixed_edge_offset=1.5, beta=0.25, width=3, height=2)
+evidence = OwnershipEvidence(ownership=(0.35, 0.0, -0.3, 0.1, 0.0, -0.1), ownership_stdev=(0.02, 0.04, 0.03, 0.05, 0.03, 0.02), b..., None, 'W', None), width=3, height=2, empty_points=(0, 2, 3, 5), dead_black=(1,), dead_white=(4,), policy_metadata={})
+
+    def ordered_label_expansion(
+        problem: ReducedOwnershipProblem,
+        evidence: OwnershipEvidence,
+        *,
+        kappa: float,
+        maximum_passes: int = 8,
+        initial_labeling: Mapping[int, int] | None = None,
+        capacity_scale: int = _CAPACITY_SCALE,
+    ) -> OrderedExpansionResult:
+        """Run deterministic ternary alpha-expansion with interval repair.
+
+        Each pass considers alpha in (-1, 0, +1) order. An infeasible expansion
+        proposal is projected to the nearest aggregate-interval endpoint using the
+        existing deterministic connected-growth repair. A proposal is accepted
+        only when it strictly lowers the original full unary-plus-TV energy.
+        """
+        if (
+            isinstance(maximum_passes, bool)
+            or not isinstance(maximum_passes, int)
+            or maximum_passes < 0
+        ):
+            raise ValueError("maximum_passes must be a non-negative integer")
+        if (
+            isinstance(capacity_scale, bool)
+            or not isinstance(capacity_scale, int)
+            or capacity_scale <= 0
+        ):
+            raise ValueError("capacity_scale must be a positive integer")
+        if (
+            isinstance(kappa, bool)
+            or not isinstance(kappa, (int, float))
+            or not math.isfinite(float(kappa))
+            or kappa < 0
+        ):
+            raise ValueError("kappa must be finite and non-negative")
+        if evidence.ownership_stdev is None:
+            raise ValueError("ordered expansion requires ownershipStdev")
+        if tuple(sorted(evidence.empty_points)) != problem.points:
+            raise ValueError("reduced problem points do not match evidence empty points")
+
+        started_ns = time.perf_counter_ns()
+        initial = (
+            budget_exact_marginal_labeling(problem)
+            if initial_labeling is None
+            else dict(initial_labeling)
+        )
+        if tuple(sorted(initial)) != problem.points:
+            raise ValueError("initial labeling must cover exactly the problem points")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value not in _LABELS
+            for value in initial.values()
+        ):
+            raise ValueError("initial ownership labels must be integer -1, 0, or +1")
+        initial_sum = sum(initial.values())
+        if not problem.aggregate_lower <= initial_sum <= problem.aggregate_upper:
+            raise ValueError("initial labeling violates the aggregate interval")
+
+        empty_points = tuple(evidence.empty_points)
+        fixed_positive = set(evidence.dead_black)
+        fixed_negative = set(evidence.dead_white)
+        if fixed_positive & fixed_negative:
+            raise ValueError("fixed dead-Black and dead-White points overlap")
+        fixed_labels = {
+            **{point: 1 for point in fixed_positive},
+            **{point: -1 for point in fixed_negative},
+        }
+        eligible = tuple(sorted(set(empty_points) | set(fixed_labels)))
+        neighbours, all_edges = ownership_graph(
+            eligible, evidence.width, evidence.height,
+        )
+        component_for = component_ids(eligible, neighbours)
+
+        current = dict(initial)
+        current_energy = full_energy_from_reduction(problem, current)
+        cross_checked_energy = ownership_energy(
+>           current_full,
+            ^^^^^^^^^^^^
+            evidence,
+            empty_points,
+            all_edges,
+            float(kappa),
+            problem.beta,
+        )
+E       NameError: name 'current_full' is not defined
+
+transformers/stencil_cover/stencil_ownership_expansion.py:276: NameError
+============================================================================================= short test summary info =============================================================================================
+FAILED tests/test_stencil_cover_enricher.py::test_legacy_threshold_policy_does_not_require_ownership_stdev - AssertionError: assert 'includeOwnershipStdev' not in {'boardXSize': 2, 'boardYSize': 2, 'capabilities': {'stencil_cover': {'truncation_threshold': 0.5}}, 'includeOwnership': True, ...}
+FAILED tests/test_stencil_cover_enricher.py::test_coherent_policy_keeps_a_feasible_incumbent_on_a_full_board - assert 4.382841957965866 < 2.5
+FAILED tests/test_stencil_ownership_expansion.py::test_ordered_expansion_is_feasible_monotone_and_energy_cross_checked - NameError: name 'current_full' is not defined
+FAILED tests/test_stencil_ownership_expansion.py::test_ordered_expansion_uses_aggregate_repair_and_keeps_interval - NameError: name 'current_full' is not defined
+FAILED tests/test_stencil_ownership_expansion.py::test_ordered_expansion_full_energy_includes_fixed_dead_stone_interactions - NameError: name 'current_full' is not defined
+==================================================================================== 5 failed, 782 passed, 1 skipped in 13.86s ====================================================================================
+(kataproxy) bork@fastapi ~/w/proxy-fable-bckp (feat/ordered-label-expansion-pr) % mypy --strict .
+scripts/run_stencil_corpus_integration.py:236: error: Item "Awaitable[Any]" of "Awaitable[Any] | Any" has no attribute "get"  [union-attr]
+transformers/stencil_cover/stencil_ownership_expansion.py:276: error: Name "current_full" is not defined  [name-defined]
+scripts/run_ownership_forest_mm.py:575: error: Name "gap_value" already defined on line 522  [no-redef]
+tests/test_stencil_corpus_integration.py:713: error: Item "Awaitable[Any]" of "Awaitable[Any] | Any" has no attribute "__iter__" (not iterable)  [union-attr]
+tests/test_stencil_corpus_integration.py:739: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+tests/test_stencil_corpus_integration.py:814: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+tests/test_stencil_corpus_integration.py:877: error: Argument 1 to "len" has incompatible type "Awaitable[Any] | Any"; expected "Sized"  [arg-type]
+tests/test_stencil_corpus_integration.py:879: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+tests/test_stencil_corpus_integration.py:915: error: Value of type "Awaitable[Any] | Any" is not indexable  [index]
+Found 9 errors in 4 files (checked 138 source files)
