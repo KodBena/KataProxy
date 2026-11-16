@@ -199,36 +199,36 @@ def violations_in_source(source: str, display_path: str = "<source>") -> list[st
         ):
             walk(node.test, scope_stack, function_depth)
             # The TYPE_CHECKING body is never executed; its entire subtree is exempt.
-            for child in node.orelse:
-                walk(child, scope_stack, function_depth)
+            for else_statement in node.orelse:
+                walk(else_statement, scope_stack, function_depth)
             return
         if isinstance(node, ast.ClassDef):
             for field_name, value in ast.iter_fields(node):
                 if field_name == "body":
-                    for child in value:
-                        walk(child, scope_stack + (node.name,), function_depth)
+                    for class_body_statement in value:
+                        walk(class_body_statement, scope_stack + (node.name,), function_depth)
                 elif isinstance(value, ast.AST):
                     walk(value, scope_stack, function_depth)
                 elif isinstance(value, list):
-                    for child in value:
-                        if isinstance(child, ast.AST):
-                            walk(child, scope_stack, function_depth)
+                    for class_field_node in value:
+                        if isinstance(class_field_node, ast.AST):
+                            walk(class_field_node, scope_stack, function_depth)
             return
         if isinstance(node, _FUNCTIONS):
             # Defaults, decorators and annotations are evaluated at definition time;
             # the body is the only region whose imports are deferred until invocation.
             for field_name, value in ast.iter_fields(node):
                 if field_name == "body":
-                    for child in value:
+                    for function_body_statement in value:
                         walk(
-                            child, scope_stack + (node.name,), function_depth + 1
+                            function_body_statement, scope_stack + (node.name,), function_depth + 1
                         )
                 elif isinstance(value, ast.AST):
                     walk(value, scope_stack, function_depth)
                 elif isinstance(value, list):
-                    for child in value:
-                        if isinstance(child, ast.AST):
-                            walk(child, scope_stack, function_depth)
+                    for function_field_node in value:
+                        if isinstance(function_field_node, ast.AST):
+                            walk(function_field_node, scope_stack, function_depth)
             return
         if isinstance(node, (ast.Import, ast.ImportFrom)) and function_depth:
             out_path = display_path
@@ -238,8 +238,8 @@ def violations_in_source(source: str, display_path: str = "<source>") -> list[st
                 f"(inside {out_context})"
             )
             return
-        for child in ast.iter_child_nodes(node):
-            walk(child, scope_stack, function_depth)
+        for descendant in ast.iter_child_nodes(node):
+            walk(descendant, scope_stack, function_depth)
 
     walk(tree, (), 0)
     return violations

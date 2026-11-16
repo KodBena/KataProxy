@@ -572,16 +572,16 @@ def build_results(
                 problem.aggregate_upper,
                 problem.beta,
             )
-            checkpoint_checkpoint_gap_value: float | None = None
+            checkpoint_gap_value: float | None = None
             if reference_is_proven:
                 raw_checkpoint_gap = checkpoint_metrics.get("additive_optimality_gap")
                 if isinstance(raw_checkpoint_gap, (int, float)):
-                    checkpoint_checkpoint_gap_value = float(raw_checkpoint_gap)
+                    checkpoint_gap_value = float(raw_checkpoint_gap)
                 gap_kind = "exact_additive_optimality_gap"
             elif lower_bound is not None:
                 raw_checkpoint_gap = checkpoint_metrics.get("additive_gap_upper_bound")
                 if isinstance(raw_checkpoint_gap, (int, float)):
-                    checkpoint_checkpoint_gap_value = float(raw_checkpoint_gap)
+                    checkpoint_gap_value = float(raw_checkpoint_gap)
                 gap_kind = "additive_gap_upper_bound"
             else:
                 gap_kind = "unavailable_without_proven_optimum_or_lower_bound"

@@ -14,7 +14,9 @@ import sys
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,17 @@ def _free_loopback_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         return int(listener.getsockname()[1])
+
+
+def _redis_server_version(response: object) -> str:
+    if isawaitable(response):
+        raise TypeError("synchronous Redis client returned an awaitable for INFO")
+    if not isinstance(response, Mapping):
+        raise TypeError("Redis INFO server response must be a mapping")
+    version_value = response.get("redis_version")
+    if not isinstance(version_value, str) or not version_value:
+        raise ValueError("Redis INFO server response has no valid redis_version")
+    return version_value
 
 
 def _stop_process(process: subprocess.Popen[str] | None) -> None:
@@ -217,7 +230,8 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     time.sleep(0.025)
 
-            info = redis_client.info(section="server")
+            info_response: object = redis_client.info(section="server")
+            redis_version = _redis_server_version(info_response)
             redis_url = f"redis://127.0.0.1:{port}/0"
             test_environment = os.environ.copy()
             # These variables are read while production modules import. They
@@ -233,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             })
             test_environment.pop("KATAPROXY_STENCIL_CORPUS_ENABLED", None)
             report["redis"].update({
-                "version": info.get("redis_version"),
+                "version": redis_version,
                 "host": "127.0.0.1",
                 "port": port,
                 "url": redis_url,

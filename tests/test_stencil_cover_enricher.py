@@ -835,7 +835,10 @@ def test_transformer_requires_explicit_stencil_cover_opt_in() -> None:
 
 
 
-def test_legacy_threshold_policy_does_not_require_ownership_stdev() -> None:
+def test_legacy_threshold_policy_does_not_require_ownership_stdev(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cfg, "STENCIL_OWNERSHIP_CORPUS_ENABLED", False)
     transformer = enricher.stencil_cover_enricher(
         _mock_link(), ownership_policy=ThresholdOwnershipPolicy(),
     )

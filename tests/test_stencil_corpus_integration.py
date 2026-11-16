@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Mapping
+from inspect import isawaitable
 import os
 import signal
 import socket
@@ -100,10 +102,146 @@ def redis_client() -> Iterator[redis.Redis]:
         client.close()
 
 
+RedisText = bytes | str
+RedisStreamRows = tuple[
+    tuple[RedisText, Mapping[RedisText, RedisText]], ...
+]
+
+
+def _require_synchronous_redis_result(value: object, command: str) -> object:
+    if isawaitable(value):
+        raise TypeError(
+            f"synchronous Redis integration client returned an awaitable for {command}"
+        )
+    return value
+
+
+def _parse_redis_stream_rows(value: object, command: str) -> RedisStreamRows:
+    response = _require_synchronous_redis_result(value, command)
+    if not isinstance(response, (list, tuple)):
+        raise TypeError(f"Redis {command} response must be a sequence")
+
+    rows: list[tuple[RedisText, Mapping[RedisText, RedisText]]] = []
+    for index, row in enumerate(response):
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+            raise TypeError(f"Redis {command} row {index} must be a pair")
+        message_id, fields = row
+        if not isinstance(message_id, (bytes, str)):
+            raise TypeError(f"Redis {command} row {index} has an invalid message id")
+        if not isinstance(fields, Mapping):
+            raise TypeError(f"Redis {command} row {index} fields must be a mapping")
+        validated_fields: dict[RedisText, RedisText] = {}
+        for key, payload in fields.items():
+            if not isinstance(key, (bytes, str)):
+                raise TypeError(f"Redis {command} row {index} has a non-text field key")
+            if not isinstance(payload, (bytes, str)):
+                raise TypeError(f"Redis {command} row {index} has a non-text field value")
+            validated_fields[key] = payload
+        rows.append((message_id, validated_fields))
+    return tuple(rows)
+
+
+def _redis_stream_rows(client: redis.Redis, stream: str) -> RedisStreamRows:
+    response: object = client.xrange(stream)
+    return _parse_redis_stream_rows(response, "XRANGE")
+
+
+def _redis_pending_count(client: redis.Redis, stream: str, group: str) -> int:
+    response: object = _require_synchronous_redis_result(
+        client.xpending(stream, group), "XPENDING",
+    )
+    if not isinstance(response, Mapping):
+        raise TypeError("Redis XPENDING response must be a mapping")
+    count = response.get("pending", response.get(b"pending"))
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise TypeError("Redis XPENDING pending count must be a non-negative integer")
+    return count
+
+
+def _redis_pending_delivery_ages(
+    client: redis.Redis, stream: str, group: str,
+) -> tuple[int, ...]:
+    response: object = _require_synchronous_redis_result(
+        client.xpending_range(stream, group, "-", "+", 10),
+        "XPENDING RANGE",
+    )
+    if not isinstance(response, (list, tuple)):
+        raise TypeError("Redis XPENDING RANGE response must be a sequence")
+    ages: list[int] = []
+    for index, entry in enumerate(response):
+        if not isinstance(entry, Mapping):
+            raise TypeError(f"Redis XPENDING RANGE entry {index} must be a mapping")
+        age = entry.get("time_since_delivered", entry.get(b"time_since_delivered"))
+        if isinstance(age, bool) or not isinstance(age, int) or age < 0:
+            raise TypeError(
+                f"Redis XPENDING RANGE entry {index} delivery age must be a "
+                "non-negative integer"
+            )
+        ages.append(age)
+    return tuple(ages)
+
+
+def _redis_stream_length(client: redis.Redis, stream: str) -> int:
+    response: object = _require_synchronous_redis_result(
+        client.xlen(stream), "XLEN",
+    )
+    if isinstance(response, bool) or not isinstance(response, int) or response < 0:
+        raise TypeError("Redis XLEN response must be a non-negative integer")
+    return response
+
+
+class _SynchronousRedisStreamPort:
+    """Translate redis-py's sync/async union into the materializer's sync port."""
+
+    def __init__(self, client: redis.Redis) -> None:
+        self._client = client
+
+    def xgroup_create(
+        self, name: str, groupname: str, id: str = "$", mkstream: bool = False,
+    ) -> object:
+        response: object = self._client.xgroup_create(
+            name, groupname, id=id, mkstream=mkstream,
+        )
+        return _require_synchronous_redis_result(response, "XGROUP CREATE")
+
+    def xautoclaim(
+        self,
+        name: str,
+        groupname: str,
+        consumername: str,
+        min_idle_time: int,
+        start_id: str = "0-0",
+        count: int | None = None,
+    ) -> object:
+        response: object = self._client.xautoclaim(
+            name, groupname, consumername, min_idle_time,
+            start_id=start_id, count=count,
+        )
+        return _require_synchronous_redis_result(response, "XAUTOCLAIM")
+
+    def xreadgroup(
+        self,
+        groupname: str,
+        consumername: str,
+        streams: dict[str, str],
+        count: int | None = None,
+        block: int | None = None,
+    ) -> object:
+        response: object = self._client.xreadgroup(
+            groupname, consumername, streams, count=count, block=block,
+        )
+        return _require_synchronous_redis_result(response, "XREADGROUP")
+
+    def xack(self, name: str, groupname: str, *ids: str) -> int:
+        response: object = self._client.xack(name, groupname, *ids)
+        value = _require_synchronous_redis_result(response, "XACK")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeError("Redis XACK response must be a non-negative integer")
+        return value
+
+
 def _stream_port(client: redis.Redis) -> RedisStreamPort:
-    # redis-py models several Streams return shapes as optional/unions; the
-    # materializer only consumes the narrow operations declared by its port.
-    return cast(RedisStreamPort, client)
+    return _SynchronousRedisStreamPort(client)
 
 
 def _profile(name: str) -> SolverWorkProfile:
@@ -682,7 +820,7 @@ async def test_ordinary_service_explicit_opt_out_keeps_analysis_available(
         assert supervisors == []
         response = await _capture_one_query(websocket)
         assert "stencilCover" in response
-        assert redis_client.xrange(CORPUS_STREAM_KEY) == []
+        assert _redis_stream_rows(redis_client, CORPUS_STREAM_KEY) == ()
         assert not database.exists()
     finally:
         await _stop_ordinary_service(task, websocket)
@@ -706,17 +844,11 @@ async def test_real_proxy_capture_backlogs_then_materializes_with_materializer_s
         await _stop_proxy(server, task, websocket)
 
     # No materializer has been constructed or started during proxy capture.
-    stream_response = redis_client.xrange(CORPUS_STREAM_KEY)
-    assert stream_response is not None
-    stream_rows = [
-        (message_id, fields)
-        for message_id, fields in stream_response
-        if message_id is not None and fields is not None
-    ]
+    stream_rows = _redis_stream_rows(redis_client, CORPUS_STREAM_KEY)
     assert len(stream_rows) >= 2
     events: list[dict[str, Any]] = []
     for _message_id, fields in stream_rows:
-        payload = fields.get(b"event")
+        payload = fields.get(b"event", fields.get("event"))
         assert isinstance(payload, (bytes, str))
         events.append(parse_event(payload))
     assert any(event["event_type"] == "instance_seen" for event in events)
@@ -733,10 +865,9 @@ async def test_real_proxy_capture_backlogs_then_materializes_with_materializer_s
     assert counts["acked"] == len(stream_rows)
     assert store.counts()["receipts"] == len(stream_rows)
     assert store.counts()["instances"] >= 1
-    pending = redis_client.xpending(
-        CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
-    )
-    assert pending["pending"] == 0
+    assert _redis_pending_count(
+        redis_client, CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
+    ) == 0
 
 
 @pytest.mark.asyncio
@@ -757,7 +888,7 @@ async def test_real_proxy_capture_spools_exact_bytes_on_redis_failure_and_recove
     finally:
         await _stop_proxy(server, task, websocket)
 
-    assert redis_client.xrange(CORPUS_STREAM_KEY) == []
+    assert _redis_stream_rows(redis_client, CORPUS_STREAM_KEY) == ()
     with sqlite3.connect(database) as connection:
         rows = connection.execute(
             "SELECT event_json, payload_sha256 FROM stencil_corpus_spool_events "
@@ -799,7 +930,7 @@ def test_real_redis_stream_backlog_is_consumed_after_materializer_resumes(
         assert publisher.publish(event) == "redis_stream"
 
     # The materializer is deliberately absent while the backlog accumulates.
-    assert redis_client.xlen(CORPUS_STREAM_KEY) == len(events)
+    assert _redis_stream_length(redis_client, CORPUS_STREAM_KEY) == len(events)
     store = SQLiteCorpusStore(database)
     assert store.counts()["receipts"] == 0
 
@@ -811,9 +942,9 @@ def test_real_redis_stream_backlog_is_consumed_after_materializer_resumes(
     assert counts["acked"] == len(events)
     assert store.counts()["receipts"] == len(events)
     assert store.counts()["instances"] == 1
-    assert redis_client.xpending(
-        CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
-    )["pending"] == 0
+    assert _redis_pending_count(
+        redis_client, CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
+    ) == 0
 
 
 def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
@@ -871,19 +1002,19 @@ def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
     store = SQLiteCorpusStore(database)
     assert store.counts()["receipts"] == 1
     assert store.counts()["instances"] == 1
-    pending = redis_client.xpending_range(
-        CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP, "-", "+", 10,
+    pending_ages = _redis_pending_delivery_ages(
+        redis_client, CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
     )
-    assert len(pending) == 1
+    assert len(pending_ages) == 1
     deadline = time.monotonic() + 5.0
-    while int(pending[0]["time_since_delivered"]) < 1:
+    while pending_ages[0] < 1:
         if time.monotonic() >= deadline:
             pytest.fail("pending entry did not become claimable within five seconds")
         time.sleep(0.001)
-        pending = redis_client.xpending_range(
-            CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP, "-", "+", 10,
+        pending_ages = _redis_pending_delivery_ages(
+            redis_client, CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
         )
-        assert pending
+        assert pending_ages
 
     # Restart through the production CLI in a new process. Its normal
     # startup constructs a fresh consumer and recovers through XAUTOCLAIM.
@@ -912,6 +1043,6 @@ def test_real_process_interruption_after_sqlite_commit_replays_pending_entry(
     assert "acked': 1" in restarted.stderr
     assert store.counts()["receipts"] == 1
     assert store.counts()["instances"] == 1
-    assert redis_client.xpending(
-        CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
-    )["pending"] == 0
+    assert _redis_pending_count(
+        redis_client, CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP,
+    ) == 0
