@@ -166,7 +166,7 @@ def register_cache_invalidator(
         return True
 
 
-def create_redis_client() -> Any:
+def create_redis_client() -> redis.Redis:
     """Connect to the proxy's dedicated Redis database, failing explicitly."""
     client = redis.Redis(
         host=_REDIS_HOST,

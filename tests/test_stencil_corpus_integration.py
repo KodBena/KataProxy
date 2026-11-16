@@ -66,9 +66,10 @@ from transformers.stencil_cover.stencil_corpus_events import (
     parse_event,
     serialize_event,
 )
-from transformers.stencil_cover.stencil_corpus_materializer import (
+from transformers.stencil_cover.stencil_corpus_materializer import StencilCorpusMaterializer
+from transformers.stencil_cover.stencil_redis_stream_port import (
     RedisStreamPort,
-    StencilCorpusMaterializer,
+    SynchronousRedisStreamAdapter,
 )
 from transformers.stencil_cover.stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
@@ -190,65 +191,8 @@ def _redis_stream_length(client: redis.Redis, stream: str) -> int:
     return response
 
 
-class _SynchronousRedisStreamPort:
-    """Translate redis-py's sync/async union into the materializer's sync port."""
-
-    def __init__(self, client: redis.Redis) -> None:
-        self._client = client
-
-    def xgroup_create(
-        self, name: str, groupname: str, id: str = "$", mkstream: bool = False,
-    ) -> object:
-        response: object = self._client.xgroup_create(
-            name, groupname, id=id, mkstream=mkstream,
-        )
-        return _require_synchronous_redis_result(response, "XGROUP CREATE")
-
-    def xautoclaim(
-        self,
-        name: str,
-        groupname: str,
-        consumername: str,
-        min_idle_time: int,
-        start_id: str = "0-0",
-        count: int | None = None,
-    ) -> object:
-        response: object = self._client.xautoclaim(
-            name, groupname, consumername, min_idle_time,
-            start_id=start_id, count=count,
-        )
-        return _require_synchronous_redis_result(response, "XAUTOCLAIM")
-
-    def xreadgroup(
-        self,
-        groupname: str,
-        consumername: str,
-        streams: dict[str, str],
-        count: int | None = None,
-        block: int | None = None,
-    ) -> object:
-        redis_streams: dict[
-            bytes | str | memoryview[int],
-            int | bytes | str | memoryview[int],
-        ] = {
-            stream_name: stream_id
-            for stream_name, stream_id in streams.items()
-        }
-        response: object = self._client.xreadgroup(
-            groupname, consumername, redis_streams, count=count, block=block,
-        )
-        return _require_synchronous_redis_result(response, "XREADGROUP")
-
-    def xack(self, name: str, groupname: str, *ids: str) -> int:
-        response: object = self._client.xack(name, groupname, *ids)
-        value = _require_synchronous_redis_result(response, "XACK")
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise TypeError("Redis XACK response must be a non-negative integer")
-        return value
-
-
 def _stream_port(client: redis.Redis) -> RedisStreamPort:
-    return _SynchronousRedisStreamPort(client)
+    return SynchronousRedisStreamAdapter(client)
 
 
 def _profile(name: str) -> SolverWorkProfile:

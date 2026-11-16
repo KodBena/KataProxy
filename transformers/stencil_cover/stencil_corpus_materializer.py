@@ -14,7 +14,8 @@ import signal
 import socket
 import threading
 import uuid
-from typing import Any, Callable, Protocol, Sequence
+from collections.abc import Mapping
+from typing import Any, Callable, Sequence
 
 from .stencil_cache_storage import create_redis_client
 from .stencil_corpus_publisher import (
@@ -27,40 +28,12 @@ from .stencil_corpus_store import (
     MissingInstanceSighting,
     SQLiteCorpusStore,
 )
+from .stencil_redis_stream_port import RedisStreamPort, SynchronousRedisStreamAdapter
 
 logger = logging.getLogger("kataproxy.stencil_corpus_materializer")
 
 
-class RedisStreamPort(Protocol):
-    """Small structural protocol for the Redis Streams operations used here."""
-
-    def xgroup_create(
-        self, name: str, groupname: str, id: str = "$", mkstream: bool = False,
-    ) -> Any: ...
-
-    def xautoclaim(
-        self,
-        name: str,
-        groupname: str,
-        consumername: str,
-        min_idle_time: int,
-        start_id: str = "0-0",
-        count: int | None = None,
-    ) -> Any: ...
-
-    def xreadgroup(
-        self,
-        groupname: str,
-        consumername: str,
-        streams: dict[str, str],
-        count: int | None = None,
-        block: int | None = None,
-    ) -> Any: ...
-
-    def xack(self, name: str, groupname: str, *ids: str) -> int: ...
-
-
-def _normalise_stream_id(value: Any) -> str:
+def _normalise_stream_id(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("ascii")
     if isinstance(value, str):
@@ -68,22 +41,22 @@ def _normalise_stream_id(value: Any) -> str:
     raise TypeError("Redis stream message ID must be text or bytes")
 
 
-def _event_payload(fields: Any) -> bytes | str:
-    if not isinstance(fields, dict):
+def _event_payload(fields: object) -> bytes | str:
+    if not isinstance(fields, Mapping):
         raise TypeError("Redis stream fields must be a mapping")
     payload = fields.get(b"event", fields.get("event"))
     if isinstance(payload, (bytes, str)):
         return payload
-    raise ValueError("Redis stream entry does not contain an event payload")
+    raise ValueError("Redis stream entry does not contain a valid event payload")
 
 
-def _parse_stream_messages(value: Any) -> tuple[tuple[str, Any], ...]:
+def _parse_stream_messages(value: object) -> tuple[tuple[str, object], ...]:
     if not isinstance(value, (list, tuple)):
-        return ()
-    messages: list[tuple[str, Any]] = []
-    for item in value:
+        raise TypeError("Redis stream messages must be a sequence")
+    messages: list[tuple[str, object]] = []
+    for index, item in enumerate(value):
         if not isinstance(item, (list, tuple)) or len(item) != 2:
-            continue
+            raise TypeError(f"Redis stream message {index} must be an id/fields pair")
         message_id, fields = item
         messages.append((_normalise_stream_id(message_id), fields))
     return tuple(messages)
@@ -135,15 +108,10 @@ class StencilCorpusMaterializer:
                 raise
         self._group_ready = True
 
-    def _claim_stale_pending(self) -> tuple[tuple[str, Any], ...]:
+    def _claim_stale_pending(self) -> tuple[tuple[str, object], ...]:
         if self.redis is None:
             return ()
-        autoclaim = getattr(self.redis, "xautoclaim", None)
-        if not callable(autoclaim):
-            raise RuntimeError(
-                "Redis client/server must support XAUTOCLAIM for pending-event recovery"
-            )
-        response = autoclaim(
+        response = self.redis.xautoclaim(
             CORPUS_STREAM_KEY,
             CORPUS_CONSUMER_GROUP,
             self.consumer_name,
@@ -151,12 +119,14 @@ class StencilCorpusMaterializer:
             start_id=self._claim_cursor,
             count=self.batch_size,
         )
-        if not isinstance(response, (list, tuple)) or len(response) < 2:
-            raise RuntimeError("Redis XAUTOCLAIM returned an unexpected response")
+        if not isinstance(response, (list, tuple)) or len(response) not in (2, 3):
+            raise TypeError("Redis XAUTOCLAIM returned an unexpected response shape")
+        if len(response) == 3 and not isinstance(response[2], (list, tuple)):
+            raise TypeError("Redis XAUTOCLAIM deleted-entry list must be a sequence")
         self._claim_cursor = _normalise_stream_id(response[0])
         return _parse_stream_messages(response[1])
 
-    def _read_new(self, block_ms: int | None) -> tuple[tuple[str, Any], ...]:
+    def _read_new(self, block_ms: int | None) -> tuple[tuple[str, object], ...]:
         if self.redis is None:
             return ()
         kwargs: dict[str, Any] = {"count": self.batch_size}
@@ -168,13 +138,19 @@ class StencilCorpusMaterializer:
             {CORPUS_STREAM_KEY: ">"},
             **kwargs,
         )
-        if not isinstance(response, (list, tuple)):
+        if response is None:
             return ()
-        collected: list[tuple[str, Any]] = []
-        for stream_entry in response:
+        if not isinstance(response, (list, tuple)):
+            raise TypeError("Redis XREADGROUP response must be a sequence or None")
+        collected: list[tuple[str, object]] = []
+        for index, stream_entry in enumerate(response):
             if not isinstance(stream_entry, (list, tuple)) or len(stream_entry) != 2:
-                continue
-            _stream_name, rows = stream_entry
+                raise TypeError(
+                    f"Redis XREADGROUP stream entry {index} must be a name/rows pair"
+                )
+            stream_name, rows = stream_entry
+            if _normalise_stream_id(stream_name) != CORPUS_STREAM_KEY:
+                raise ValueError("Redis XREADGROUP returned an unrequested stream")
             collected.extend(_parse_stream_messages(rows))
         return tuple(collected)
 
@@ -205,7 +181,7 @@ class StencilCorpusMaterializer:
         return counts
 
     def _ingest_stream_messages(
-        self, messages: tuple[tuple[str, Any], ...],
+        self, messages: tuple[tuple[str, object], ...],
     ) -> dict[str, int]:
         counts = {"stream_ingested": 0, "acked": 0, "duplicates": 0, "deferred": 0, "errors": 0}
         if self.redis is None:
@@ -359,7 +335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     redis_client: RedisStreamPort | None = None
     if not args.spool_only:
         try:
-            redis_client = create_redis_client()
+            redis_client = SynchronousRedisStreamAdapter(create_redis_client())
         except Exception:
             logger.exception(
                 "Could not connect to Redis DB 7; use --spool-only to drain "

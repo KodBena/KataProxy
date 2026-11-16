@@ -20,6 +20,7 @@ from transformers.stencil_cover.stencil_corpus_events import (
     serialize_event,
 )
 from transformers.stencil_cover.stencil_corpus_materializer import StencilCorpusMaterializer
+from transformers.stencil_cover.stencil_redis_stream_port import SynchronousRedisStreamAdapter
 from transformers.stencil_cover.stencil_corpus_publisher import (
     CORPUS_CONSUMER_GROUP,
     CORPUS_STREAM_KEY,
@@ -150,10 +151,10 @@ class _FakeRedis:
         with self._lock:
             return bool(self.new_messages or self.pending_messages)
 
-    def xgroup_create(self, *args: Any, **kwargs: Any) -> str:
+    def xgroup_create(self, *args: Any, **kwargs: Any) -> bool:
         with self._lock:
             self.groups.append((args, kwargs))
-        return "OK"
+        return True
 
     def xautoclaim(self, *args: Any, **kwargs: Any) -> tuple[str, list[Any], list[Any]]:
         with self._lock:
@@ -210,6 +211,84 @@ def _message(
     payload: bytes,
 ) -> tuple[bytes, dict[bytes, bytes]]:
     return message_id.encode("ascii"), {b"event": payload}
+
+
+
+class _AsyncGroupCreateRedis:
+    async def xgroup_create(
+        self, _name: str, _groupname: str, id: str = "$", mkstream: bool = False,
+    ) -> bool:
+        return bool(id) and mkstream
+
+    def xautoclaim(
+        self, _name: str, _groupname: str, _consumername: str,
+        _min_idle_time: int, start_id: str = "0-0", count: int | None = None,
+    ) -> object:
+        return start_id, [], []
+
+    def xreadgroup(
+        self,
+        _groupname: str,
+        _consumername: str,
+        _streams: dict[
+            bytes | str | memoryview[int],
+            int | bytes | str | memoryview[int],
+        ],
+        count: int | None = None,
+        block: int | None = None,
+    ) -> object | None:
+        return None
+
+    def xack(self, _name: str, _groupname: str, *_ids: str) -> object:
+        return 0
+
+
+class _MalformedReadRedis:
+    def xgroup_create(
+        self, _name: str, _groupname: str, id: str = "$", mkstream: bool = False,
+    ) -> bool:
+        return True
+
+    def xautoclaim(
+        self, _name: str, _groupname: str, _consumername: str,
+        _min_idle_time: int, start_id: str = "0-0", count: int | None = None,
+    ) -> object:
+        return "0-0", [], []
+
+    def xreadgroup(
+        self, _groupname: str, _consumername: str, _streams: dict[str, str],
+        count: int | None = None, block: int | None = None,
+    ) -> object:
+        return {"unexpected": "shape"}
+
+    def xack(self, _name: str, _groupname: str, *_ids: str) -> int:
+        return 0
+
+
+def test_synchronous_redis_adapter_refuses_awaitables_and_preserves_empty_reads() -> None:
+    adapter = SynchronousRedisStreamAdapter(_AsyncGroupCreateRedis())
+
+    with pytest.raises(TypeError, match="awaitable.*XGROUP CREATE"):
+        adapter.xgroup_create(
+            CORPUS_STREAM_KEY, CORPUS_CONSUMER_GROUP, id="0-0", mkstream=True,
+        )
+    assert adapter.xreadgroup(
+        CORPUS_CONSUMER_GROUP,
+        "test-consumer",
+        {CORPUS_STREAM_KEY: ">"},
+        count=1,
+    ) is None
+
+
+def test_materializer_refuses_malformed_xreadgroup_response(tmp_path: Path) -> None:
+    store = SQLiteCorpusStore(tmp_path / "corpus.sqlite3")
+    materializer = StencilCorpusMaterializer(
+        store, _MalformedReadRedis(), consumer_name="malformed-read",
+    )
+
+    with pytest.raises(TypeError, match="XREADGROUP response"):
+        materializer.run_once(block_ms=0)
+
 
 
 def test_stream_materializer_creates_group_and_commits_before_ack(tmp_path: Path) -> None:
