@@ -862,7 +862,7 @@ def build_results(
         "maximum_ordered_expansion_passes": maximum_passes,
         "continuous_tv_maximum_iterations": 2000,
         "latency_gap_definition": {
-            "latency": "wall time in milliseconds for the named computation; forest MM and ordered expansion include their initializer, while forest DP is reported separately",
+            "latency": "wall time in milliseconds for the named computation; forest MM and ordered expansion include their initializer, continuous-TV co-area and argmax share one relaxation solve, and forest DP is reported separately",
             "gap": "exact additive gap only for proven optima; otherwise an additive upper bound only when a reference lower bound exists",
             "frontier_scope": "per evidence/objective instance; do not pool different instances into one frontier",
         },

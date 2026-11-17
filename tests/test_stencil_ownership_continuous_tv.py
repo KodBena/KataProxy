@@ -109,3 +109,11 @@ def test_continuous_tv_rejects_invalid_iteration_budget() -> None:
 
     with pytest.raises(ValueError, match="maximum_iterations"):
         continuous_tv_relaxation(problem, evidence, maximum_iterations=0)
+
+
+def test_continuous_tv_rejects_boolean_tolerance() -> None:
+    evidence = _evidence((0.2,), width=1, height=1)
+    problem = build_reduced_problem(evidence, 1.0, 0.25, 0.5)
+
+    with pytest.raises(ValueError, match="tolerance"):
+        continuous_tv_relaxation(problem, evidence, tolerance=True)

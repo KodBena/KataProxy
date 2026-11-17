@@ -18,7 +18,7 @@ with \(L+n \leq \sum_i(a_i+b_i) \leq U+n\). The hard aggregate interval is not s
 
 The implementation uses deterministic Chambolle--Pock primal-dual iterations. Dual edge variables are projected onto \([-\beta,\beta]\); the aggregate dual variable uses the exact interval-indicator proximal operator; primal variables are projected onto the ordered triangle. A conservative operator-norm upper bound is used for the common step size.
 
-The reported lower bound is the Fenchel dual objective at the returned dual iterate. The fractional primal iterate is interpolated toward the existing budget-exact feasible labeling when necessary to obtain a feasible continuous primal point for the primal/dual gap diagnostic. The code reports both the raw fractional aggregate residual and the feasible-primal energy. A finite iteration budget does not imply convergence: the convergence flag and iteration count are authoritative.
+The reported lower bound is the Fenchel dual objective at the returned dual iterate, evaluated in floating-point arithmetic. Dual feasibility follows from the explicit box projections and interval proximal update, but the implementation does not emit an independently verified rational dual certificate; treat the result as a numerical lower bound, not a formal exact-arithmetic certificate. The fractional primal iterate is interpolated toward the existing budget-exact feasible labeling when necessary to obtain a feasible continuous primal point for the primal/dual gap diagnostic. The code reports both the raw fractional aggregate residual and the feasible-primal energy. A finite iteration budget does not imply convergence: the convergence flag and iteration count are authoritative.
 
 ## Rounding variations
 
