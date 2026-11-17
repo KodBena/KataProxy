@@ -184,14 +184,14 @@ def ordered_label_lp_relaxation(
 
     first_values = tuple(float(solved.x[first_start + index]) for index in range(count))
     second_values = tuple(float(solved.x[second_start + index]) for index in range(count))
-    for first, second in zip(first_values, second_values):
+    for first_threshold, second_threshold in zip(first_values, second_values):
         if (
-            not math.isfinite(first)
-            or not math.isfinite(second)
-            or first < -1e-7
-            or first > 1.0 + 1e-7
-            or second < -1e-7
-            or second > first + 1e-7
+            not math.isfinite(first_threshold)
+            or not math.isfinite(second_threshold)
+            or first_threshold < -1e-7
+            or first_threshold > 1.0 + 1e-7
+            or second_threshold < -1e-7
+            or second_threshold > first_threshold + 1e-7
         ):
             raise ArithmeticError("ordered-label LP violated threshold variable bounds")
 
