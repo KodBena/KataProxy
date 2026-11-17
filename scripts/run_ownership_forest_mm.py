@@ -49,10 +49,11 @@ from transformers.stencil_cover.stencil_ownership_forest import (
 from transformers.stencil_cover.stencil_ownership_graphcut import ownership_graph
 from transformers.stencil_cover.stencil_ownership_repair import ownership_energy
 from transformers.stencil_cover.stencil_ownership_expansion import ordered_label_expansion
+from transformers.stencil_cover.stencil_ownership_relaxation import ordered_label_lp_relaxation
 
 
 RESULT_FORMAT = "kataproxy.ownership-approximation-comparison-results.v1"
-ALGORITHM_VERSION = "cardinality-forest-mm-and-ordered-expansion-v1"
+ALGORITHM_VERSION = "cardinality-forest-mm-ordered-expansion-and-lp-v2"
 DEFAULT_SPLIT_SEED = "ownership-forest-mm-holdout-v1"
 DEFAULT_MAX_PASSES = 8
 
@@ -279,12 +280,14 @@ def build_results(
         "forest_dp": [],
         "forest_mm_total": [],
         "ordered_expansion_total": [],
+        "ordered_label_lp": [],
     }
     method_gaps: dict[str, list[float]] = {
         "marginal_initializer": [],
         "forest_dp": [],
         "forest_mm": [],
         "ordered_expansion": [],
+        "ordered_label_lp_rounding": [],
     }
     reference_kind_counts: Counter[str] = Counter()
     board_group_signatures: set[str] = set()
@@ -453,6 +456,35 @@ def build_results(
             raise ArithmeticError("MM result is worse than its feasible initializer")
 
         if progress is not None:
+            progress(f"[{problem_number}/{len(prepared)}] ordered-label LP relaxation")
+        lp_start = time.perf_counter_ns()
+        lp_result = ordered_label_lp_relaxation(problem)
+        lp_ms = (time.perf_counter_ns() - lp_start) / 1_000_000.0
+        lp_empty = dict(lp_result.labeling)
+        lp_full = _archive_labeling(lp_empty, representative)
+        lp_energy = ownership_energy(
+            lp_full,
+            evidence,
+            representative.empty_points,
+            all_edges,
+            config["kappa"],
+            config["beta"],
+        )
+        if abs(
+            lp_energy - full_energy_from_reduction(problem, lp_empty)
+        ) > 1e-6:
+            raise ArithmeticError("ordered-label LP rounding failed full-energy cross-check")
+        if lp_result.lower_bound > lp_energy + 1e-6:
+            raise ArithmeticError("ordered-label LP lower bound exceeds its rounded candidate")
+        effective_lower_bound = (
+            lp_result.lower_bound
+            if lower_bound is None
+            else max(lower_bound, lp_result.lower_bound)
+        )
+        if effective_lower_bound > reference_energy + 1e-6:
+            raise ValueError("combined valid lower bound exceeds archived feasible reference")
+
+        if progress is not None:
             progress(f"[{problem_number}/{len(prepared)}] ordered-label expansion")
         expansion_start = time.perf_counter_ns()
         expansion_result = ordered_label_expansion(
@@ -484,6 +516,7 @@ def build_results(
             ("forest_dp", forest_ms),
             ("forest_mm_total", marginal_ms + mm_ms),
             ("ordered_expansion_total", expansion_ms),
+            ("ordered_label_lp", lp_ms),
         ):
             method_times[name].append(elapsed)
         method_results = {
@@ -491,6 +524,7 @@ def build_results(
             "forest_dp": (forest_full, forest_energy),
             "forest_mm": (mm_full, mm_energy),
             "ordered_expansion": (expansion_full, expansion_energy),
+            "ordered_label_lp_rounding": (lp_full, lp_energy),
         }
         methods: dict[str, Any] = {}
         method_latency_ms = {
@@ -498,6 +532,7 @@ def build_results(
             "forest_dp": forest_ms,
             "forest_mm": marginal_ms + mm_ms,
             "ordered_expansion": expansion_ms,
+            "ordered_label_lp_rounding": lp_ms,
         }
         latency_gap_comparison_points: list[dict[str, Any]] = []
         for name, (labels, energy) in method_results.items():
@@ -507,7 +542,7 @@ def build_results(
                 reference_labels,
                 reference_energy,
                 reference_is_proven,
-                lower_bound,
+                effective_lower_bound,
                 representative.empty_points,
                 all_edges,
                 problem.expected_sum,
@@ -521,7 +556,7 @@ def build_results(
             if reference_is_proven:
                 gap_value = metrics.get("additive_optimality_gap")
                 gap_kind = "exact_additive_optimality_gap"
-            elif lower_bound is not None:
+            elif effective_lower_bound is not None:
                 gap_value = metrics.get("additive_gap_upper_bound")
                 gap_kind = "additive_gap_upper_bound"
             else:
@@ -564,7 +599,7 @@ def build_results(
                 reference_labels,
                 reference_energy,
                 reference_is_proven,
-                lower_bound,
+                effective_lower_bound,
                 representative.empty_points,
                 all_edges,
                 problem.expected_sum,
@@ -664,6 +699,13 @@ def build_results(
                 "source": reference["source"],
                 "energy": reference_energy,
                 "lower_bound": lower_bound,
+                "combined_lower_bound": effective_lower_bound,
+                "combined_lower_bound_sources": [
+                    source for source, value in (
+                        ("archive", lower_bound),
+                        ("ordered_label_lp", lp_result.lower_bound),
+                    ) if value is not None and abs(value - effective_lower_bound) <= 1e-9
+                ],
             },
             "timing_ms": {
                 "marginal_initializer": marginal_ms,
@@ -685,6 +727,17 @@ def build_results(
                 "additive_optimality_gap_upper_bound": float(
                     forest_omitted_edge_tv
                 ),
+            },
+            "ordered_label_lp": {
+                "lower_bound": lp_result.lower_bound,
+                "lp_objective_without_fixed_offset": lp_result.lp_objective,
+                "rounded_energy": lp_energy,
+                "additive_gap_upper_bound": max(0.0, lp_energy - lp_result.lower_bound),
+                "threshold_count": lp_result.threshold_count,
+                "feasible_rounding_count": lp_result.feasible_rounding_count,
+                "used_marginal_fallback": lp_result.used_marginal_fallback,
+                "solver_message": lp_result.solver_message,
+                "latency_ms": lp_ms,
             },
             "ordered_expansion": {
                 "initial_energy": expansion_result.initial_energy,
