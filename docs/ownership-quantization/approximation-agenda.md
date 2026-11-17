@@ -64,15 +64,22 @@ approximation agenda therefore seeks a method that:
    - Natural status: optimal when unconstrained optimum is feasible;
      feasible-supported / feasible-repaired otherwise.
 
-2. **LP / metric-labeling relaxation + deterministic rounding**
-   - Linear metric on three ordered labels has integrality gap 1 for the
-     pairwise terms; cardinality handled by Lagrangian or soft penalty.
+2. **LP / ordered-label relaxation + deterministic rounding**
+   - The current LP uses continuous ordered-threshold variables and retains
+     the hard aggregate interval directly.
+   - Its pairwise TV terms are represented by linear epigraph constraints.
    - Rounding must be fixed and deterministic so that results are reproducible.
 
-3. **Continuous convex Potts / TV relaxation + co-area or argmax rounding**
-   - Duality gap supplies an a-posteriori bound.
-   - Useful when a continuous certificate is desired; latency depends on the
-     chosen first-order solver.
+3. **Continuous convex Potts / TV formulation + co-area or argmax rounding**
+   - The current continuous-TV formulation uses the same ordered-threshold
+     feasible set and hard aggregate interval as candidate 2; it is therefore
+     a solver/formulation variation of the same relaxation, not an independent
+     mathematical relaxation.
+   - HiGHS solves the epigraph LP; Chambolle--Pock solves the equivalent
+     nonsmooth convex TV form and exposes a Fenchel dual lower bound.
+   - Common-threshold co-area and simplex argmax are distinct rounding
+     variations. Compare them independently, but do not count their shared
+     relaxation as an independent bound or approximation family.
 
 4. **Pure local search / ICM from the unary MAP, with aggregate repair**
    - Lowest implementation cost; weakest a-priori guarantee.

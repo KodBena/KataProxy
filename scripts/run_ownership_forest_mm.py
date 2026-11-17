@@ -50,10 +50,11 @@ from transformers.stencil_cover.stencil_ownership_graphcut import ownership_grap
 from transformers.stencil_cover.stencil_ownership_repair import ownership_energy
 from transformers.stencil_cover.stencil_ownership_expansion import ordered_label_expansion
 from transformers.stencil_cover.stencil_ownership_relaxation import ordered_label_lp_relaxation
+from transformers.stencil_cover.stencil_ownership_continuous_tv import continuous_tv_relaxation
 
 
 RESULT_FORMAT = "kataproxy.ownership-approximation-comparison-results.v1"
-ALGORITHM_VERSION = "cardinality-forest-mm-ordered-expansion-and-lp-v2"
+ALGORITHM_VERSION = "cardinality-forest-mm-expansion-lp-continuous-tv-v3"
 DEFAULT_SPLIT_SEED = "ownership-forest-mm-holdout-v1"
 DEFAULT_MAX_PASSES = 8
 
@@ -281,6 +282,7 @@ def build_results(
         "forest_mm_total": [],
         "ordered_expansion_total": [],
         "ordered_label_lp": [],
+        "continuous_tv": [],
     }
     method_gaps: dict[str, list[float]] = {
         "marginal_initializer": [],
@@ -288,6 +290,8 @@ def build_results(
         "forest_mm": [],
         "ordered_expansion": [],
         "ordered_label_lp_rounding": [],
+        "continuous_tv_coarea": [],
+        "continuous_tv_argmax": [],
     }
     reference_kind_counts: Counter[str] = Counter()
     board_group_signatures: set[str] = set()
@@ -485,6 +489,38 @@ def build_results(
             raise ValueError("combined valid lower bound exceeds archived feasible reference")
 
         if progress is not None:
+            progress(f"[{problem_number}/{len(prepared)}] continuous convex TV relaxation")
+        continuous_tv_start = time.perf_counter_ns()
+        continuous_tv_result = continuous_tv_relaxation(
+            problem, evidence, maximum_iterations=2000, tolerance=1e-5,
+        )
+        continuous_tv_ms = (time.perf_counter_ns() - continuous_tv_start) / 1_000_000.0
+        continuous_coarea_empty = dict(continuous_tv_result.coarea_labeling)
+        continuous_argmax_empty = dict(continuous_tv_result.argmax_labeling)
+        continuous_coarea_full = _archive_labeling(continuous_coarea_empty, representative)
+        continuous_argmax_full = _archive_labeling(continuous_argmax_empty, representative)
+        continuous_coarea_energy = ownership_energy(
+            continuous_coarea_full, evidence, representative.empty_points,
+            all_edges, config["kappa"], config["beta"],
+        )
+        continuous_argmax_energy = ownership_energy(
+            continuous_argmax_full, evidence, representative.empty_points,
+            all_edges, config["kappa"], config["beta"],
+        )
+        if abs(continuous_coarea_energy - full_energy_from_reduction(problem, continuous_coarea_empty)) > 1e-6:
+            raise ArithmeticError("continuous-TV co-area rounding failed full-energy cross-check")
+        if abs(continuous_argmax_energy - full_energy_from_reduction(problem, continuous_argmax_empty)) > 1e-6:
+            raise ArithmeticError("continuous-TV argmax rounding failed full-energy cross-check")
+        if continuous_tv_result.lower_bound > min(continuous_coarea_energy, continuous_argmax_energy) + 1e-5:
+            raise ArithmeticError("continuous-TV dual lower bound exceeds a feasible rounded candidate")
+        effective_lower_bound = max(
+            value for value in (effective_lower_bound, continuous_tv_result.lower_bound)
+            if value is not None
+        )
+        if effective_lower_bound > reference_energy + 1e-5:
+            raise ValueError("combined valid lower bound exceeds archived feasible reference")
+
+        if progress is not None:
             progress(f"[{problem_number}/{len(prepared)}] ordered-label expansion")
         expansion_start = time.perf_counter_ns()
         expansion_result = ordered_label_expansion(
@@ -517,6 +553,7 @@ def build_results(
             ("forest_mm_total", marginal_ms + mm_ms),
             ("ordered_expansion_total", expansion_ms),
             ("ordered_label_lp", lp_ms),
+            ("continuous_tv", continuous_tv_ms),
         ):
             method_times[name].append(elapsed)
         method_results = {
@@ -525,6 +562,8 @@ def build_results(
             "forest_mm": (mm_full, mm_energy),
             "ordered_expansion": (expansion_full, expansion_energy),
             "ordered_label_lp_rounding": (lp_full, lp_energy),
+            "continuous_tv_coarea": (continuous_coarea_full, continuous_coarea_energy),
+            "continuous_tv_argmax": (continuous_argmax_full, continuous_argmax_energy),
         }
         methods: dict[str, Any] = {}
         method_latency_ms = {
@@ -533,6 +572,8 @@ def build_results(
             "forest_mm": marginal_ms + mm_ms,
             "ordered_expansion": expansion_ms,
             "ordered_label_lp_rounding": lp_ms,
+            "continuous_tv_coarea": continuous_tv_ms,
+            "continuous_tv_argmax": continuous_tv_ms,
         }
         latency_gap_comparison_points: list[dict[str, Any]] = []
         for name, (labels, energy) in method_results.items():
@@ -613,7 +654,7 @@ def build_results(
                 if isinstance(raw_checkpoint_gap, (int, float)):
                     checkpoint_gap_value = float(raw_checkpoint_gap)
                 gap_kind = "exact_additive_optimality_gap"
-            elif lower_bound is not None:
+            elif effective_lower_bound is not None:
                 raw_checkpoint_gap = checkpoint_metrics.get("additive_gap_upper_bound")
                 if isinstance(raw_checkpoint_gap, (int, float)):
                     checkpoint_gap_value = float(raw_checkpoint_gap)
@@ -704,6 +745,7 @@ def build_results(
                     source for source, value in (
                         ("archive", lower_bound),
                         ("ordered_label_lp", lp_result.lower_bound),
+                        ("continuous_tv", continuous_tv_result.lower_bound),
                     ) if value is not None and abs(value - effective_lower_bound) <= 1e-9
                 ],
             },
@@ -713,6 +755,7 @@ def build_results(
                 "forest_mm_passes": mm_ms,
                 "forest_mm_total_including_initializer": marginal_ms + mm_ms,
                 "ordered_expansion_total": expansion_ms,
+                "continuous_tv_relaxation_and_rounding": continuous_tv_ms,
             },
             "forest_dp": {
                 "surrogate_energy_reduced": forest_result.surrogate_energy,
@@ -738,6 +781,29 @@ def build_results(
                 "used_marginal_fallback": lp_result.used_marginal_fallback,
                 "solver_message": lp_result.solver_message,
                 "latency_ms": lp_ms,
+            },
+            "continuous_tv": {
+                "lower_bound": continuous_tv_result.lower_bound,
+                "feasible_primal_energy": continuous_tv_result.feasible_primal_energy,
+                "primal_dual_gap": continuous_tv_result.primal_dual_gap,
+                "iterations": continuous_tv_result.iterations,
+                "converged": continuous_tv_result.converged,
+                "coarea_candidate_count": continuous_tv_result.coarea_candidate_count,
+                "coarea_repaired_count": continuous_tv_result.coarea_repaired_count,
+                "argmax_was_repaired": continuous_tv_result.argmax_was_repaired,
+                "aggregate_primal_residual": continuous_tv_result.aggregate_primal_residual,
+                "solver_message": continuous_tv_result.solver_message,
+                "latency_ms": continuous_tv_ms,
+                "roundings": {
+                    "coarea": {
+                        "energy": continuous_coarea_energy,
+                        "additive_gap_upper_bound": max(0.0, continuous_coarea_energy - continuous_tv_result.lower_bound),
+                    },
+                    "argmax": {
+                        "energy": continuous_argmax_energy,
+                        "additive_gap_upper_bound": max(0.0, continuous_argmax_energy - continuous_tv_result.lower_bound),
+                    },
+                },
             },
             "ordered_expansion": {
                 "initial_energy": expansion_result.initial_energy,
@@ -794,6 +860,7 @@ def build_results(
         },
         "maximum_mm_passes": maximum_passes,
         "maximum_ordered_expansion_passes": maximum_passes,
+        "continuous_tv_maximum_iterations": 2000,
         "latency_gap_definition": {
             "latency": "wall time in milliseconds for the named computation; forest MM and ordered expansion include their initializer, while forest DP is reported separately",
             "gap": "exact additive gap only for proven optima; otherwise an additive upper bound only when a reference lower bound exists",
