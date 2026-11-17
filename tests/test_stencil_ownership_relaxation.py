@@ -23,16 +23,20 @@ def _evidence(
     width: int,
     height: int,
     deviations: tuple[float, ...] | None = None,
+    board: tuple[str | None, ...] | None = None,
 ) -> OwnershipEvidence:
+    board_cells = tuple(None for _ in means) if board is None else board
     return OwnershipEvidence(
         ownership=means,
         ownership_stdev=(
             tuple(0.05 for _ in means) if deviations is None else deviations
         ),
-        board=tuple(None for _ in means),
+        board=board_cells,
         width=width,
         height=height,
-        empty_points=tuple(range(len(means))),
+        empty_points=tuple(
+            point for point, colour in enumerate(board_cells) if colour is None
+        ),
         dead_black=(),
         dead_white=(),
         policy_metadata={},
@@ -92,7 +96,16 @@ def test_ordered_label_lp_rounding_is_deterministic_and_full_energy_consistent()
 
 
 def test_ordered_label_lp_handles_empty_problem() -> None:
-    evidence = _evidence((), width=1, height=1)
+    evidence = _evidence(
+        (0.0,),
+        width=1,
+        height=1,
+        board=("B",),
+    )
+    assert len(evidence.ownership) == 1
+    assert len(evidence.ownership_stdev or ()) == 1
+    assert len(evidence.board) == 1
+    assert evidence.empty_points == ()
     problem = build_reduced_problem(evidence, 1.0, 0.25, 0.5)
 
     result = ordered_label_lp_relaxation(problem)
