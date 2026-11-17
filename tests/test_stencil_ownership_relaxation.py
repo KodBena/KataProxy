@@ -8,6 +8,7 @@ import pytest
 
 from transformers.stencil_cover.stencil_ownership import OwnershipEvidence
 from transformers.stencil_cover.stencil_ownership_forest import (
+    ReducedOwnershipProblem,
     build_reduced_problem,
     full_energy_from_reduction,
 )
@@ -38,7 +39,7 @@ def _evidence(
     )
 
 
-def _exact_energy(problem: object) -> float:
+def _exact_energy(problem: ReducedOwnershipProblem) -> float:
     candidates: list[float] = []
     for values in product((-1, 0, 1), repeat=len(problem.points)):
         total = sum(values)
